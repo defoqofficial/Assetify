@@ -664,9 +664,6 @@ class SingletonUpdater:
                 self._tag_latest = self._tags[n]  # guaranteed at least len()=n+1
                 self.print_verbose(
                     "Most recent tag found:" + str(self._tags[n]['name']))
-                    
-        print(f"Resolving latest tag from: {self._tags}")
-        print(f"Latest resolved tag: {self._tag_latest}")
 
     def get_raw(self, url):
         """All API calls to base url."""
@@ -776,7 +773,6 @@ class SingletonUpdater:
         self.print_verbose("Now retrieving the new source zip")
         self._source_zip = os.path.join(local, "source.zip")
         self.print_verbose("Starting download update zip")
-        
         try:
             request = urllib.request.Request(url)
             context = ssl._create_unverified_context()
