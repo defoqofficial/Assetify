@@ -776,12 +776,9 @@ class SingletonUpdater:
         self.print_verbose("Now retrieving the new source zip")
         self._source_zip = os.path.join(local, "source.zip")
         self.print_verbose("Starting download update zip")
-        request = urllib.request.Request(url)
-        self.print(f"Downloading update zip from URL: {url}")  # Debugging print
         
         try:
             request = urllib.request.Request(url)
-            self.print(f"Downloading update zip from URL: {url}")  # Debugging print
             context = ssl._create_unverified_context()
 
             # Setup private token if appropriate.
