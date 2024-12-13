@@ -2,7 +2,7 @@ bl_info = {
     "name": "Assetify",
     "description": "Convert objects and geometry nodes into game-ready assets with baked textures for Unreal Engine.",
     "author": "Nino Defoq",
-    "version": (1, 0, 1),
+    "version": (1, 0, 2),
     "blender": (4, 3, 0),
     "location": "3D View > Tool Shelf > Assetify",
     "warning": "",
