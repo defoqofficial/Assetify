@@ -2,7 +2,7 @@ bl_info = {
     "name": "Assetify",
     "description": "Convert objects and geometry nodes into game-ready assets with baked textures for Unreal Engine.",
     "author": "Nino Defoq",
-    "version": (1, 0, 1),
+    "version": (2, 0, 0),
     "blender": (4, 3, 0),
     "location": "3D View > Tool Shelf > Assetify",
     "warning": "",
@@ -10,7 +10,9 @@ bl_info = {
     "category": "Object",
 }
 
+import importlib
 import socket
+import sys
 import traceback
 import bpy
 import os
@@ -24,6 +26,9 @@ import subprocess
 import math as m
 from gpu_extras.batch import batch_for_shader
 from . import addon_updater_ops
+from . import anim_geonode
+from . import animation_processor
+from . import anim_cloth
 import bpy.utils.previews
 import numpy
 import uuid
@@ -31,6 +36,8 @@ from bpy.props import CollectionProperty
 import bmesh
 import math
 from mathutils import Vector
+import addon_utils
+import glob
 
 # Define a global dictionary to store the custom icon previews
 custom_icons = None
@@ -1721,7 +1728,6 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
         return self.execute(context)
 
     def execute(self, context):
-    
         assetify_settings = context.scene.assetify_bake_settings
         asset_collections = assetify_settings.asset_collections
 
@@ -1732,7 +1738,12 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
             self.report({'WARNING'}, "No asset collections selected.")
             return {'CANCELLED'}
 
-        # Initialize variables
+        # Continue with the regular game-ready conversion
+        self.report({'INFO'}, "Running Game Ready Conversion...")
+        return self.run_still_process(context)
+
+    def run_still_process(self, context):
+        """Handle the still process for game-ready asset conversion."""
         self._assets_to_process = []
         self._current_asset_index = 0
         self.total_assets = 0
@@ -1748,14 +1759,19 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
         self.collections_processed = set()
 
         # Collect assets and create game-ready collections
-        for item in asset_collections:
+        assetify_settings = context.scene.assetify_bake_settings
+        for item in assetify_settings.asset_collections:
             collection = item.collection
             if collection:
                 self.main_collections.add(collection)
                 # Create game-ready collection for main collection
                 self.create_game_ready_collection(collection, context, assetify_settings)
                 # Collect assets and build game-ready subcollections
-                self.collect_assets(collection, context, parent_game_ready_collection=self.game_ready_collections[collection])
+                self.collect_assets(
+                    collection,
+                    context,
+                    parent_game_ready_collection=self.game_ready_collections[collection]
+                )
 
         self.total_assets = len(self._assets_to_process)
 
@@ -1926,15 +1942,6 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
             context (bpy.types.Context): Blender's context.
         """
         # Ensure the 3D viewport is set to solid shading
-        #for area in context.screen.areas:
-        #    if area.type == 'VIEW_3D':
-        #        space = area.spaces.active
-        #        if space.shading.type != 'SOLID':
-        #            print(f"[DEBUG] Setting 3D viewport to solid shading.")
-        #            space.shading.type = 'SOLID'
-        #        break
-
-        # Determine the game-ready collection
         game_ready_collection = self.game_ready_collections.get(original_collection)
         if not game_ready_collection:
             print(f"[WARNING] No game-ready collection found for {obj.name}")
@@ -1944,38 +1951,68 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
         new_obj = obj.copy()
         if obj.data:
             new_obj.data = obj.data.copy()
-        # Generate a unique name for the new asset
-        new_obj.name = self.generate_unique_asset_name(obj.name)
+        new_obj.name = f"{obj.name}_gameasset"
         game_ready_collection.objects.link(new_obj)
         print(f"[DEBUG] Linked object: {new_obj.name} to {game_ready_collection.name}")
         
-        # Check if the object is already linked
-        if new_obj.name not in [o.name for o in game_ready_collection.objects]:
-            game_ready_collection.objects.link(new_obj)
-            print(f"[DEBUG] Linked object: {new_obj.name} to {game_ready_collection.name}")
-        else:
-            print(f"[WARNING] Object {new_obj.name} is already linked to {game_ready_collection.name}")
+        assetify_settings = context.scene.assetify_bake_settings
 
-        # Handle text objects: Convert to mesh using bpy.ops.object.convert
+        # Determine skip conditions based on bake mode and skip_conversion
+        skip_conditions = animation_processor.get_skip_conditions()
+        animation_type = context.scene.assetify_animation_settings.animation_type
+        file_format = context.scene.assetify_animation_settings.file_format
+
+        # Set new_obj as the active object
+        bpy.context.view_layer.objects.active = new_obj
+        new_obj.select_set(True)
+        print(f"[DEBUG] Set {new_obj.name} as the active object.")
+
+        debug_print(f"[DEBUG] Animation Type: {animation_type}, File Format: {file_format}")
+        debug_print(f"[DEBUG] Skip Conditions: {skip_conditions}")
+        
+        # Check if in animation mode and process accordingly
+        if assetify_settings.bake_mode == 'ANIMATION' and not (animation_type, file_format) in skip_conditions:
+            self.report({'INFO'}, f"Checking animation processing conditions for {new_obj.name}...")
+            from .animation_processor import process_animation_conditions
+            result = process_animation_conditions(context, report_func=self.report, obj=new_obj)
+            if result == {'CANCELLED'}:
+                self.report({'WARNING'}, f"Animation preprocessing was cancelled for {new_obj.name}.")
+                return {'CANCELLED'}
+
+        elif assetify_settings.bake_mode == 'ANIMATION' and (animation_type, file_format) in skip_conditions:
+            from .animation_processor import process_animation_conditions
+            result = process_animation_conditions(context, report_func=self.report, obj=new_obj)
+            debug_print(f"[INFO] Condition met to Skip Conversion. Skipping conversion for {new_obj.name} due to conditions: ({animation_type}, {file_format}).")
+            
+            # Remove any empty material slots before making materials unique
+            remove_empty_material_slots(new_obj)
+            debug_print(f"[DEBUG] Removed empty material slots for {new_obj.name}.")
+
+            # Make the materials unique for the duplicated object
+            make_materials_unique(new_obj)
+            debug_print(f"[DEBUG] Made materials unique for {new_obj.name}.")
+
+            # Rename materials to match object name
+            rename_materials(new_obj)
+            debug_print(f"[DEBUG] Renamed materials for {new_obj.name}.")
+
+            # Convert UVMap attribute to an actual UV map layer
+            convert_uvmap_attribute_to_uv_layer(new_obj)
+            debug_print(f"[DEBUG] Converted UVMap attributes for {new_obj.name}.")
+            
+            simplify_materials_and_uv_maps(obj)
+            finalize_uv_maps(obj)
+            
+            return {'SKIPPED'}
+
+        # Convert text objects to meshes if necessary
         if new_obj.type == 'FONT':
             print(f"[DEBUG] Converting text object {new_obj.name} to mesh.")
-            
-            # Ensure the object is active and selected
             bpy.context.view_layer.objects.active = new_obj
-            for selected in bpy.context.selected_objects:
-                selected.select_set(False)
-            new_obj.select_set(True)
-
-            # Ensure the 3D Viewport is active
-            for area in bpy.context.screen.areas:
-                if area.type == "VIEW_3D":
-                    with bpy.context.temp_override(area=area, region=area.regions[0]):
-                        # Perform the conversion
-                        bpy.ops.object.convert(target="MESH")
-                    break
+            bpy.ops.object.convert(target='MESH')
             print(f"[DEBUG] Converted text object {new_obj.name} to mesh.")
 
-        # Apply particle systems and modifiers in stack order
+        # Process particle systems and modifiers
         if new_obj.particle_systems or new_obj.modifiers:
             print(f"[DEBUG] Processing particle systems and modifiers on {new_obj.name}")
             new_obj = apply_particle_systems(new_obj)
@@ -1989,7 +2026,6 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
         )
 
         # Add the asset to the baked assets list
-        assetify_settings = context.scene.assetify_bake_settings
         baked_asset = assetify_settings.baked_assets.add()
         baked_asset.name = new_obj.name
         baked_asset.is_game_asset = True
@@ -1997,10 +2033,19 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
         baked_asset.is_fbx_exported = check_if_exported(new_obj)
         baked_asset.include_in_send = False
         baked_asset.collection_name = game_ready_collection.name
-        print(f"[DEBUG] Added {new_obj.name} to baked assets")
+        print(f"[DEBUG] Added {new_obj.name} to baked assets.")
 
         # Decrement the asset count for the collection
         self.collection_asset_counts[original_collection] -= 1
+
+        # Manage baked collections
+        self.manage_baked_collections(original_collection, baked_asset, game_ready_collection, context)
+
+    def manage_baked_collections(self, original_collection, baked_asset, game_ready_collection, context):
+        """
+        Updates and manages the baked collections list and related data.
+        """
+        assetify_settings = context.scene.assetify_bake_settings
 
         # Initialize baked collection data if not already done
         if original_collection not in self.baked_collections_data:
@@ -2012,8 +2057,6 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
             }
 
         baked_collection_data = self.baked_collections_data[original_collection]
-
-        # Add asset data to the collection's data
         baked_collection_data['assets'].append({
             'name': baked_asset.name,
             'is_game_asset': baked_asset.is_game_asset,
@@ -2024,19 +2067,18 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
 
         # Update collection status
         if baked_asset.is_baked:
-            baked_collection_data['is_baked'] = True  # Set to True if any asset is baked
+            baked_collection_data['is_baked'] = True
         if baked_asset.is_fbx_exported:
-            baked_collection_data['include_in_send'] = True  # Set to True if any asset is exported
+            baked_collection_data['include_in_send'] = True
 
-        # If all assets for the collection are processed, add the collection to the list
+        # Finalize baked collection if all assets are processed
         if self.collection_asset_counts[original_collection] == 0 and original_collection not in self.collections_processed:
-            # Add the baked collection to assetify_settings.baked_collections
             baked_collection = assetify_settings.baked_collections.add()
             baked_collection.name = baked_collection_data['name']
             baked_collection.is_baked = baked_collection_data['is_baked']
             baked_collection.include_in_send = baked_collection_data['include_in_send']
 
-            # Add assets to baked_collection.assets
+            # Add assets to baked collection
             for asset_data in baked_collection_data['assets']:
                 collection_asset = baked_collection.assets.add()
                 collection_asset.name = asset_data['name']
@@ -2047,8 +2089,6 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
                 print(f"[DEBUG] Added {asset_data['name']} to baked collection: {baked_collection.name}")
 
             print(f"[DEBUG] Added baked collection entry: {baked_collection.name}")
-
-            # Mark the collection as processed
             self.collections_processed.add(original_collection)
 
     def cancel(self, context):
@@ -2129,113 +2169,174 @@ class ASSETIFY_OT_import_selected_fbx(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        """Check if valid files exist for unlocking the button based on the selected format."""
         assetify_settings = context.scene.assetify_bake_settings
         export_path = bpy.path.abspath(assetify_settings.export_fbx_path)
         bake_folder = bpy.path.abspath(assetify_settings.bake_folder)
         texture_folder = os.path.join(bake_folder, "textures")
-        import_format = assetify_settings.import_format.lower()
 
         if not export_path or not os.path.isdir(export_path):
-            print("[DEBUG] Invalid export path:", export_path)
+            print("[DEBUG] Export path is invalid or does not exist.")
             return False
 
-        if not os.path.isdir(texture_folder):
-            print("[DEBUG] Invalid texture folder:", texture_folder)
+        # Determine the valid extension based on the mode
+        if assetify_settings.export_mode == 'STILL':
+            selected_extension = assetify_settings.import_format.lower()
+            suffix = "_still"
+        elif assetify_settings.export_mode == 'ANIMATION':
+            selected_extension = assetify_settings.animation_import_format.lower()
+            suffix = "_anim"
+        else:
+            print("[DEBUG] Invalid export mode selected.")
             return False
+
+        # Use the full animation export format name for file naming
+        format_label = assetify_settings.animation_import_format.upper()
 
         valid_extensions = {
             'fbx': '.fbx',
             'obj': '.obj',
             'gltf': ['.glb', '.gltf'],
             'stl': '.stl',
+            'alembic': '.abc',
         }
-        selected_extension = valid_extensions.get(import_format)
+        selected_extension = valid_extensions.get(selected_extension)
 
         # Check for assets
         if assetify_settings.asset_mode == 'ASSET':
             for asset in assetify_settings.baked_assets:
                 if asset.include_in_send:
-                    if cls.check_asset_files(asset, export_path, selected_extension):
+                    if cls.check_asset_files(asset, export_path, selected_extension, suffix, format_label):
                         return True
 
         # Check for collections
         elif assetify_settings.asset_mode == 'COLLECTION':
             for collection in assetify_settings.baked_collections:
-                if collection.include_in_send and get_collection_level(collection.name) == 0:  # Root collection
+                if collection.include_in_send and get_collection_level(collection.name) == 0:
                     for asset in collection.assets:
-                        if cls.check_asset_files(asset, export_path, selected_extension):
+                        if cls.check_asset_files(asset, export_path, selected_extension, suffix, format_label):
                             return True
-
-        #print("[DEBUG] No valid files found for unlocking the button.")
         return False
 
     @staticmethod
-    def check_asset_files(asset, export_path, selected_extension):
-        """Helper function to check if an asset has all required files."""
-        # Sanitize the asset name by removing "_gameasset" if present
+    def check_asset_files(asset, export_path, selected_extension, suffix, format_label):
+        """
+        Check if a file exists for a given asset with the expected naming convention.
+        Supports both single and multiple extensions (e.g., GLTF: .glb, .gltf).
+
+        Args:
+            asset (bpy.types.PropertyGroup): The asset to check.
+            export_path (str): The path where exported files are located.
+            selected_extension (str or list): The expected file extension(s).
+            suffix (str): The suffix appended to the file name (_still or _ANIM).
+            format_label (str): The export format label (e.g., ALEMBIC, FBX).
+
+        Returns:
+            bool: True if a matching file is found, False otherwise.
+        """
         sanitized_name = sanitize_name(asset.name.replace("_gameasset", ""))
 
-        # Check for format-specific file
+        # Standardize format_label and suffix for consistent comparison
+        format_label = format_label.upper().replace(" ", "_")
+        suffix = suffix.upper()
+
+        # Handle extension types (single or multiple)
         if isinstance(selected_extension, list):
-            file_exists = any(
-                check_if_file_exists(sanitized_name, export_path, ext)
-                for ext in selected_extension
-            )
-            extensions_str = ", ".join(selected_extension)  # Create a string representation of extensions for debugging
+            extensions = [ext.lstrip(".").lower() for ext in selected_extension]
         else:
-            file_exists = check_if_file_exists(sanitized_name, export_path, selected_extension)
-            extensions_str = selected_extension.upper()
+            extensions = [selected_extension.lstrip(".").lower()]
 
-        if not file_exists:
-            print(f"[DEBUG] Missing {extensions_str} file for {asset.name}")
+        # Iterate through possible extensions to find the file
+        for ext in extensions:
+            # Correct check for OBJ animation sequences (no underscore before 0001)
+            if format_label == "OBJ" and suffix == "_ANIM":
+                full_name = f"{sanitized_name}_{format_label}{suffix}0001.{ext}"
+            else:
+                full_name = f"{sanitized_name}_{format_label}{suffix}.{ext}"
 
-        # Return True if the file exists
-        return file_exists
+            file_path = os.path.join(export_path, full_name)
+
+            # Check if the file exists
+            if os.path.isfile(file_path):
+                print(f"[DEBUG] Found file: {file_path}")
+                return True
+            else:
+                print(f"[DEBUG] File not found: {file_path}")
+
+        print(f"[DEBUG] No matching files found for asset: {sanitized_name}")
+        return False
 
     def execute(self, context):
         """Prepare for importing files based on the selected format."""
         assetify_settings = context.scene.assetify_bake_settings
         export_path = bpy.path.abspath(assetify_settings.export_fbx_path)
-        import_format = assetify_settings.import_format.lower()
 
-        self._assets_to_import = []
+        # Determine the valid extension and suffix based on the mode
+        if assetify_settings.export_mode == 'STILL':
+            selected_format = assetify_settings.import_format.lower()
+            suffix = "_still"
+        elif assetify_settings.export_mode == 'ANIMATION':
+            selected_format = assetify_settings.animation_import_format.lower()
+            suffix = "_anim"
+        else:
+            self.report({'WARNING'}, "Invalid export mode selected.")
+            return {'CANCELLED'}
 
+        # Define valid extensions for import formats
         valid_extensions = {
             'fbx': '.fbx',
             'obj': '.obj',
             'gltf': ['.glb', '.gltf'],
             'stl': '.stl',
+            'alembic': '.abc',  # Added Alembic support
         }
-        selected_extension = valid_extensions.get(import_format)
+        selected_extension = valid_extensions.get(selected_format)
 
-        print(f"[DEBUG] Execute - Starting import check for assets in format: {import_format}")
+        if not selected_extension:
+            self.report({'WARNING'}, f"Unsupported format: {selected_format.upper()}")
+            return {'CANCELLED'}
+
+        # Prepare a readable label for the format (handles both single and list extensions)
+        if isinstance(selected_extension, list):
+            extension_label = ", ".join(ext.upper() for ext in selected_extension)
+        else:
+            extension_label = selected_extension.upper()
+
+        self._assets_to_import = []
+
         for asset in assetify_settings.baked_assets:
-            print(f"[DEBUG] Execute - Checking asset: {asset.name} (Include in Send: {asset.include_in_send})")
             sanitized_name = sanitize_name(asset.name.replace("_gameasset", ""))
+            full_name = f"{sanitized_name}_{selected_format.upper()}{suffix}"  # Include format
+
             if isinstance(selected_extension, list):
                 for ext in selected_extension:
-                    print(f"[DEBUG] Execute - Checking file for sanitized name: {sanitized_name} with extension: {ext}")
-                    if check_if_file_exists(sanitized_name, export_path, ext):
-                        print(f"[DEBUG] Execute - Found file for {sanitized_name} with extension {ext}")
-                        self._assets_to_import.append((asset, ext))
-                        break
+                    # ✅ Adjust check for OBJ sequences
+                    if selected_format == 'obj' and assetify_settings.export_mode == 'ANIMATION':
+                        # Check for the OBJ sequence with frame numbers
+                        if check_for_obj_sequence(full_name, export_path, ext):
+                            self._assets_to_import.append((asset, ext))
+                            break
+                    else:
+                        if check_if_file_exists(full_name, export_path, ext):
+                            self._assets_to_import.append((asset, ext))
+                            break
             else:
-                print(f"[DEBUG] Execute - Checking file for sanitized name: {sanitized_name} with extension: {selected_extension}")
-                if check_if_file_exists(sanitized_name, export_path, selected_extension):
-                    print(f"[DEBUG] Execute - Found file for {sanitized_name} with extension {selected_extension}")
-                    self._assets_to_import.append((asset, selected_extension))
+                if selected_format == 'obj' and assetify_settings.export_mode == 'ANIMATION':
+                    # ✅ Check for OBJ sequence when in animation mode
+                    if check_for_obj_sequence(full_name, export_path, selected_extension):
+                        self._assets_to_import.append((asset, selected_extension))
+                else:
+                    if check_if_file_exists(full_name, export_path, selected_extension):
+                        self._assets_to_import.append((asset, selected_extension))
 
-        print(f"[DEBUG] Final _assets_to_import: {[asset[0].name for asset in self._assets_to_import]}")
         if not self._assets_to_import:
-            self.report({'WARNING'}, f"No files found for selected assets in {import_format.upper()} format.")
+            self.report({'WARNING'}, f"No files found for selected assets in {extension_label} format.")
             return {'CANCELLED'}
 
         # Initialize progress tracking
         self.total_import_steps = len(self._assets_to_import)
-        start_progress_bar(self, initial_message=f"Importing {import_format.upper()} Files")
+        start_progress_bar(self, initial_message=f"Importing {extension_label} Files")
         self.progress_value = 0.0
-        self.current_operation = f"Importing {import_format.upper()} Files..."
+        self.current_operation = f"Importing {extension_label} Files..."
 
         wm = context.window_manager
         self._timer = wm.event_timer_add(0.1, window=context.window)
@@ -2271,33 +2372,81 @@ class ASSETIFY_OT_import_selected_fbx(bpy.types.Operator):
         assetify_settings = context.scene.assetify_bake_settings
         export_path = bpy.path.abspath(assetify_settings.export_fbx_path)
 
+        # Append _still or _ANIM based on the export mode
+        if assetify_settings.export_mode == 'STILL':
+            suffix = "_still"
+            mode_format = assetify_settings.import_format.upper()
+        elif assetify_settings.export_mode == 'ANIMATION':
+            suffix = "_ANIM"
+            mode_format = assetify_settings.animation_import_format.upper()
+        else:
+            self.report({'WARNING'}, "Invalid export mode. Cannot determine naming convention.")
+            return
+        
+        # Debugging: Check the format extension and export mode
+        print(f"[DEBUG] format_ext: {format_ext}")
+        print(f"[DEBUG] export_mode: {assetify_settings.export_mode}")
+        print(f"[DEBUG] mode_format: {mode_format}")
+        print(f"[DEBUG] suffix: {suffix}")
+
+        # Match exported naming convention
         sanitized_name = sanitize_name(asset_name.replace('_gameasset', ''))
-        file_path = os.path.join(export_path, f"{sanitized_name}{format_ext}")
+        full_name = f"{sanitized_name}_{mode_format}{suffix}"
+        file_path = os.path.join(export_path, f"{full_name}{format_ext}")
 
         if not os.path.exists(file_path):
             self.report({'WARNING'}, f"File not found for asset '{asset_name}': {file_path}")
+            print(f"[DEBUG] Looking for file: {file_path}")
             return
 
-        print(f"[DEBUG] Importing {format_ext.upper()} for asset: {asset_name}")
+        print(f"[DEBUG] Importing {format_ext.upper()} for asset: {full_name}")
         objects_before = set(obj.name for obj in bpy.context.scene.objects)
 
-        # Import based on file extension
-        if format_ext == '.fbx':
-            bpy.ops.import_scene.fbx(filepath=file_path)
-        elif format_ext == '.obj':
-            bpy.ops.wm.obj_import(filepath=file_path)
-        elif format_ext in ['.glb', '.gltf']:
-            bpy.ops.import_scene.gltf(filepath=file_path)
-        elif format_ext == '.stl':
-            bpy.ops.wm.stl_import(filepath=file_path)
+        folder_path = os.path.join(export_path, f"{sanitized_name}_{mode_format}{suffix}")
 
+        if format_ext == '.obj' and not os.path.exists(folder_path):
+            self.report({'WARNING'}, f"OBJ sequence folder not found: {folder_path}")
+            return
+
+        if format_ext == '.obj' and assetify_settings.export_mode == 'ANIMATION':
+            print(f"[DEBUG] Importing OBJ sequence as shape keys for {asset_name}")
+
+            target_obj = context.active_object
+            if not target_obj or target_obj.type != 'MESH':
+                self.report({'WARNING'}, f"No active mesh object selected for importing {asset_name}")
+                return
+
+            # Load the OBJ sequence
+            load_obj_sequence_as_shape_keys(target_obj, folder_path, full_name)
+        else:
+            # Standard imports for other formats
+            file_path = os.path.join(export_path, f"{sanitized_name}_{mode_format}{suffix}{format_ext}")
+            if format_ext == '.fbx':
+                bpy.ops.import_scene.fbx(filepath=file_path)
+            elif format_ext in ['.glb', '.gltf']:
+                print("[DEBUG] Importing GLTF...")
+                if not os.path.exists(file_path):
+                    print(f"[ERROR] GLTF file not found: {file_path}")
+                else:
+                    try:
+                        bpy.ops.import_scene.gltf(filepath=file_path)
+                        print("[DEBUG] GLTF import executed successfully.")
+                    except Exception as e:
+                        print(f"[ERROR] GLTF import failed: {e}")
+            elif format_ext == '.abc':
+                bpy.ops.wm.alembic_import(filepath=file_path)
+            elif format_ext == '.stl':
+                bpy.ops.wm.stl_import(filepath=file_path)
+            
+        # Update object names in the scene
         objects_after = set(obj.name for obj in bpy.context.scene.objects)
         new_object_names = objects_after - objects_before
 
         for obj_name in new_object_names:
             obj = bpy.context.scene.objects.get(obj_name)
             if obj:
-                obj.name = f"{asset_name.replace('_gameasset', '')}{format_ext.replace('.', '_')}"
+                # Append the full naming convention to the object name
+                obj.name = full_name
                 obj.location = (0.0, 0.0, 0.0)
                 print(f"[DEBUG] Imported and renamed: {obj.name}")
 
@@ -2311,14 +2460,145 @@ class ASSETIFY_OT_import_selected_fbx(bpy.types.Operator):
         remove_progress_bar(self)
         self.report({'INFO'}, "Import canceled.")
 
-def check_if_file_exists(asset_name, export_path, extension):
-    sanitized_name = sanitize_name(asset_name.replace("_gameasset", ""))
-    file_name = f"{sanitized_name}{extension}"
-    file_path = os.path.join(export_path, file_name)
+def check_for_obj_sequence(asset_name, export_path, extension):
+    """
+    Check if an OBJ sequence (with frame numbers) exists.
 
-    exists = os.path.isfile(file_path)
-    print(f"[DEBUG] Checking file existence - Asset: {asset_name}, Sanitized: {sanitized_name}, Path: {file_path}, Exists: {exists}")
-    return exists
+    Args:
+        asset_name (str): Sanitized asset name.
+        export_path (str): Path to the exported files.
+        extension (str): File extension (.obj).
+
+    Returns:
+        bool: True if at least one OBJ file with a frame number exists.
+    """
+    # Look for files like Plane_OBJ_ANIM0001.obj, Plane_OBJ_ANIM0002.obj
+    search_pattern = os.path.join(export_path, f"{asset_name}????{extension}")
+    matching_files = glob.glob(search_pattern)
+
+    if matching_files:
+        print(f"[DEBUG] Found OBJ sequence for {asset_name}: {matching_files[0]}")
+        return True
+    else:
+        print(f"[DEBUG] No OBJ sequence found for {asset_name} with pattern: {search_pattern}")
+        return False
+
+def load_obj_sequence_as_shape_keys(target_obj, export_path, full_name):
+    """
+    Loads an OBJ sequence and applies each as a shape key.
+
+    Args:
+        target_obj (bpy.types.Object): The object to apply the shape keys to.
+        export_path (str): Path to the exported files.
+        full_name (str): Base name for OBJ sequence files.
+    """
+    search_pattern = os.path.join(export_path, f"{full_name}????.obj")
+    obj_files = sorted(glob.glob(search_pattern))
+
+    if not obj_files:
+        print(f"[WARNING] No OBJ sequence found with pattern: {search_pattern}")
+        return
+
+    print(f"[DEBUG] Found {len(obj_files)} OBJ files for {target_obj.name}")
+
+    # ✅ Deselect all objects before importing
+    bpy.ops.object.select_all(action='DESELECT')
+
+    for obj_file in obj_files:
+        frame_number = os.path.splitext(os.path.basename(obj_file))[0][-4:]
+        import_obj_as_shape_key(obj_file, target_obj, frame_number)
+
+    print(f"[INFO] Successfully imported OBJ sequence as shape keys.")
+
+def import_obj_as_shape_key(filepath, target_obj, frame_number):
+    """
+    Imports a single OBJ file and applies it as a shape key.
+
+    Args:
+        filepath (str): File path of the OBJ file.
+        target_obj (bpy.types.Object): Target object for shape keys.
+        frame_number (str): Frame number for naming the shape key.
+    """
+    # Debug: File being imported
+    print(f"[DEBUG] Importing OBJ file: {filepath}")
+
+    # ✅ Ensure proper context for importing
+    bpy.ops.object.select_all(action='DESELECT')
+    bpy.context.view_layer.objects.active = target_obj
+
+    # ✅ Import OBJ
+    bpy.ops.import_scene.obj(filepath=filepath, split_mode='OFF')
+    
+    # ✅ Check if the OBJ imported
+    imported_objects = bpy.context.selected_objects
+    if not imported_objects:
+        print(f"[ERROR] Failed to import {filepath}")
+        return
+
+    imported_obj = imported_objects[0]
+    print(f"[DEBUG] Imported object: {imported_obj.name}")
+
+    # ✅ Ensure vertex count matches
+    if len(imported_obj.data.vertices) != len(target_obj.data.vertices):
+        print(f"[WARNING] Vertex count mismatch. Skipping {filepath}.")
+        bpy.data.objects.remove(imported_obj, do_unlink=True)
+        return
+
+    # ✅ Apply as shape key
+    bpy.context.view_layer.objects.active = target_obj
+    imported_obj.select_set(True)
+    bpy.ops.object.join_shapes()
+
+    # ✅ Rename shape key
+    target_obj.data.shape_keys.key_blocks[-1].name = f"Frame_{frame_number}"
+
+    # ✅ Cleanup
+    bpy.data.objects.remove(imported_obj, do_unlink=True)
+    print(f"[DEBUG] Applied {filepath} as shape key 'Frame_{frame_number}'")
+
+def check_if_file_exists(asset_name, export_path, extension, mode_format="OBJ", suffix="_ANIM"):
+    """
+    Checks if the export file or OBJ sequence (starting with 0001) exists for the given asset.
+
+    Args:
+        asset_name (str): The name of the asset to check.
+        export_path (str): The directory where exported files are stored.
+        extension (str): The file extension to look for (e.g., '.obj').
+        mode_format (str): The export format (e.g., 'OBJ', 'FBX').
+        suffix (str): The suffix to append (_still or _ANIM).
+
+    Returns:
+        bool: True if the file or folder with 0001 exists, False otherwise.
+    """
+    sanitized_name = sanitize_name(asset_name.replace("_gameasset", ""))
+
+    # OBJ Animation Sequence Check → Look in the dedicated subfolder for 0001
+    if extension == ".obj" and suffix == "_ANIM":
+        folder_name = f"{sanitized_name}_{mode_format}{suffix}"
+        folder_path = os.path.join(export_path, folder_name)
+
+        # Expect the first OBJ file to be 0001 (e.g., Plane_OBJ_ANIM0001.obj)
+        first_frame_file = f"{sanitized_name}_{mode_format}{suffix}0001{extension}"
+        first_frame_path = os.path.join(folder_path, first_frame_file)
+
+        # Debug: Check if the first frame OBJ exists
+        print(f"[DEBUG] Checking for first frame OBJ: {first_frame_path}")
+
+        if os.path.isfile(first_frame_path):
+            print(f"[DEBUG] Found first frame OBJ file: {first_frame_path}")
+            return True
+        else:
+            print(f"[DEBUG] First frame OBJ not found: {first_frame_path}")
+            return False
+
+    # Standard file check for other formats (FBX, GLTF, etc.)
+    else:
+        file_name = f"{sanitized_name}_{mode_format}{suffix}{extension}"
+        file_path = os.path.join(export_path, file_name)
+
+        exists = os.path.isfile(file_path)
+        print(f"[DEBUG] Checking file existence - Asset: {asset_name}, Path: {file_path}, Exists: {exists}")
+        return exists
 
 def update_bake_folder(self, context):
     """Update the export FBX path to match the bake folder when the bake folder changes."""
@@ -2524,7 +2804,7 @@ class ASSETIFY_OT_show_custom_attributes_info(bpy.types.Operator):
         layout.separator()
         
         # Add "Show YouTube Tutorial" button
-        layout.operator("wm.url_open", text="Show YouTube Tutorial").url = "https://www.youtube.com/@NinoDefoQ"
+        layout.operator("wm.url_open", text="Show YouTube Tutorial").url = "https://www.youtube.com/watch?v=ZgdlRGKfEPA&ab_channel=Nino&t=24m00s"
 
     def execute(self, context):
         # This does nothing as the dialog box is used for displaying info
@@ -3022,7 +3302,14 @@ class AssetifyPreferences(bpy.types.AddonPreferences):
         # ops = col.operator("wm.url_open","Open webpage ")
         # ops.url=addon_updater_ops.updater.website
         
-        
+def apply_global_animation_setting(assetify_settings):
+    """
+    Apply the global animation setting to all selected assets.
+    """
+    for asset in assetify_settings.baked_assets:
+        if asset.include_in_send:  # Only apply to selected assets
+            asset.process_animations = assetify_settings.process_animations_global
+            print(f"[DEBUG] Set animation processing for '{asset.name}' to {assetify_settings.process_animations_global}.")        
 
 class AssetifyBakeSettings(bpy.types.PropertyGroup):
     bake_resolution: bpy.props.EnumProperty(
@@ -3036,6 +3323,49 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
         default='1024'
     )
     
+    # New property for the Asset List collapsible menu
+    show_asset_list_menu: bpy.props.BoolProperty(
+        name="Show Asset List Menu",
+        description="Toggle the visibility of the Asset List menu",
+        default=False
+    )
+    
+    show_bake_mode_menu: bpy.props.BoolProperty(
+        name="Show Bake Mode Menu",
+        description="Toggle visibility of the bake mode settings menu",
+        default=True
+    )
+    
+    texturebake_mode: bpy.props.EnumProperty(
+        name="Texture Bake Mode",
+        description="Choose whether to bake still textures or an animated sequence",
+        items=[
+            ('STILL', "Still", "Bake a single set of textures"),
+            ('ANIMATION', "Animation", "Bake textures as a sequence (one set per frame)")
+        ],
+        default='STILL',
+    )
+    
+    bake_mode: bpy.props.EnumProperty(
+        name="Bake Mode",
+        description="Choose between baking for still or animation mode",
+        items=[
+            ('STILL', "Still", "Bake for still assets"),
+            ('ANIMATION', "Animation", "Bake animations for assets")
+        ],
+        default='STILL'
+    )
+    
+    export_mode: bpy.props.EnumProperty(
+        name="Export Mode",
+        description="Switch between Still and Animation exporting",
+        items=[
+            ('STILL', "Still", "Export still models only"),
+            ('ANIMATION', "Animation", "Export models with animations")
+        ],
+        default='STILL',
+    )
+
     skip_uv_unwrap: bpy.props.BoolProperty(
         name="Skip UV Unwrapping",
         description="Skip the UV unwrapping process during baking",
@@ -3054,6 +3384,19 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
         default='FBX',
     )
     
+    animation_export_format: bpy.props.EnumProperty(
+        name="Animation Export Format",
+        description="Choose the format for exporting animations",
+        items=[
+            ('FBX', "FBX (.fbx)", "Export to FBX format"),
+            ('ALEMBIC', "Alembic (.abc)", "Export to Alembic format"),
+            ('GLTF', "glTF (.gltf .glb)", "Export to glTF format"),
+            ('OBJ', "Wavefront (.obj)", "Export to OBJ format"),
+            ('MDD', "Point Cache (.mdd)", "Export to MDD format"),
+        ],
+        default='FBX',
+    )
+    
     import_format: bpy.props.EnumProperty(
         name="Import Format",
         description="Choose the format to import assets",
@@ -3065,6 +3408,19 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
         ],
         default='FBX',  # Default import format
         update=lambda self, context: update_export_status(context)
+    )
+    
+    # Import formats for animation mode
+    animation_import_format: bpy.props.EnumProperty(
+        name="Animation Import Format",
+        description="Choose the format for importing animations",
+        items=[
+            ('FBX', "FBX", "Import FBX files"),
+            ('ALEMBIC', "Alembic", "Import Alembic files"),
+            ('GLTF', "glTF", "Import glTF files"),
+            ('OBJ', "Wavefront (OBJ)", "Import OBJ files"),
+        ],
+        default='FBX',
     )
     
     skip_save_check: bpy.props.BoolProperty(
@@ -3531,6 +3887,50 @@ def restore_original_materials(obj, original_materials):
     for slot in obj.material_slots:
         if slot.material and slot.material.name in original_materials:
             slot.material = original_materials[slot.material.name]
+            
+def store_material_links(obj):
+    """Store all original links for each material."""
+    material_links = {}
+    for mat_slot in obj.material_slots:
+        if not mat_slot.material or not mat_slot.material.use_nodes:
+            continue
+        
+        node_tree = mat_slot.material.node_tree
+        material_links[mat_slot.material.name] = [
+            (link.from_socket, link.to_socket) for link in node_tree.links
+        ]
+    return material_links
+
+def restore_material_links(obj, material_links):
+    """Restore all original links for each material."""
+    for mat_slot in obj.material_slots:
+        if not mat_slot.material or not mat_slot.material.use_nodes:
+            continue
+        
+        mat_name = mat_slot.material.name
+        if mat_name not in material_links:
+            continue
+        
+        node_tree = mat_slot.material.node_tree
+        # Clear all existing links
+        for link in list(node_tree.links):
+            node_tree.links.remove(link)
+        # Restore original links
+        for from_socket, to_socket in material_links[mat_name]:
+            node_tree.links.new(from_socket, to_socket)
+
+def remove_temporary_nodes(obj, node_types=("TEX_IMAGE", "EMISSION", "COMBRGB")):
+    """Remove temporary nodes added for baking."""
+    for mat_slot in obj.material_slots:
+        if not mat_slot.material or not mat_slot.material.use_nodes:
+            continue
+        
+        node_tree = mat_slot.material.node_tree
+        nodes_to_remove = [
+            node for node in node_tree.nodes if node.type in node_types
+        ]
+        for node in nodes_to_remove:
+            node_tree.nodes.remove(node)
 
 class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
     """Bake Textures for Unreal Engine with Progress Bar (Modal)"""
@@ -3565,11 +3965,16 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
         return self.execute(context)
 
     def execute(self, context):
+        # Reset UV unwrapped objects tracker
+        self._uv_unwrapped_objects = set()
+        
         assetify_settings = context.scene.assetify_bake_settings
         texture_path = bpy.path.abspath(assetify_settings.bake_folder)
 
         # Ensure viewport shading is set to solid
         set_viewport_shading_to_solid(context)
+        
+        self.original_material_links = {}
 
         # Check if we are in 'ASSET' or 'COLLECTION' mode
         if assetify_settings.asset_mode == 'ASSET':
@@ -3593,15 +3998,27 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
             mode_type = 'asset' if assetify_settings.asset_mode == 'ASSET' else 'collection'
             self.report({'ERROR'}, f"No objects to bake in {mode_type} mode.")
             return {'CANCELLED'}
+        
+        # Prepare for animation mode
+        if assetify_settings.texturebake_mode == 'ANIMATION':
+            self._frame_index = context.scene.frame_start
+            self._current_frame = context.scene.frame_current
+            self.total_bake_steps = len(self._objects_to_bake) * self._steps_per_object * (context.scene.frame_end - context.scene.frame_start + 1)
+        else:
+            self.total_bake_steps = len(self._objects_to_bake) * self._steps_per_object
 
-        # Store original material setups for reset functionality
-        self.original_materials = {}
         for obj in self._objects_to_bake:
             if obj and obj.data.materials:
-                self.original_materials[obj.name] = [mat.copy() for mat in obj.data.materials]
+                self.original_material_links[obj.name] = store_material_links(obj)
 
         # Run cleanup for images before baking
         self.cleanup_images_for_baking()
+
+        # Initialize frame tracking for ANIMATION mode
+        if assetify_settings.texturebake_mode == 'ANIMATION':
+            self._total_frames = context.scene.frame_end - context.scene.frame_start + 1
+        else:
+            self._total_frames = 1
 
         # Initialize progress tracking and start modal baking process
         self.bake_progress = 0
@@ -3655,13 +4072,59 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
             return {'CANCELLED'}
         
         if event.type == 'TIMER':
+            if context.scene.assetify_bake_settings.texturebake_mode == 'ANIMATION':
+                total_frames = context.scene.frame_end - context.scene.frame_start + 1
+                total_steps = total_frames * len(self._objects_to_bake) * self._steps_per_object
+
+                if self._frame_index > context.scene.frame_end:
+                    # Restore original frame
+                    context.scene.frame_set(self._current_frame)
+
+                    # Finalize baking
+                    self.current_operation = "Baking Complete."
+                    self.current_sub_operation = ""
+                    print(f"Baking complete for all frames. Removing timer.")
+                    remove_progress_bar(self)
+                    switch_to_solid_shading_and_back()
+                    bpy.context.window_manager.event_timer_remove(self._timer)
+
+                    # Update baked asset list and statuses
+                    update_baked_asset_list(context)
+                    update_baked_collections_status(context)
+                    context.scene.assetify_bake_settings.assets_baked = True
+
+                    # Cleanup
+                    if hasattr(self, 'original_materials'):
+                        del self.original_materials  # Clean up memory
+
+                    self.report({'INFO'}, "Baking operation completed successfully.")
+                    return {'FINISHED'}
+
+                # Update progress based on current frame, object, and step
+                current_step = (
+                    (self._frame_index - context.scene.frame_start) * len(self._objects_to_bake) * self._steps_per_object
+                ) + (self._bake_index * self._steps_per_object) + self._step_index + 1
+                self.progress_value = current_step / total_steps
+                self.progress_value = min(self.progress_value, 1.0)  # Clamp to 1.0
+
+                # Request a redraw for progress bar updates
+                bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+
+                # Set current frame
+                context.scene.frame_set(self._frame_index)
+                print(f"Baking frame {self._frame_index} - Progress: {self.progress_value * 100:.2f}%")
+                
             if self._bake_index < len(self._objects_to_bake):
                 obj = self._objects_to_bake[self._bake_index]
 
-                # Ensure the object is active and selected
-                bpy.ops.object.select_all(action='DESELECT')  # Deselect all
-                bpy.context.view_layer.objects.active = obj      # Set as active
-                obj.select_set(True)                            # Select the object
+                # Deselect all objects without using bpy.ops
+                for obj_to_deselect in bpy.context.selected_objects:
+                    obj_to_deselect.select_set(False)
+
+                # Select and set the current object as active
+                context.view_layer.objects.active = obj
+                obj.select_set(True)
+                          # Select the object
 
                 platform = context.scene.assetify_bake_settings.platform_target
 
@@ -3670,18 +4133,25 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                     if not hasattr(self, '_original_materials'):
                         self._original_materials = store_original_materials(obj)
 
+                    if not hasattr(self, '_uv_unwrapped_objects'):
+                        self._uv_unwrapped_objects = set()
+
                     # Ungroup nodes in all materials
                     for slot in obj.material_slots:
                         if slot.material:
                             ungroup_nodes(slot.material)
 
-                    # Check if UV unwrapping should be skipped
-                    if not context.scene.assetify_bake_settings.skip_uv_unwrap:
-                        self.current_sub_operation = "Applying UV Unwrap..."
-                        smart_uv_project(obj)
-                        print(f"UV unwrapped for {obj.name}")
+                    # Perform UV unwrapping only if the object hasn't been unwrapped yet
+                    if obj.name not in self._uv_unwrapped_objects:
+                        if not context.scene.assetify_bake_settings.skip_uv_unwrap:
+                            self.current_sub_operation = "Applying UV Unwrap..."
+                            smart_uv_project(obj)
+                            print(f"UV unwrapped for {obj.name}")
+                            self._uv_unwrapped_objects.add(obj.name)  # Mark as unwrapped
+                        else:
+                            print(f"Skipping UV unwrapping for {obj.name}")
                     else:
-                        print(f"Skipping UV unwrapping for {obj.name}")
+                        print(f"Object {obj.name} already UV unwrapped, skipping.")
 
                 if platform == 'UNITY':
                     baking_steps = [
@@ -3689,13 +4159,14 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                         {"name": "Baking MetallicSmoothness", "func": lambda: bake_and_save(obj, 'COMBINED', 'MetallicSmoothness', context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
                         {"name": "Baking Normal", "func": lambda: bake_and_save(obj, 'NORMAL', 'Normal', context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
                         {"name": "Baking Alpha", "func": lambda: bake_alpha_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder))},
-                        # Skip simplifying and finalizing steps if UV unwrapping is skipped
-                        *([] if context.scene.assetify_bake_settings.skip_uv_unwrap else [
-                            {"name": "Simplifying Materials and UV Maps", "func": lambda: simplify_materials_and_uv_maps(obj)},
-                            {"name": "Finalizing UV Map naming", "func": lambda: finalize_uv_maps(obj)}
-                        ]),
-                        {"name": "Applying Baked Textures", "func": lambda: apply_baked_textures(obj, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)}
                     ]
+
+                    if context.scene.assetify_bake_settings.texturebake_mode == 'STILL':
+                        baking_steps.extend([
+                            {"name": "Simplifying Materials and UV Maps", "func": lambda: simplify_materials_and_uv_maps(obj)},
+                            {"name": "Finalizing UV Map naming", "func": lambda: finalize_uv_maps(obj)},
+                            {"name": "Applying Baked Textures", "func": lambda: apply_baked_textures(obj, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
+                        ])
                 else:
                     baking_steps = [
                         {"name": "Baking BaseColor", "func": lambda: bake_and_save(obj, 'DIFFUSE', 'BaseColor', context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
@@ -3703,13 +4174,14 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                         {"name": "Baking Metallic", "func": lambda: bake_and_save(obj, 'COMBINED', 'Metallic', context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
                         {"name": "Baking Normal", "func": lambda: bake_and_save(obj, 'NORMAL', 'Normal', context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
                         {"name": "Baking Alpha", "func": lambda: bake_alpha_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder))},
-                        # Skip simplifying and finalizing steps if UV unwrapping is skipped
-                        *([] if context.scene.assetify_bake_settings.skip_uv_unwrap else [
-                            {"name": "Simplifying Materials and UV Maps", "func": lambda: simplify_materials_and_uv_maps(obj)},
-                            {"name": "Finalizing UV Map naming", "func": lambda: finalize_uv_maps(obj)}
-                        ]),
-                        {"name": "Applying Baked Textures", "func": lambda: apply_baked_textures(obj, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)}
                     ]
+
+                    if context.scene.assetify_bake_settings.texturebake_mode == 'STILL':
+                        baking_steps.extend([
+                            {"name": "Simplifying Materials and UV Maps", "func": lambda: simplify_materials_and_uv_maps(obj)},
+                            {"name": "Finalizing UV Map naming", "func": lambda: finalize_uv_maps(obj)},
+                            {"name": "Applying Baked Textures", "func": lambda: apply_baked_textures(obj, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
+                        ])
 
                 if self._step_index < len(baking_steps):
                     step = baking_steps[self._step_index]
@@ -3741,34 +4213,52 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                     self._step_index += 1
                     
                 else:
-                    update_baked_status(obj, True)
-                    self._step_index = 0
-                    self._bake_index += 1
+                    if context.scene.assetify_bake_settings.texturebake_mode == 'ANIMATION':
+                        # In ANIMATION mode, restore original materials
+                        if obj.name in self.original_material_links:
+                            try:
+                                restore_material_links(obj, self.original_material_links[obj.name])
+                            except Exception as e:
+                                print(f"[ERROR] Failed to restore material links for {obj.name}: {e}")
+                            remove_temporary_nodes(obj)  # Clean up temporary nodes
+                    else:
+                        # In STILL mode, KEEP baked textures and skip restoring original materials
+                        print(f"[INFO] Skipping material restoration for {obj.name} in STILL mode.")
 
-                    # Restore original materials after baking
-                    #restore_original_materials(obj, self._original_materials)
-                    #del self._original_materials  # Clean up
+                    # Move to the next object or frame
+                    self._bake_index += 1  # Proceed to the next object
+                    self._step_index = 0   # Reset the step index for the new object
 
-            else:
-                # Baking complete
-                self.current_operation = "Baking Complete."
-                self.current_sub_operation = ""
+                    # Check if all objects have been baked
+                    if self._bake_index >= len(self._objects_to_bake):
+                        if context.scene.assetify_bake_settings.texturebake_mode == 'ANIMATION':
+                            # For animation mode, move to the next frame
+                            self._frame_index += 1
+                            self._bake_index = 0  # Reset the object index for the new frame
+                            return {'PASS_THROUGH'}
+                        else:
+                            # Still mode: Finalize the process
+                            self.current_operation = "Baking Complete."
+                            self.current_sub_operation = ""
+                            print(f"Baking complete for all objects. Removing timer.")
+                            remove_progress_bar(self)
+                            switch_to_solid_shading_and_back()
+                            bpy.context.window_manager.event_timer_remove(self._timer)
 
-                print(f"Baking complete for all objects. Removing timer.")
-                remove_progress_bar(self)
-                switch_to_solid_shading_and_back()
-                bpy.context.window_manager.event_timer_remove(self._timer)
-                
-                update_baked_asset_list(context)
-                
-                update_baked_collections_status(context)
-                
-                # Set assets_baked to True after baking completes
-                context.scene.assetify_bake_settings.assets_baked = True
-                
-                update_baked_collections_status(context)         
+                            # Restore original frame if necessary
+                            if hasattr(self, '_current_frame'):
+                                context.scene.frame_set(self._current_frame)
 
-                return {'FINISHED'}
+                            update_baked_asset_list(context)
+                            update_baked_collections_status(context)
+                            context.scene.assetify_bake_settings.assets_baked = True
+
+                            # Cleanup
+                            if hasattr(self, 'original_materials'):
+                                del self.original_materials  # Clean up memory
+
+                            self.report({'INFO'}, "Baking operation completed successfully.")
+                            return {'FINISHED'}
                     
             return {'PASS_THROUGH'}
 
@@ -3779,6 +4269,11 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
         self.current_operation = "Baking Cancelled."
         self.current_sub_operation = ""
         remove_progress_bar(self)
+
+        for obj in self._objects_to_bake:
+            if obj.name in self.original_material_links:
+                restore_material_links(obj, self.original_material_links[obj.name])
+            remove_temporary_nodes(obj)  # Clean up temporary nodes
 
         if self._timer:
             bpy.context.window_manager.event_timer_remove(self._timer)
@@ -3839,33 +4334,49 @@ def ensure_gpu_rendering():
         debug_print("No GPU found, using CPU for baking.")
         
 def ensure_optix_denoiser():
-    """Ensure OptiX denoiser is enabled if available, otherwise fallback to OpenImageDenoise."""
+    """Ensure OptiX denoiser is enabled if available, otherwise fallback to OpenImageDenoise or disable if unsupported."""
     scene = bpy.context.scene
 
     # Ensure the Cycles engine is active
-    if scene.render.engine == 'CYCLES':
-        # Get Cycles preferences
+    if scene.render.engine != 'CYCLES':
+        print("[DEBUG] Render engine is not Cycles, skipping denoiser setup.")
+        return
+
+    # Get Cycles preferences safely
+    try:
         prefs = bpy.context.preferences.addons['cycles'].preferences
+        prefs.get_devices()  # Refresh device list
+    except KeyError:
+        print("[ERROR] Cycles preferences not found. Make sure Cycles is installed and active.")
+        return
+    except AttributeError:
+        print("[ERROR] Could not retrieve Cycles preferences, possibly due to a compatibility issue.")
+        return
 
-        # Refresh device list
-        prefs.get_devices()
+    # Check system type for platform-specific adjustments
+    is_mac = sys.platform == "darwin"
 
-        # Check if OptiX is available among the devices
-        if any(device.type == 'OPTIX' and device.use for device in prefs.devices):
-            scene.cycles.use_denoising = True
-            scene.cycles.denoiser = 'OPTIX'
-            debug_print("OptiX denoiser enabled.")
-        elif hasattr(scene.cycles, 'denoiser') and 'OPENIMAGEDENOISE' in scene.cycles.denoiser:
-            # Fallback to OpenImageDenoise if OptiX is not available
-            scene.cycles.use_denoising = True
-            scene.cycles.denoiser = 'OPENIMAGEDENOISE'
-            debug_print("OptiX not available, using OpenImageDenoise.")
-        else:
-            # No compatible denoiser available
-            scene.cycles.use_denoising = False
-            debug_print("No compatible denoiser available.")
+    # Ensure Cycles denoising settings exist
+    if not hasattr(scene.cycles, "denoiser"):
+        print("[ERROR] Scene does not have denoiser settings. This Blender version might not support denoising.")
+        return
+
+    # Check if OptiX is available among devices
+    optix_available = any(device.type == 'OPTIX' and device.use for device in prefs.devices)
+    oidn_available = hasattr(scene.cycles, 'denoiser') and 'OPENIMAGEDENOISE' in scene.cycles.denoiser
+
+    # Apply denoising settings based on availability
+    if optix_available and not is_mac:  # OptiX is not available on macOS
+        scene.cycles.use_denoising = True
+        scene.cycles.denoiser = 'OPTIX'
+        print("[DEBUG] OptiX denoiser enabled.")
+    elif oidn_available:
+        scene.cycles.use_denoising = True
+        scene.cycles.denoiser = 'OPENIMAGEDENOISE'
+        print("[DEBUG] OptiX not available, using OpenImageDenoise.")
     else:
-        debug_print("Render engine is not Cycles, cannot enable denoiser.")
+        scene.cycles.use_denoising = False
+        print("[DEBUG] No compatible denoiser available, disabling denoising.")
         
 def smart_uv_project(obj):
     """
@@ -3940,6 +4451,11 @@ def convert_uvmap_attribute_to_uv_layer(obj):
     Ensures that the new UV layer is named 'UVMap' and no duplicates are created.
     """
     uvmap_name = "UVMap"
+    
+    # Check if the object has a 'uv_layers' attribute (only meshes support UV layers)
+    if not hasattr(obj.data, 'uv_layers'):
+        print(f"Object '{obj.name}' does not support UV layers (type: {obj.type}). Skipping.")
+        return
 
     # Check if an existing UVMap with the same name exists
     existing_uvmap = obj.data.uv_layers.get(uvmap_name)
@@ -4053,18 +4569,44 @@ def add_realize_instances_node(geometry_node_modifier):
         debug_print("Original connections restored. Realize Instances node removed.")
 
     return revert_changes
-    
-def realize_geometry_node_instances(obj):
+ 
+def realize_geometry_node_instances(obj, skip_conversion=False):
     """
     Adds 'Realize Instances' node to each Geometry Nodes modifier on the object
-    and reverts changes after processing. Handles both meshes and curves.
+    and optionally skips conversion to mesh based on centralized conditions.
     """
+    # Assign animation type and file format for the object
+    scene = bpy.context.scene
+    obj['animation_type'] = scene.assetify_animation_settings.animation_type
+    obj['file_format'] = scene.assetify_animation_settings.file_format
+    skip_conditions = animation_processor.get_skip_conditions()
+    assetify_settings = bpy.context.scene.assetify_bake_settings
+    debug_print(f"[DEBUG] Assigned animation_type: {obj['animation_type']}, file_format: {obj['file_format']} to {obj.name}")
+    
+    animation_type = obj['animation_type']
+    file_format = obj['file_format']
+
+    # Debug: Log object properties and conditions
+    debug_print(f"[DEBUG] Object: {obj.name}, Animation Type: {animation_type}, File Format: {file_format}")
+    debug_print(f"[DEBUG] Skip Conditions: {skip_conditions}")
+    
+    # Set skip_conditions based on the bake mode
+    if assetify_settings.bake_mode == 'STILL':
+        skip_conversion = False
+        print("[INFO] Bake mode is STILL. Skipping conditions disabled.")
+    else:
+        skip_conditions = animation_processor.get_skip_conditions()
+        if (animation_type, file_format) in skip_conditions:
+            debug_print(f"[INFO] Skipping conversion for {obj.name} ({animation_type}, {file_format}).")
+            return {'SKIPPED'}
+            print("[INFO] Bake mode is ANIMATION. Using skip conditions from animation processor.")
+
     if obj.type not in {'MESH', 'CURVE'}:
         debug_print(f"Object {obj.name} is neither a mesh nor a curve. Skipping...")
-        return
-    
+        return {'SKIPPED'}
+
     debug_print(f"Processing object: {obj.name}")
-    
+
     cleanup_functions = []  # Store cleanup functions for reverting changes
 
     # Check and process all modifiers on the object
@@ -4076,34 +4618,110 @@ def realize_geometry_node_instances(obj):
             if modifier.type == 'NODES':  # Check if it's a Geometry Nodes modifier
                 debug_print(f"Found Geometry Nodes modifier: {modifier.name}")
                 cleanup = add_realize_instances_node(modifier)
-                if cleanup:
+                if callable(cleanup):
                     cleanup_functions.append(cleanup)
+                else:
+                    debug_print(f"[WARNING] Cleanup function for modifier {modifier.name} is not callable.")
 
-    # If the object is a curve and should be converted to a mesh:
-    if obj.type == 'CURVE':
-        debug_print(f"Converting curve object {obj.name} to mesh.")
-        bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.convert(target='MESH')  # Convert curve to mesh before applying modifiers
-        debug_print(f"Curve object {obj.name} converted to mesh.")
-    elif obj.type == 'MESH':
-        debug_print(f"Converting mesh object {obj.name} to final mesh.")
-        bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.convert(target='MESH')  # Convert mesh to a final mesh after realizing instances
-        debug_print(f"Mesh object {obj.name} converted to final mesh.")
+    # Skip the conversion section if the flag is set
+    if not skip_conversion:
+        if obj.type == 'CURVE':
+            debug_print(f"Converting curve object {obj.name} to mesh.")
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.convert(target='MESH')  # Convert curve to mesh before applying modifiers
+            debug_print(f"Curve object {obj.name} converted to mesh.")
+        elif obj.type == 'MESH':
+            debug_print(f"Converting mesh object {obj.name} to final mesh.")
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.convert(target='MESH')  # Convert mesh to a final mesh after realizing instances
+            debug_print(f"Mesh object {obj.name} converted to final mesh.")
+    else:
+        debug_print(f"Skipping mesh conversion for object {obj.name}.")
 
     # Ensure the object is still selected after conversion
     obj = bpy.context.active_object
 
     # Remove any empty material slots
     remove_empty_material_slots(obj)
-    
-    # Apply UV unwrap if necessary (this step is optional, uncomment if needed)
-    #smart_uv_project(obj)
-    
+
     # Revert changes to the Geometry Node tree
     for cleanup in cleanup_functions:
         cleanup()
-    debug_print("All changes reverted for geometry nodes.")
+    debug_print(f"All changes reverted for geometry nodes on {obj.name}.")
+
+    return {'FINISHED'}
+    
+def process_object(obj, custom_object, custom_name, custom_value_name):
+    """
+    Processes the object: applies geometry nodes, converts curves to meshes, makes materials unique,
+    renames materials, and removes empty material slots.
+    """
+    
+    scene = bpy.context.scene  # Access the scene
+    
+    # Set animation type and file format
+    obj['animation_type'] = scene.assetify_animation_settings.animation_type
+    obj['file_format'] = scene.assetify_animation_settings.file_format
+
+    debug_print(f"[DEBUG] Assigned animation_type: {obj['animation_type']}, file_format: {obj['file_format']} to {obj.name}")
+    debug_print(f"[INFO] Starting process for object: {obj.name}")
+
+    # Deselect all objects
+    bpy.ops.object.select_all(action='DESELECT')
+
+    # Set the duplicated object as the active object and select it
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    debug_print(f"[DEBUG] Object {obj.name} is set as active and selected.")
+
+    # Only call customize_color if Mossify mode is active
+    if scene.assetify_bake_settings.use_mossify:
+        debug_print(f"[DEBUG] Mossify mode active. Applying customize_color to {obj.name}.")
+        customize_color(obj, custom_object)
+    else:
+        debug_print(f"[DEBUG] Adding custom attributes to geometry for {obj.name}.")
+        add_custom_attributes_to_geometry(obj, custom_object)
+
+    # Handle geometry nodes
+    cleanup_functions = []  # Store cleanup functions for reverting changes
+    try:
+        debug_print(f"[DEBUG] Calling realize_geometry_node_instances for {obj.name}.")
+        cleanup = realize_geometry_node_instances(obj)
+
+        if cleanup == {'SKIPPED'}:
+            debug_print(f"[INFO] Skipped processing object {obj.name} due to skip conditions.")
+        elif cleanup and callable(cleanup):
+            debug_print(f"[DEBUG] Adding cleanup function for {obj.name}.")
+            cleanup_functions.append(cleanup)
+        else:
+            debug_print(f"[DEBUG] No cleanup function returned for {obj.name}.")
+
+        # Remove any empty material slots before making materials unique
+        remove_empty_material_slots(obj)
+        debug_print(f"[DEBUG] Removed empty material slots for {obj.name}.")
+
+        # Make the materials unique for the duplicated object
+        make_materials_unique(obj)
+        debug_print(f"[DEBUG] Made materials unique for {obj.name}.")
+
+        # Rename materials to match object name
+        rename_materials(obj)
+        debug_print(f"[DEBUG] Renamed materials for {obj.name}.")
+
+        # Convert UVMap attribute to an actual UV map layer
+        convert_uvmap_attribute_to_uv_layer(obj)
+        debug_print(f"[DEBUG] Converted UVMap attributes for {obj.name}.")
+
+    finally:
+        # Revert changes to the Geometry Nodes tree
+        for cleanup in cleanup_functions:
+            debug_print(f"[DEBUG] Reverting changes for {obj.name}.")
+            cleanup()
+        debug_print(f"[INFO] All temporary changes reverted for {obj.name}.")
+
+    # Deselect the object after processing
+    obj.select_set(False)
+    debug_print(f"[INFO] Completed processing for object: {obj.name}.")
 
 def make_materials_unique(obj):
     """
@@ -4175,55 +4793,6 @@ def duplicate_objects_in_collection(original_collection, game_ready_collection, 
             baked_collection.assets[-1].is_fbx_exported = baked_asset.is_fbx_exported
             baked_collection.assets[-1].include_in_send = baked_asset.include_in_send
             baked_collection.assets[-1].collection_name = baked_asset.collection_name
-
-def process_object(obj, custom_object, custom_name, custom_value_name):
-    """
-    Processes the object: applies geometry nodes, converts curves to meshes, makes materials unique, 
-    renames materials, and removes empty material slots.
-    """
-    scene = bpy.context.scene  # Access the scene
-
-    # Deselect all objects
-    bpy.ops.object.select_all(action='DESELECT')
-
-    # Set the duplicated object as the active object and select it
-    bpy.context.view_layer.objects.active = obj
-    obj.select_set(True)
-
-    # Only call customize_color if Mossify mode is active
-    if scene.assetify_bake_settings.use_mossify:
-        customize_color(obj, custom_object)
-    else:
-        add_custom_attributes_to_geometry(obj, custom_object)
-
-    # Handle geometry nodes
-    cleanup_functions = []  # Store cleanup functions for reverting changes
-    try:
-        # Realize geometry node instances and store cleanup
-        cleanup = realize_geometry_node_instances(obj)
-        if cleanup:
-            cleanup_functions.append(cleanup)
-
-        # Remove any empty material slots before making materials unique
-        remove_empty_material_slots(obj)
-
-        # Make the materials unique for the duplicated object
-        make_materials_unique(obj)
-
-        # Rename materials to match object name
-        rename_materials(obj)
-
-        # Convert UVMap attribute to an actual UV map layer
-        convert_uvmap_attribute_to_uv_layer(obj)
-
-    finally:
-        # Revert changes to the Geometry Nodes tree
-        for cleanup in cleanup_functions:
-            cleanup()
-        debug_print(f"All temporary changes reverted for {obj.name}.")
-
-    # Deselect the object after processing
-    obj.select_set(False)
 
 def process_collection(collection, game_ready_collection, assetify_settings, main_collection=None, operator=None):
     """
@@ -4404,6 +4973,9 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
 
     # Set render device (CPU or GPU)
     bpy.context.scene.cycles.device = assetify_settings.render_device.upper()
+    
+        # Ensure resolution is an integer
+    resolution = int(resolution)
 
     # Set tile size for Cycles
     if assetify_settings.use_tiling:
@@ -4427,17 +4999,71 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
     # Ensure OptiX denoiser if available
     ensure_optix_denoiser()
 
-    # Create a general "textures" folder for all textures
-    textures_folder = os.path.join(save_dir, "textures")
-    os.makedirs(textures_folder, exist_ok=True)
+    # Determine file path and frame-specific folder structure
+    if assetify_settings.texturebake_mode == 'ANIMATION':
+        # Create subfolder for the object
+        object_folder = os.path.join(save_dir, f"{obj.name}_textures")
+        os.makedirs(object_folder, exist_ok=True)
 
-    # Define the file path for the baked texture
-    texture_file_path = os.path.join(textures_folder, f"{obj.name}_{map_type}.png")
+        # Create subfolder for the map type
+        map_folder = os.path.join(object_folder, map_type)
+        os.makedirs(map_folder, exist_ok=True)
 
-    # Check if the texture file already exists and delete it to allow overriding
+        # Generate file name based on the current frame
+        frame_number = bpy.context.scene.frame_current
+        file_name = f"Frame{frame_number:04d}.png"
+        texture_file_path = os.path.join(map_folder, file_name)
+    else:
+        # For STILL mode, save in a single "textures" folder
+        textures_folder = os.path.join(save_dir, "textures")
+        os.makedirs(textures_folder, exist_ok=True)
+
+        # Save the map directly in the "textures" folder
+        texture_file_path = os.path.join(textures_folder, f"{obj.name}_{map_type}.png")
+
+    # Delete the file if it already exists
     if os.path.exists(texture_file_path):
         os.remove(texture_file_path)
-        print(f"Overwriting existing texture: {texture_file_path}")
+        print(f"[DEBUG] Removed existing file: {texture_file_path}")
+
+    # Create a new bake image for each frame
+    image_name = f"{obj.name}_{map_type}_Frame{bpy.context.scene.frame_current:04d}"
+    image = bpy.data.images.get(image_name) or bpy.data.images.new(
+        name=image_name,
+        width=resolution,
+        height=resolution,
+        alpha=True
+    )
+    image.colorspace_settings.name = 'Non-Color' if map_type in ["Roughness", "Normal", "Metallic"] else 'sRGB'
+
+    # Store original material links for restoration
+    original_material_links = {}
+
+    for mat_slot in obj.material_slots:
+        if mat_slot.material and mat_slot.material.use_nodes:
+            node_tree = mat_slot.material.node_tree
+
+            # Save original links for restoration
+            material_output = next((node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
+            if material_output:
+                original_material_links[mat_slot.material.name] = [
+                    (link.from_socket, link.to_socket)
+                    for link in node_tree.links
+                    if link.to_node == material_output
+                ]
+
+            # Remove previously added texture nodes for this bake
+            nodes_to_remove = [
+                node for node in node_tree.nodes
+                if node.type == 'TEX_IMAGE' and node.image and node.image.name.startswith(f"{obj.name}_{map_type}_Frame")
+            ]
+            for node in nodes_to_remove:
+                node_tree.nodes.remove(node)
+
+            # Create a new texture node for the current frame
+            tex_node = node_tree.nodes.new(type='ShaderNodeTexImage')
+            tex_node.image = image
+            node_tree.nodes.active = tex_node  # Set as active for baking
 
     if platform == "UNITY" and map_type == "MetallicSmoothness":
         # Step 1: Bake the roughness map (but don't save the individual roughness map)
@@ -4469,6 +5095,27 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
         packed_image.save()
 
         debug_print(f"Packed Roughness/Metallic for {obj.name} and saved as {packed_image.filepath_raw}")
+        
+            # Restore original material setup
+        for mat_slot in obj.material_slots:
+            if mat_slot.material and mat_slot.material.use_nodes:
+                node_tree = mat_slot.material.node_tree
+
+                # Remove texture nodes added for baking
+                nodes_to_remove = [
+                    node for node in node_tree.nodes if node.type == 'TEX_IMAGE'
+                ]
+                for node in nodes_to_remove:
+                    node_tree.nodes.remove(node)
+
+                # Restore original links to the material output node
+                material_output = next((node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
+                original_links = original_material_links.get(mat_slot.material.name, [])
+                for link in list(node_tree.links):
+                    if link.to_node == material_output:
+                        node_tree.links.remove(link)
+                for from_socket, to_socket in original_links:
+                    node_tree.links.new(from_socket, to_socket)
         
         return packed_image
 
@@ -4555,6 +5202,27 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
                         else:
                             # Restore the original value
                             metallic_input.default_value = saved_setting
+            
+                # Restore original material setup
+                for mat_slot in obj.material_slots:
+                    if mat_slot.material and mat_slot.material.use_nodes:
+                        node_tree = mat_slot.material.node_tree
+
+                        # Remove texture nodes added for baking
+                        nodes_to_remove = [
+                            node for node in node_tree.nodes if node.type == 'TEX_IMAGE'
+                        ]
+                        for node in nodes_to_remove:
+                            node_tree.nodes.remove(node)
+
+                        # Restore original links to the material output node
+                        material_output = next((node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
+                        original_links = original_material_links.get(mat_slot.material.name, [])
+                        for link in list(node_tree.links):
+                            if link.to_node == material_output:
+                                node_tree.links.remove(link)
+                        for from_socket, to_socket in original_links:
+                            node_tree.links.new(from_socket, to_socket)
             
             return image
         
@@ -4785,16 +5453,64 @@ def bake_roughness_map(obj, image):
  
 def bake_alpha_map(obj, resolution, save_dir):
     """Bake the alpha channel for all materials on the object into a single image."""
-
+    assetify_settings = bpy.context.scene.assetify_bake_settings
     ensure_cycles_render_engine()
+    
+    resolution = int(resolution)
+    
+    if assetify_settings.texturebake_mode == 'ANIMATION':
+        # Create a subfolder for the object being baked
+        object_folder = os.path.join(save_dir, f"{obj.name}_textures")
+        os.makedirs(object_folder, exist_ok=True)
 
-    # Create a folder for textures
-    textures_folder = os.path.join(save_dir, "textures")
-    os.makedirs(textures_folder, exist_ok=True)
+        # Create a subfolder for the Alpha map
+        map_folder = os.path.join(object_folder, "Alpha")
+        os.makedirs(map_folder, exist_ok=True)
 
-    # Create a single bake image
-    image = create_bake_image(obj, "Opacity", resolution)
+        # Generate a file name based on the current frame
+        frame_number = bpy.context.scene.frame_current
+        file_name = f"Frame{frame_number:04d}.png"
+        texture_file_path = os.path.join(map_folder, file_name)
+    else:
+        # For STILL mode, save directly in the "textures" folder
+        textures_folder = os.path.join(save_dir, "textures")
+        os.makedirs(textures_folder, exist_ok=True)
+
+        # Save the Alpha map as a single file
+        texture_file_path = os.path.join(textures_folder, f"{obj.name}_Alpha.png")
+
+    # Delete the file if it already exists
+    if os.path.exists(texture_file_path):
+        os.remove(texture_file_path)
+        print(f"[DEBUG] Removed existing file: {texture_file_path}")
+
+    # Create a new bake image for each frame
+    image_name = f"{obj.name}_Alpha_Frame{bpy.context.scene.frame_current:04d}"
+    image = bpy.data.images.get(image_name) or bpy.data.images.new(
+        name=image_name,
+        width=resolution,
+        height=resolution,
+        alpha=True
+    )
     image.colorspace_settings.name = 'Non-Color'
+
+    # Clean up previously added image nodes and add a new one
+    for mat_slot in obj.material_slots:
+        if mat_slot.material and mat_slot.material.use_nodes:
+            node_tree = mat_slot.material.node_tree
+
+            # Remove previously added texture nodes for this bake
+            nodes_to_remove = [
+                node for node in node_tree.nodes
+                if node.type == 'TEX_IMAGE' and node.image and node.image.name.startswith(f"{obj.name}_Alpha_Frame")
+            ]
+            for node in nodes_to_remove:
+                node_tree.nodes.remove(node)
+
+            # Create a new texture node for the current frame
+            tex_node = node_tree.nodes.new(type='ShaderNodeTexImage')
+            tex_node.image = image
+            node_tree.nodes.active = tex_node  # Set as active for baking
 
     # Store original connections and modifications
     materials_original_links = {}
@@ -4925,7 +5641,7 @@ def bake_alpha_map(obj, resolution, save_dir):
 
     # Save the baked image
     try:
-        image.filepath_raw = os.path.join(textures_folder, f"{obj.name}_Alpha.png")
+        image.filepath_raw = texture_file_path
         image.file_format = 'PNG'
         image.save()
         debug_print(f"Baked Alpha map saved at {image.filepath_raw}")
@@ -5140,6 +5856,11 @@ def simplify_materials_and_uv_maps(obj):
         debug_print(f"No extra material slots to remove for {obj.name}")
     
     game_uv_name = "GameUV"
+    
+    # Check if the object supports UV layers
+    if not hasattr(obj.data, 'uv_layers'):
+        debug_print(f"Object '{obj.name}' does not support UV layers (type: {obj.type}). Skipping.")
+        return
 
     # Confirm 'GameUV' exists to avoid issues
     game_uv = obj.data.uv_layers.get(game_uv_name)
@@ -5167,6 +5888,12 @@ def finalize_uv_maps(obj):
     """
     Ensures 'GameUV' is renamed to 'UVMap' and only one UV map is left at the end.
     """
+    
+    # Check if the object supports UV layers
+    if not hasattr(obj.data, 'uv_layers'):
+        debug_print(f"Object '{obj.name}' does not support UV layers (type: {obj.type}). Skipping.")
+        return
+    
     uvmap_name = "UVMap"
     gameuv_name = "GameUV"
 
@@ -5832,7 +6559,7 @@ class OBJECT_OT_export_collection_as_fbx(bpy.types.Operator):
                         self._objects_to_export.extend(self.collect_objects_from_collection(collection))
 
         # Filter out invalid objects
-        self._objects_to_export = [obj for obj in self._objects_to_export if obj and obj.type == 'MESH']
+        self._objects_to_export = [obj for obj in self._objects_to_export if obj]
 
         if not self._objects_to_export:
             self.report({'ERROR'}, "No valid assets to export.")
@@ -5888,7 +6615,7 @@ class OBJECT_OT_export_collection_as_fbx(bpy.types.Operator):
         """Export the object in the selected format."""
         export_format = assetify_settings.export_format
         sanitized_name = self.sanitize_name(obj.name.replace('_gameasset', ''))
-        export_file_path = os.path.join(export_path, f"{sanitized_name}.{export_format.lower()}")
+        export_file_path = os.path.join(export_path, f"{sanitized_name}_{export_format}_still.{export_format.lower()}")
 
         bpy.ops.object.select_all(action='DESELECT')
         obj.select_set(True)
@@ -5984,6 +6711,280 @@ class OBJECT_OT_export_collection_as_fbx(bpy.types.Operator):
         context.window_manager.event_timer_remove(self._timer)
         remove_progress_bar(self)
         self.report({'INFO'}, "Export canceled.")
+
+class OBJECT_OT_export_collection_with_animations(bpy.types.Operator):
+    """Export selected assets or collections with animations"""
+    bl_idname = "assetify.export_selected_animations"
+    bl_label = "Export Selected Animations"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    _timer = None
+    _export_index = 0
+    _objects_to_export = []
+    total_export_steps = 0
+    progress_value = 0.0
+    current_operation = ""
+    current_sub_operation = ""
+
+    draw_handler = None
+    space_reference = None
+
+    @classmethod
+    def poll(cls, context):
+        assetify_settings = context.scene.assetify_bake_settings
+        export_path = bpy.path.abspath(assetify_settings.export_fbx_path)
+
+        if not export_path or not os.path.isdir(export_path):
+            return False
+
+        if assetify_settings.asset_mode == 'ASSET':
+            return any(asset.include_in_send for asset in assetify_settings.baked_assets)
+
+        elif assetify_settings.asset_mode == 'COLLECTION':
+            return any(collection.include_in_send for collection in assetify_settings.baked_collections)
+
+        return False
+
+    def execute(self, context):
+        assetify_settings = context.scene.assetify_bake_settings
+        wm = context.window_manager
+
+        # Collect objects to export based on selected mode
+        if assetify_settings.asset_mode == 'ASSET':
+            self._objects_to_export = [
+                bpy.data.objects.get(asset.name) for asset in assetify_settings.baked_assets
+                if asset.include_in_send
+            ]
+        elif assetify_settings.asset_mode == 'COLLECTION':
+            self._objects_to_export = []
+            for baked_collection in assetify_settings.baked_collections:
+                if baked_collection.include_in_send:
+                    collection = bpy.data.collections.get(baked_collection.name)
+                    if collection:
+                        self._objects_to_export.extend(self.collect_objects_from_collection(collection))
+
+        # Filter out invalid objects
+        self._objects_to_export = [obj for obj in self._objects_to_export if obj]
+
+        if not self._objects_to_export:
+            self.report({'ERROR'}, "No valid assets with animations to export.")
+            return {'CANCELLED'}
+
+        # Initialize progress tracking
+        self.total_export_steps = len(self._objects_to_export)
+        start_progress_bar(self, initial_message="Exporting Selected Animations")
+        self.progress_value = 0.0
+        self.current_operation = "Exporting Animation Files..."
+
+        # Start modal timer
+        self._timer = wm.event_timer_add(0.1, window=context.window)
+        wm.modal_handler_add(self)
+
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type == 'TIMER':
+            if self._export_index < len(self._objects_to_export):
+                obj = self._objects_to_export[self._export_index]
+                assetify_settings = context.scene.assetify_bake_settings
+                export_path = bpy.path.abspath(assetify_settings.export_fbx_path)
+
+                # Export the object
+                self.current_sub_operation = f"Exporting {obj.name}..."
+                self.export_animation_object(obj, export_path, assetify_settings, context)
+
+                # Update progress
+                self._export_index += 1
+                self.progress_value = self._export_index / self.total_export_steps
+                bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+
+            else:
+                # Export complete
+                self.current_operation = "Export Complete."
+                remove_progress_bar(self)
+                context.window_manager.event_timer_remove(self._timer)
+                self.finalize_export(context)
+                return {'FINISHED'}
+
+        return {'PASS_THROUGH'}
+
+    def finalize_export(self, context):
+        """Finalize the export, update statuses, and refresh UI"""
+        assetify_settings = context.scene.assetify_bake_settings
+        update_collection_statuses(assetify_settings)
+        populate_baked_assets_from_scene(assetify_settings)
+        populate_baked_collections_from_scene(assetify_settings)
+        self.report({'INFO'}, "Exported animations for selected assets/collections.")
+
+    def export_animation_object(self, obj, export_path, assetify_settings, context):
+        """Export the object with animations in the selected format."""
+        animation_export_format = assetify_settings.animation_export_format
+        sanitized_name = self.sanitize_name(obj.name.replace('_gameasset', ''))
+        export_file_path = os.path.join(export_path, f"{sanitized_name}_{animation_export_format}_ANIM.{animation_export_format.lower()}")
+
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+
+        if animation_export_format == 'FBX':
+            bpy.ops.export_scene.fbx(
+                filepath=export_file_path,
+                use_selection=True,
+                bake_anim=True,
+                bake_anim_force_startend_keying=True,
+                bake_anim_simplify_factor=0.0,
+                object_types={'MESH', 'ARMATURE'},
+                path_mode='COPY',
+                embed_textures=True,
+                axis_forward='-Z',
+                axis_up='Y'
+            )
+            
+        elif animation_export_format == 'OBJ':
+            # Create a dedicated subfolder for OBJ animation frames
+            obj_anim_folder = os.path.join(export_path, f"{sanitized_name}_OBJ_ANIM")
+
+            if not os.path.exists(obj_anim_folder):
+                os.makedirs(obj_anim_folder)
+                print(f"[DEBUG] Created folder for OBJ animation export: {obj_anim_folder}")
+
+            # Loop through each frame and export as OBJ
+            for frame in range(bpy.context.scene.frame_start, bpy.context.scene.frame_end + 1):
+                bpy.context.scene.frame_set(frame)
+
+                # Export OBJ with proper naming (e.g., Plane_OBJ_ANIM0001.obj)
+                frame_file_name = f"{sanitized_name}_OBJ_ANIM{str(frame).zfill(4)}.obj"
+                frame_file_path = os.path.join(obj_anim_folder, frame_file_name)
+            
+                bpy.ops.wm.obj_export(
+                    filepath=frame_file_path,
+                    export_animation=True,  # OBJ itself does not support built-in animations
+                    start_frame=bpy.context.scene.frame_start,  # Scene's start frame
+                    end_frame=bpy.context.scene.frame_end,  # Scene's end frame
+                    export_selected_objects=True,  # Export selected objects
+                    apply_modifiers=True,  # Apply modifiers
+                    export_eval_mode='DAG_EVAL_VIEWPORT',  # Use viewport visibility
+                    export_uv=True,  # Export UVs
+                    export_normals=True,  # Export normals
+                    export_materials=True,  # Export materials
+                    export_pbr_extensions=False,  # Disable PBR extensions
+                    path_mode='COPY',  # Copy paths for any external files
+                    forward_axis='NEGATIVE_Z',  # Forward axis configuration
+                    up_axis='Y'  # Up axis configuration
+                )
+        
+        elif animation_export_format == 'ALEMBIC':
+            export_file_path = os.path.join(export_path, f"{sanitized_name}_ALEMBIC_ANIM.abc")
+            bpy.ops.wm.alembic_export(
+                filepath=export_file_path,
+                selected=True,
+                start=bpy.context.scene.frame_start,
+                end=bpy.context.scene.frame_end
+            )
+        elif animation_export_format == 'GLTF':
+            if obj.type == 'MESH':
+                bpy.context.view_layer.objects.active = obj
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_all(action='SELECT')
+                bpy.ops.mesh.quads_convert_to_tris()
+                bpy.ops.object.mode_set(mode='OBJECT')
+            
+            bpy.ops.export_scene.gltf(
+                filepath=export_file_path,
+                export_format='GLB',
+                use_selection=True,
+                export_animations=True,
+                export_yup=True,
+                export_apply=True,
+                export_normals=True,
+                export_tangents=True,
+                export_materials='NONE',
+                export_morph=True,  # Include shape keys
+                export_morph_normal=True,  # Export shape key normal deltas
+                export_morph_tangent=True,  # Exclude shape key tangent deltas
+                export_lights=False,  # Exclude lights
+                export_all_vertex_colors=False
+            )
+            
+        elif animation_export_format == 'MDD':
+            
+            ensure_mdd_extension_enabled()
+            
+            # Create the export path for MDD
+            export_file_path = os.path.join(export_path, f"{sanitized_name}_MDD_ANIM.mdd")
+            
+            bpy.context.view_layer.objects.active = obj
+
+            # Export MDD (Requires an OBJ sequence or baked animation)
+            bpy.ops.export_shape.mdd(
+                filepath=export_file_path,
+                frame_start=bpy.context.scene.frame_start,
+                frame_end=bpy.context.scene.frame_end,
+                fps=bpy.context.scene.render.fps,
+            )
+
+        print(f"[DEBUG] Exported {obj.name} with animations as {animation_export_format} to {export_file_path}") 
+
+    def collect_objects_from_collection(self, collection):
+        """Recursively collect all objects (mesh and armature) from the collection and its subcollections."""
+        objects = []
+        def collect_from_collection(col):
+            for obj in col.objects:
+                if obj.type in {'MESH', 'ARMATURE', 'CURVE', 'FONT'}:
+                    objects.append(obj)
+            for subcol in col.children:
+                collect_from_collection(subcol)
+        collect_from_collection(collection)
+        return objects
+
+    def sanitize_name(self, name):
+        """Sanitize object name to create valid folder and file names."""
+        return re.sub(r'[<>:"/\\|?*]', '_', name)
+
+    def cancel(self, context):
+        context.window_manager.event_timer_remove(self._timer)
+        remove_progress_bar(self)
+        self.report({'INFO'}, "Animation export canceled.")
+
+import bpy
+import addon_utils
+
+def ensure_mdd_extension_enabled():
+    """
+    Ensures that the 'NewTek MDD format' exporter is enabled in all Blender versions.
+    - Uses 'io_mesh_mdd' for versions < 4.3
+    - Uses 'bl_ext.blender_org.newtek_mdd_format' for Blender 4.3+
+    """
+    
+    # Define the correct module/extension names
+    legacy_addon_module = "io_mesh_mdd"  # For Blender 4.2 and below
+    extension_id = "bl_ext.blender_org.newtek_mdd_format"  # For Blender 4.3+
+
+    # Check Blender version
+    if bpy.app.version >= (4, 3, 0):
+        # Blender 4.3+ → Use the extension system
+        is_enabled = addon_utils.check(extension_id)[1]
+
+        if is_enabled:
+            print(f"[DEBUG] 'NewTek MDD format' extension is already enabled in Blender 4.3+.")
+        else:
+            try:
+                addon_utils.enable(extension_id, default_set=True, persistent=True)
+                print(f"[DEBUG] Successfully enabled 'NewTek MDD format' extension for Blender 4.3+.")
+            except Exception as e:
+                print(f"[ERROR] Failed to enable 'NewTek MDD format' extension: {e}")
+
+    else:
+        # Blender 4.2 and earlier → Use the legacy add-on system
+        is_enabled = addon_utils.check(legacy_addon_module)[1]
+
+        if is_enabled:
+            print(f"[DEBUG] 'NewTek MDD format' add-on is already enabled in Blender < 4.3.")
+        else:
+            try:
+                addon_utils.enable(legacy_addon_module, default_set=True, persistent=True)
+                print(f"[DEBUG] Successfully enabled 'NewTek MDD format' add-on for Blender < 4.3.")
+            except Exception as e:
+                print(f"[ERROR] Failed to enable 'NewTek MDD format' add-on: {e}")
 
 class ASSETIFY_OT_show_unimportable_assets(bpy.types.Operator):
     """Show a list of selected root collections or assets with details of missing textures or format files"""
@@ -6191,6 +7192,92 @@ def count_top_level_collections(collections):
     """
     return sum(1 for collection in collections if get_collection_level(collection.name) == 0)
 
+class ASSETIFY_OT_switch_export_mode(bpy.types.Operator):
+    """Switch between Still and Animation export modes"""
+    bl_idname = "assetify.switch_export_mode"
+    bl_label = "Switch Export Mode"
+
+    mode: bpy.props.EnumProperty(
+        items=[
+            ('STILL', "Still", "Switch to Still export mode"),
+            ('ANIMATION', "Animation", "Switch to Animation export mode")
+        ]
+    )
+
+    def execute(self, context):
+        assetify_settings = context.scene.assetify_bake_settings
+        assetify_settings.export_mode = self.mode
+        self.report({'INFO'}, f"Switched to {self.mode} export mode.")
+        return {'FINISHED'}
+    
+class ASSETIFY_OT_switch_texturebake_mode(bpy.types.Operator):
+    """Switch between Still and Animation texture bake modes"""
+    bl_idname = "assetify.switch_texturebake_mode"
+    bl_label = "Switch Texture Bake Mode"
+
+    mode: bpy.props.EnumProperty(
+        items=[
+            ('STILL', "Still", "Switch to Still texture bake mode"),
+            ('ANIMATION', "Animation", "Switch to Animation texture bake mode")
+        ]
+    )
+
+    def execute(self, context):
+        assetify_settings = context.scene.assetify_bake_settings
+        assetify_settings.texturebake_mode = self.mode
+        self.report({'INFO'}, f"Switched to {self.mode} texture bake mode.")
+        return {'FINISHED'}
+    
+class ASSETIFY_OT_switch_bake_mode(bpy.types.Operator):
+    """Switch between Still and Animation bake modes"""
+    bl_idname = "assetify.switch_bake_mode"
+    bl_label = "Switch Bake Mode"
+
+    mode: bpy.props.StringProperty()
+
+    def execute(self, context):
+        assetify_settings = context.scene.assetify_bake_settings
+        assetify_settings.bake_mode = self.mode
+        self.report({'INFO'}, f"Bake Mode set to {self.mode}")
+        return {'FINISHED'}
+
+class ASSETIFY_OT_show_mossify_mode_info(bpy.types.Operator):
+    """Show information about Mossify Mode"""
+    bl_idname = "assetify.show_mossify_mode_info"
+    bl_label = "Mossify Mode Info"
+
+    def invoke(self, context, event):
+        # Call the dialog popup
+        return context.window_manager.invoke_popup(self)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="Mossify Mode enables advanced customization options")
+        layout.label(text="for moss effects, including geometry nodes and textures.")
+
+    def execute(self, context):
+        return {'FINISHED'}
+    
+class ASSETIFY_OT_show_apply_frame_attributes_info(bpy.types.Operator):
+    """Show information about applying frame attributes"""
+    bl_idname = "assetify.show_apply_frame_attributes_info"
+    bl_label = "Apply Attributes Info"
+
+    def invoke(self, context, event):
+        # This calls the popup dialog
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        layout = self.layout
+        # Add the informational text here
+        layout.label(text="Apply baked data to object attributes")
+        layout.label(text="for shape-key processed geometry node animations.")
+        layout.label(text="Ensures shader animations match the baked data.")
+
+    def execute(self, context):
+        # No additional actions; the popup is only informational
+        return {'FINISHED'}
+
 class ASSETIFY_PT_tools_panel(bpy.types.Panel):
     """Creates a Panel in the 3D Viewport Tool Shelf"""
     bl_label = "Assetify"
@@ -6209,233 +7296,342 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         
         # Draw social links
         self.draw_social_links(layout)
-
-        # Mossify toggle button
-        row = layout.row()
-        row.operator("assetify.toggle_mossify_mode", text="Mossify Mode", depress=assetify_settings.use_mossify)
-
-        # Asset Collections list with add/remove buttons side by side
-        layout.label(text="Asset Collections:")
-        row = layout.row()
-        split = row.split(factor=0.8)
-        col = split.column()
-
-        # Calculate the number of rows based on the number of items in the list, with a min of 2 and max of 5
-        asset_collections_count = len(assetify_settings.asset_collections)
-        asset_collections_rows = min(max(asset_collections_count, 1), 100)
-
-        col.template_list("ASSETIFY_UL_asset_collections", "", assetify_settings, "asset_collections", assetify_settings, "active_asset_collection_index", rows=asset_collections_rows)
-
-        col = split.column(align=True)
-        col.operator("assetify.add_asset_collection", icon='ADD', text="")
-        col.operator("assetify.remove_asset_collection", icon='REMOVE', text="")
-
-        # Show the "Enable Custom Attributes" option only if Mossify is not enabled
-        if not assetify_settings.use_mossify:
-            row = layout.row(align=True)
-            row.operator("assetify.show_custom_attributes_info", text="", icon='INFO')
-            row.prop(assetify_settings, "enable_custom_attributes", text="Enable Custom Attributes")
-            # Add an info button next to the "Enable Custom Attributes" option
-
-        # Show the emitter input if Mossify is enabled or if custom attributes are enabled
-        if assetify_settings.use_mossify or assetify_settings.enable_custom_attributes:
-            layout.prop_search(scene, "custom_object", bpy.data, "objects", text="Emitter", icon='OUTLINER_OB_EMPTY')
-
-        # Show the custom attributes list and settings if "Enable Custom Attributes" is active
-        if not assetify_settings.use_mossify and assetify_settings.enable_custom_attributes:
-            layout.label(text="Custom Attributes")
-            row = layout.row()
-            # Calculate the number of rows based on the number of items in the list, with a min of 3 and max of 6
-            custom_attributes_count = len(assetify_settings.custom_attributes)
-            custom_attributes_rows = min(max(custom_attributes_count, 1), 100)
-
-            row.template_list(
-                "ASSETIFY_UL_custom_attributes",
-                "",
-                assetify_settings,
-                "custom_attributes",
-                assetify_settings,
-                "active_custom_attribute_index",
-                rows=custom_attributes_rows
-            )
-
-            col = row.column(align=True)
-            col.operator("assetify.add_custom_attribute", icon='ADD', text="")
-            col.operator("assetify.remove_custom_attribute", icon='REMOVE', text="")
-
-        row = layout.row(align=True)
-        # Info button
-        row.operator(
-            "assetify.show_disable_original_collections_info",
-            text="",
-            icon='INFO',
-            emboss=False
-        )
-        # Checkbox
-        row.prop(
-            assetify_settings,
-            "disable_original_collections",
-            text="Disable Original Collections"
-        )
-
-        # Set Game Assets button row with info icon
-        set_game_assets_row = layout.row(align=True)
-
-        # Info button (always enabled)
-        info_col = set_game_assets_row.column()
-        info_col.operator("assetify.show_set_game_assets_info", text="", icon='INFO', emboss=False)
-
-        # Set Game Assets button (enabled based on Asset Collections list and collections set)
-        set_game_assets_button_col = set_game_assets_row.column()
-
-        # Check if there are asset collections and all have a collection assigned
+        
+        # Ensure has_asset_collections and all_collections_assigned are defined before use
         has_asset_collections = len(assetify_settings.asset_collections) > 0
         all_collections_assigned = all(
             item.collection is not None for item in assetify_settings.asset_collections
         )
 
-        # Set the enabled state of the button
-        set_game_assets_button_col.enabled = has_asset_collections and all_collections_assigned
-        set_game_assets_button_col.operator("object.convert_to_game_ready", text="Process Assets")
-
-        # Create a row for the mode selection (Asset / Collection)
-        row = layout.row(align=True)
-
-        # Button for Asset Mode (Highlight if selected)
-        asset_button = row.operator(
-            "assetify.switch_mode",
-            text="Asset",
-            depress=assetify_settings.asset_mode == 'ASSET'
+        # Process Settings Section
+        box = layout.box()
+        row = box.row()
+        row.prop(
+            assetify_settings,
+            "show_bake_mode_menu",  # Controls the expansion of Process Section
+            text="",
+            icon="TRIA_DOWN" if assetify_settings.show_bake_mode_menu else "TRIA_RIGHT",
+            emboss=False
         )
-        asset_button.mode = 'ASSET'
+        row.label(text="Process Assets")
 
-        # Button for Collection Mode (Highlight if selected)
-        collection_button = row.operator(
-            "assetify.switch_mode",
-            text="Collection",
-            depress=assetify_settings.asset_mode == 'COLLECTION'
-        )
-        collection_button.mode = 'COLLECTION'
-        
-        # Initialize collection_in_send to avoid undefined errors
-        collection_in_send = False
-
-        if assetify_settings.asset_mode == 'ASSET':
-            
-            # Draw the headers as the first row (column titles)
-            header = layout.row(align=True)
-
-            # First column: Checkbox (10% of total width)
-            split = header.split(factor=0.15)  # Checkbox column: 10% of the total width
-            split.label(text="", icon='CHECKMARK')
-
-            # Second column: Name (40% of total width)
-            split = split.split(factor=0.4 / 0.9)  # Adjusted for 40% of the remaining width
-            split.label(text="Asset")
-
-            # Third column: Swap (16.66% of remaining width)
-            remaining = split.split(factor=0.5)  # Split remaining space into three equal parts
-            remaining.label(text="", icon='TEXTURE')
-
-            # Fifth column: Exported (16.66% of remaining width)
-            remaining.label(text="", icon='FILE_TICK')
-            
-            num_rows = max(min(len(assetify_settings.baked_assets), 5), 1)  # Limit to a maximum of 10 rows for better UI control
-            
-            row = layout.row()
-            row.template_list("ASSETIFY_UL_baked_assets", "", assetify_settings, "baked_assets", assetify_settings, "active_baked_asset_index", rows=num_rows)
-
-            layout.operator("assetify.refresh_asset_collection_list", text="Refresh List", icon='FILE_REFRESH')
-            #layout.operator("assetify.reset_materials", text="Reset Materials")
-
-            # Enable delete button if any asset has include_in_send=True
-            delete_assets_row = layout.row()
-            delete_assets_row.enabled = any(asset.include_in_send for asset in assetify_settings.baked_assets)
-            delete_assets_row.operator("assetify.delete_selected_assets", text="Delete Selected Assets", icon='TRASH')
-            
-            separate_assets_row = layout.row()
-            separate_assets_row.enabled = any(asset.include_in_send for asset in assetify_settings.baked_assets)
-            separate_assets_row.operator("assetify.separate_by_material", text="Separate by Material", icon='OUTLINER_OB_MESH')
-            
-            join_assets_row = layout.row()
-            join_assets_row.enabled = any(asset.include_in_send for asset in assetify_settings.baked_assets)
-            join_assets_row.operator("assetify.join_assets", text="Join Assets", icon='OBJECT_DATA')
-        else:
-            
-            # Draw the headers as the first row (column titles)
-            header = layout.row(align=True)
-
-            # First column: Checkbox (10% of total width)
-            split = header.split(factor=0.15)  # Checkbox column: 10% of the total width
-            split.label(text="", icon='CHECKMARK')
-
-            # Second column: Name (40% of total width)
-            split = split.split(factor=0.4 / 0.9)  # Adjusted for 40% of the remaining width
-            split.label(text="Collection")
-
-            # Third column: Swap (16.66% of remaining width)
-            remaining = split.split(factor=0.33)  # Split remaining space into three equal parts
-            remaining.label(text="", icon='ARROW_LEFTRIGHT')
-
-            # Fourth column: Baked (16.66% of remaining width)
-            remaining = remaining.split(factor=0.5)
-            remaining.label(text="", icon='TEXTURE')
-
-            # Fifth column: Exported (16.66% of remaining width)
-            remaining.label(text="", icon='FILE_TICK')
-            
-            num_top_level_collections = count_top_level_collections(assetify_settings.baked_collections)
-            num_collection_rows = max(min(num_top_level_collections, 5), 1)  # Limit to a maximum of 5 rows
-            
-            row = layout.row()
-            row.template_list("ASSETIFY_UL_collection_list", "", assetify_settings, "baked_collections", assetify_settings, "active_baked_collection_index",rows=num_collection_rows)
-
-            layout.operator("assetify.refresh_asset_collection_list", text="Refresh List", icon='FILE_REFRESH')
-
-            collection_in_send = any(
-                collection.include_in_send for collection in assetify_settings.baked_collections
+        if assetify_settings.show_bake_mode_menu:            
+            # Still Mode button
+            texbake_button = row.operator(
+                "assetify.switch_bake_mode",
+                text="Still",
+                depress=assetify_settings.bake_mode == 'STILL'
             )
-            
-            # Debugging to verify the state of each collection's include_in_send
-            #for collection in assetify_settings.baked_collections:
-            #    print(f"Collection '{collection.name}': include_in_send = {collection.include_in_send}")
+            texbake_button.mode = 'STILL'
 
-            #print(f"collection_in_send status: {collection_in_send}")
+            animbake_button = row.operator(
+                "assetify.switch_bake_mode",
+                text="Animation",
+                depress=assetify_settings.bake_mode == 'ANIMATION'
+            )
+            animbake_button.mode = 'ANIMATION'
 
-            # Enable delete button for collections
-            delete_collections_row = layout.row()
-            delete_collections_row.enabled = collection_in_send
-            delete_collections_row.operator("assetify.delete_selected_collections", text="Delete Selected Collections", icon='TRASH')
+            # Asset Collections list with add/remove buttons side by side
+            box.label(text="Asset Collections:")
+            row = box.row()
+            split = row.split(factor=0.8)
+            col = split.column()
+
+            # Calculate the number of rows based on the number of items in the list, with a min of 2 and max of 5
+            asset_collections_count = len(assetify_settings.asset_collections)
+            asset_collections_rows = min(max(asset_collections_count, 1), 100)
+
+            col.template_list(
+                "ASSETIFY_UL_asset_collections",
+                "",
+                assetify_settings,
+                "asset_collections",
+                assetify_settings,
+                "active_asset_collection_index",
+                rows=asset_collections_rows
+            )
+
+            col = split.column(align=True)
+            col.operator("assetify.add_asset_collection", icon='ADD', text="")
+            col.operator("assetify.remove_asset_collection", icon='REMOVE', text="")
             
-            separate_collections_row = layout.row()
-            separate_collections_row.enabled = collection_in_send
-            separate_collections_row.operator("assetify.separate_by_material", text="Separate by Material", icon='OUTLINER_OB_MESH')
-            
-            join_collections_row = layout.row()
-            join_collections_row.enabled = collection_in_send
-            join_collections_row.operator("assetify.join_assets", text="Join Assets", icon='OBJECT_DATA')
-            
-        if assetify_settings.asset_mode == 'COLLECTION':
-            # Swap button with info icon
-            swap_row = layout.row(align=True)
-            
-            # Info button (always enabled)
-            info_col = swap_row.column()
-            info_col.operator("assetify.show_swap_info", text="", icon='INFO', emboss=False)
-            
-            # Swap button (enabled based on collection_in_send)
-            swap_button_col = swap_row.column()
-            swap_button_col.enabled = collection_in_send  # Enable/disable only this column
-            swap_button_col.operator("assetify.swap_collections", text="Swap Selected Original & Game Assets")
+            # Mossify Mode option with Info button
+            row = box.row(align=True)
+            row.operator(
+                "assetify.show_mossify_mode_info",  # Create an operator for the info popup
+                text="",
+                icon='INFO',
+                emboss=False
+            )
+            row.prop(
+                assetify_settings,
+                "use_mossify",
+                text="Mossify Mode"
+            )
+
+            # Show the "Enable Custom Attributes" option only if Mossify is not enabled
+            if not assetify_settings.use_mossify:
+                row = box.row(align=True)
+                row.operator("assetify.show_custom_attributes_info", text="", icon='INFO', emboss=False)  # Set emboss=False
+                row.prop(assetify_settings, "enable_custom_attributes", text="Enable Custom Attributes")
+
+            # Show the emitter input if Mossify is enabled or if custom attributes are enabled
+            if assetify_settings.use_mossify or assetify_settings.enable_custom_attributes:
+                box.prop_search(scene, "custom_object", bpy.data, "objects", text="Emitter", icon='OUTLINER_OB_EMPTY')
+
+            # Show the custom attributes list and settings if "Enable Custom Attributes" is active
+            if not assetify_settings.use_mossify and assetify_settings.enable_custom_attributes:
+                box.label(text="Custom Attributes")
+                row = box.row()
+                # Calculate the number of rows based on the number of items in the list, with a min of 3 and max of 6
+                custom_attributes_count = len(assetify_settings.custom_attributes)
+                custom_attributes_rows = min(max(custom_attributes_count, 1), 100)
+
+                row.template_list(
+                    "ASSETIFY_UL_custom_attributes",
+                    "",
+                    assetify_settings,
+                    "custom_attributes",
+                    assetify_settings,
+                    "active_custom_attribute_index",
+                    rows=custom_attributes_rows
+                )
+
+                col = row.column(align=True)
+                col.operator("assetify.add_custom_attribute", icon='ADD', text="")
+                col.operator("assetify.remove_custom_attribute", icon='REMOVE', text="")
+
+            # Disable Original Collections option
+            row = box.row(align=True)
+            row.operator(
+                "assetify.show_disable_original_collections_info",
+                text="",
+                icon='INFO',
+                emboss=False
+            )
+            row.prop(
+                assetify_settings,
+                "disable_original_collections",
+                text="Disable Original Collections"
+            )
+
+            # Show options based on the selected bake mode
+            if assetify_settings.bake_mode == 'ANIMATION':
+                # Animation Mode settings
+                if hasattr(scene, "assetify_animation_settings"):
+                    settings = scene.assetify_animation_settings
+
+                    # Animation Type dropdown
+                    row = box.row(align=True)
+                    split = row.split(factor=0.5, align=True)
+                    split.label(text="Animation Type:")
+                    split.prop(settings, "animation_type", text="")
+
+                    # File Format dropdown
+                    row = box.row(align=True)
+                    split = row.split(factor=0.5, align=True)
+                    split.label(text="Desired Format:")
+                    split.prop(settings, "file_format", text="")
+
+                    # Process Animation button
+                    row = box.row(align=True)
+                    animation_type = settings.animation_type
+                    file_format = settings.file_format
+                    button_label = f"Process Animation ({file_format})"
+
+                    # Enable button only if asset collections exist and are assigned
+                    row.enabled = has_asset_collections and all_collections_assigned
+                    row.operator("object.convert_to_game_ready", text=button_label)
+                else:
+                    box.label(text="Animation Settings not found. Please reinitialize.")
+            else:
+                # Still Mode settings
+                row = box.row(align=True)
+                button_label = "Process Assets"
+
+                # Enable button only if asset collections exist and are assigned
+                row.enabled = has_asset_collections and all_collections_assigned
+                row.operator("object.convert_to_game_ready", text=button_label)
+
+                # Ensure everything remains functional and consistent
+                process_assets_row = layout.row(align=True)
+                process_button_col = process_assets_row.column()
+                process_button_col.enabled = has_asset_collections and all_collections_assigned
+
+        box = layout.box()
+        row = box.row()
+
+        # Collapsible triangle icon and label for the Asset List
+        row.prop(
+            assetify_settings,
+            "show_asset_list_menu",
+            text="",
+            icon="TRIA_DOWN" if assetify_settings.show_asset_list_menu else "TRIA_RIGHT",
+            emboss=False
+        )
+        row.label(text="Processed Asset List")
+
+        # Add Asset/Collection switch buttons if the menu is expanded
+        if assetify_settings.show_asset_list_menu:
+            # Asset/Collection switch buttons (placed next to the label)
+            row.operator(
+                "assetify.switch_mode",
+                text="Asset",
+                depress=assetify_settings.asset_mode == 'ASSET'
+            ).mode = 'ASSET'
+
+            row.operator(
+                "assetify.switch_mode",
+                text="Collection",
+                depress=assetify_settings.asset_mode == 'COLLECTION'
+            ).mode = 'COLLECTION'
+
+            if assetify_settings.asset_mode == 'ASSET':
+                # Draw headers for Asset List
+                header = box.row(align=True)
+                split = header.split(factor=0.15)
+                split.label(text="", icon='CHECKMARK')
+                split = split.split(factor=0.4 / 0.9)
+                split.label(text="Asset")
+                remaining = split.split(factor=0.5)
+                remaining.label(text="", icon='TEXTURE')
+                remaining.label(text="", icon='FILE_TICK')
+
+                # Draw asset list
+                num_rows = max(min(len(assetify_settings.baked_assets), 5), 1)
+                row = box.row()
+                row.template_list(
+                    "ASSETIFY_UL_baked_assets",
+                    "",
+                    assetify_settings,
+                    "baked_assets",
+                    assetify_settings,
+                    "active_baked_asset_index",
+                    rows=num_rows
+                )
+
+                box.operator("assetify.refresh_asset_collection_list", text="Refresh List", icon='FILE_REFRESH')
+
+                # Buttons for delete, separate, and join
+                delete_assets_row = box.row()
+                delete_assets_row.enabled = any(asset.include_in_send for asset in assetify_settings.baked_assets)
+                delete_assets_row.operator("assetify.delete_selected_assets", text="Delete Selected Assets", icon='TRASH')
+
+                separate_assets_row = box.row()
+                separate_assets_row.enabled = any(asset.include_in_send for asset in assetify_settings.baked_assets)
+                separate_assets_row.operator("assetify.separate_by_material", text="Separate by Material", icon='OUTLINER_OB_MESH')
+
+                join_assets_row = box.row()
+                join_assets_row.enabled = any(asset.include_in_send for asset in assetify_settings.baked_assets)
+                join_assets_row.operator("assetify.join_assets", text="Join Assets", icon='OBJECT_DATA')
+
+            else:
+                # Draw headers for Collection List
+                header = box.row(align=True)
+                split = header.split(factor=0.15)
+                split.label(text="", icon='CHECKMARK')
+                split = split.split(factor=0.4 / 0.9)
+                split.label(text="Collection")
+                remaining = split.split(factor=0.33)
+                remaining.label(text="", icon='ARROW_LEFTRIGHT')
+                remaining = remaining.split(factor=0.5)
+                remaining.label(text="", icon='TEXTURE')
+                remaining.label(text="", icon='FILE_TICK')
+
+                # Draw collection list
+                num_top_level_collections = count_top_level_collections(assetify_settings.baked_collections)
+                num_collection_rows = max(min(num_top_level_collections, 5), 1)
+                row = box.row()
+                row.template_list(
+                    "ASSETIFY_UL_collection_list",
+                    "",
+                    assetify_settings,
+                    "baked_collections",
+                    assetify_settings,
+                    "active_baked_collection_index",
+                    rows=num_collection_rows
+                )
+
+                box.operator("assetify.refresh_asset_collection_list", text="Refresh List", icon='FILE_REFRESH')
+
+                # Enable buttons for collections
+                collection_in_send = any(
+                    collection.include_in_send for collection in assetify_settings.baked_collections
+                )
+
+                delete_collections_row = box.row()
+                delete_collections_row.enabled = collection_in_send
+                delete_collections_row.operator("assetify.delete_selected_collections", text="Delete Selected Collections", icon='TRASH')
+
+                separate_collections_row = box.row()
+                separate_collections_row.enabled = collection_in_send
+                separate_collections_row.operator("assetify.separate_by_material", text="Separate by Material", icon='OUTLINER_OB_MESH')
+
+                join_collections_row = box.row()
+                join_collections_row.enabled = collection_in_send
+                join_collections_row.operator("assetify.join_assets", text="Join Assets", icon='OBJECT_DATA')
+
+                if assetify_settings.asset_mode == 'COLLECTION':
+                    # Swap button with info icon
+                    swap_row = box.row(align=True)
+                    info_col = swap_row.column()
+                    info_col.operator("assetify.show_swap_info", text="", icon='INFO', emboss=False)
+                    swap_button_col = swap_row.column()
+                    swap_button_col.enabled = collection_in_send
+                    swap_button_col.operator("assetify.swap_collections", text="Swap Selected Original & Game Assets")
 
         # Bake Settings Section
         box = layout.box()
         row = box.row()
         row.prop(assetify_settings, "bake_menu_expanded", text="", icon="TRIA_DOWN" if assetify_settings.bake_menu_expanded else "TRIA_RIGHT", emboss=False)
-        row.label(text="Bake Settings")
+        row.label(text="Bake Assets")
         
         if assetify_settings.bake_menu_expanded:
             
+            # Button for Still Mode (Highlight if selected)
+            texbake_button = row.operator(
+                "assetify.switch_texturebake_mode",
+                text="Still",
+                depress=assetify_settings.texturebake_mode == 'STILL'
+            )
+            texbake_button.mode = 'STILL'
+
+            # Button for Animation Mode (Highlight if selected)
+            animbake_button = row.operator(
+                "assetify.switch_texturebake_mode",
+                text="Animation",
+                depress=assetify_settings.texturebake_mode == 'ANIMATION'
+            )
+            animbake_button.mode = 'ANIMATION'
+            
+            # Show "Apply Attributes" button only in Animation mode
+            if assetify_settings.texturebake_mode == 'ANIMATION':
+                row = box.row(align=True)
+                
+                # Add an info button with emboss disabled
+                row.operator(
+                    "assetify.show_apply_frame_attributes_info",  # Info operator for explanation
+                    text="",
+                    icon='INFO',
+                    emboss=False
+                )
+                
+                # Add label for the button
+                split = row.split(factor=0.45, align=True)
+                split.label(text="Apply Attributes")
+                
+                # Add the "Apply Attributes" button with enabled logic
+                apply_button_col = split.column()
+                apply_button_col.enabled = (
+                    (assetify_settings.asset_mode == 'ASSET' and any(
+                        asset.include_in_send for asset in assetify_settings.baked_assets
+                    )) or
+                    (assetify_settings.asset_mode == 'COLLECTION' and any(
+                        collection.include_in_send for collection in assetify_settings.baked_collections
+                    ))
+                )
+                apply_button_col.operator("animation.add_frame_dependent_attributes", text="Apply Attributes")
+                        
             row = box.row(align=True)
             split = row.split(factor=0.5, align=True)  # Adjust factor for alignment
             split.label(text="Skip UV Unwrap")
@@ -6481,11 +7677,16 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             split.prop(assetify_settings, "bake_samples", text="")  # Numeric input on the right
 
             # Bake button row with info icon
-            bake_row = layout.row(align=True)
+            bake_row = box.row(align=True)
 
             # Info button (always enabled)
             info_col = bake_row.column()
             info_col.operator("assetify.show_bake_info", text="", icon='INFO', emboss=False)
+            
+            bake_button_label = (
+                "Bake Selected Assets (STILL)" if assetify_settings.texturebake_mode == 'STILL'
+                else "Bake Selected Assets (ANIM)"
+            )
 
             # Bake button (enabled based on selected items)
             bake_button_col = bake_row.column()
@@ -6497,47 +7698,87 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                     collection.include_in_send for collection in assetify_settings.baked_collections
                 ))
             )
-            bake_button_col.operator("object.bake_textures_modal", text="Bake Assets")
+            bake_button_col.operator("object.bake_textures_modal", text=bake_button_label)
 
         # Export Settings Section
         box = layout.box()
         row = box.row()
         row.prop(assetify_settings, "export_menu_expanded", text="", icon="TRIA_DOWN" if assetify_settings.export_menu_expanded else "TRIA_RIGHT", emboss=False)
-        row.label(text="Export Settings")
+        row.label(text="Export/Import Assets")
 
         if assetify_settings.export_menu_expanded:
+            
+            # Button for Still Mode (Highlight if selected)
+            still_button = row.operator(
+                "assetify.switch_export_mode",
+                text="Still",
+                depress=assetify_settings.export_mode == 'STILL'
+            )
+            still_button.mode = 'STILL'
+
+            # Button for Animation Mode (Highlight if selected)
+            animation_button = row.operator(
+                "assetify.switch_export_mode",
+                text="Animation",
+                depress=assetify_settings.export_mode == 'ANIMATION'
+            )
+            animation_button.mode = 'ANIMATION'
+                
+            # Export Section
+            export_box = layout.box()  # Create a dedicated container for export elements
+
             # Display export_fbx_path, which is automatically updated
-            row = box.row(align=True)
+            row = export_box.row(align=True)
             split = row.split(factor=0.5, align=True)
             split.label(text="Export Path")
             split.prop(assetify_settings, "export_fbx_path", text="")
 
-            # Add export format dropdown
-            row = box.row(align=True)
-            row.label(text="Export Format")
-            row.prop(assetify_settings, "export_format", text="")  # Export format dropdown
+            # Export Format Dropdown Row
+            dropdown_row = export_box.row(align=True)
+            if assetify_settings.export_mode == 'STILL':
+                dropdown_row.label(text="Still Export Format")
+                dropdown_row.prop(assetify_settings, "export_format", text="")
+            elif assetify_settings.export_mode == 'ANIMATION':
+                dropdown_row.label(text="Anim Export Format")
+                dropdown_row.prop(assetify_settings, "animation_export_format", text="")
 
-            # Add the info button and export button
-            export_row = box.row(align=True)
+            # Export Info Button and Export Button in the same row
+            export_row = export_box.row(align=True)
 
             # Info button always enabled to check missing files
             info_col = export_row.column()
             info_col.operator("assetify.show_unbaked_assets", text="", icon='INFO', emboss=False)
 
-            # Dynamically update the export button's label based on the selected format
+            # Export button with dynamic operator and label
             export_button_col = export_row.column()
-            export_format = assetify_settings.export_format.upper()
-            export_label = f"Export Selected {export_format}"
-            export_button_col.enabled = self.check_export_button_enabled(assetify_settings)
-            export_button_col.operator("assetify.export_selected_assets", text=export_label)
 
-            # Import Format Dropdown Row
-            dropdown_row = box.row(align=True)
-            dropdown_row.label(text="Import Format")
-            dropdown_row.prop(assetify_settings, "import_format", text="")
+            if assetify_settings.export_mode == 'STILL':
+                export_format = assetify_settings.export_format.upper()
+                export_label = f"Export Selected Still ({export_format})"
+                export_operator = "assetify.export_selected_assets"
+            elif assetify_settings.export_mode == 'ANIMATION':
+                export_format = assetify_settings.animation_export_format.upper()
+                export_label = f"Export Selected Anim ({export_format})"
+                export_operator = "assetify.export_selected_animations"
+
+            export_button_col.enabled = self.check_export_button_enabled(assetify_settings)
+            export_button_col.operator(export_operator, text=export_label)
+
+            # Import Section
+            import_box = layout.box()  # Create a dedicated container for import elements
+
+            # Dynamically display the appropriate import format dropdown
+            if assetify_settings.export_mode == 'STILL':
+                dropdown_row = import_box.row(align=True)
+                dropdown_row.label(text="Still Import Format")
+                dropdown_row.prop(assetify_settings, "import_format", text="")
+            elif assetify_settings.export_mode == 'ANIMATION':
+                dropdown_row = import_box.row(align=True)
+                dropdown_row.label(text="Anim Import Format")
+                dropdown_row.prop(assetify_settings, "animation_import_format", text="")
 
             # Import Settings Row
-            import_row = box.row(align=True)
+            import_row = import_box.row(align=True)
 
             # Info button always enabled for checking missing files
             info_col = import_row.column()
@@ -6545,30 +7786,52 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
 
             # Import button conditional based on file existence check
             import_button_col = import_row.column()
-            import_button_col.operator("assetify.import_selected_fbx", text=f"Import Selected {assetify_settings.import_format.upper()}")
-            
-        # Call built-in function with draw code/checks.
-        addon_updater_ops.update_notice_box_ui(self, context)
 
+            # Dynamically update the import button label
+            if assetify_settings.export_mode == 'STILL':
+                import_label = f"Import Selected Still ({assetify_settings.import_format.upper()})"
+            elif assetify_settings.export_mode == 'ANIMATION':
+                import_label = f"Import Selected Anim ({assetify_settings.animation_import_format.upper()})"
+
+            import_button_col.operator("assetify.import_selected_fbx", text=import_label)
+    
     def check_import_button_enabled(self, assetify_settings):
-        """Returns True if the Import button should be enabled based on include_in_send and FBX file existence."""
+        """Returns True if the Import button should be enabled based on include_in_send and file existence."""
         export_fbx_path = bpy.path.abspath(assetify_settings.export_fbx_path)
         print(f"[DEBUG] Export FBX Path: {export_fbx_path}")
+
+        # Determine suffix and format based on the export mode
+        if assetify_settings.export_mode == 'STILL':
+            suffix = "_still"
+            selected_format = assetify_settings.import_format.upper()
+        elif assetify_settings.export_mode == 'ANIMATION':
+            suffix = "_ANIM"
+            selected_format = assetify_settings.animation_import_format.upper()
+        else:
+            print("[DEBUG] Invalid export mode.")
+            return False
+
+        print(f"[DEBUG] Selected Format: {selected_format}, Suffix: {suffix}")
 
         if assetify_settings.asset_mode == 'ASSET':
             print("[DEBUG] Checking in Asset Mode...")
             for asset in assetify_settings.baked_assets:
                 if asset.include_in_send:
-                    fbx_name = asset.name.replace("_gameasset", "") + "_fbx.fbx"
+                    # Construct the file name with the format and suffix
+                    sanitized_name = asset.name.replace("_gameasset", "")
+                    fbx_name = f"{sanitized_name}_{selected_format}{suffix}.{selected_format.lower()}"
                     fbx_path = os.path.join(export_fbx_path, fbx_name)
+                    
                     print(f"[DEBUG] Asset Name: {asset.name}")
-                    print(f"[DEBUG] Expected FBX Name: {fbx_name}")
-                    print(f"[DEBUG] Expected FBX Path: {fbx_path}")
+                    print(f"[DEBUG] Expected File Name: {fbx_name}")
+                    print(f"[DEBUG] Expected File Path: {fbx_path}")
                     print(f"[DEBUG] File Exists: {os.path.exists(fbx_path)}")
+                    
                     if os.path.exists(fbx_path):
-                        print("[DEBUG] Valid FBX found for asset.")
+                        print("[DEBUG] Valid file found for asset.")
                         return True
-            print("[DEBUG] No valid FBX found in Asset Mode.")
+
+            print("[DEBUG] No valid files found in Asset Mode.")
             return False
 
         elif assetify_settings.asset_mode == 'COLLECTION':
@@ -6577,23 +7840,22 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 if collection.include_in_send:
                     print(f"[DEBUG] Checking collection: {collection.name}")
                     for asset in collection.assets:
-                        # Correct FBX name construction
-                        sanitized_name = asset.name.replace("_gameasset", "")  # Remove any suffix
-                        fbx_name = f"{sanitized_name}_fbx.fbx"
+                        # Construct the file name with the format and suffix
+                        sanitized_name = asset.name.replace("_gameasset", "")
+                        fbx_name = f"{sanitized_name}_{selected_format}{suffix}.{selected_format.lower()}"
                         fbx_path = os.path.join(export_fbx_path, fbx_name)
-
+                        
                         # Debug output for each asset
                         print(f"[DEBUG] Asset Name: {asset.name} in Collection: {collection.name}")
-                        print(f"[DEBUG] Expected FBX Name: {fbx_name}")
-                        print(f"[DEBUG] Expected FBX Path: {fbx_path}")
+                        print(f"[DEBUG] Expected File Name: {fbx_name}")
+                        print(f"[DEBUG] Expected File Path: {fbx_path}")
                         print(f"[DEBUG] File Exists: {os.path.exists(fbx_path)}")
 
-                        # If a valid FBX file exists, unlock the button
                         if os.path.exists(fbx_path):
-                            print("[DEBUG] Valid FBX found for a collection asset.")
+                            print("[DEBUG] Valid file found for a collection asset.")
                             return True
 
-            print("[DEBUG] No valid FBX found in Collection Mode.")
+            print("[DEBUG] No valid files found in Collection Mode.")
             return False
 
         return False
@@ -6787,7 +8049,13 @@ classes = (
     ASSETIFY_OT_cancel_operation,
     ASSETIFY_OT_proceed_without_saving,
     ASSETIFY_OT_save_as_mainfile,
+    ASSETIFY_OT_switch_export_mode,
+    ASSETIFY_OT_switch_bake_mode,
+    ASSETIFY_OT_switch_texturebake_mode,
+    ASSETIFY_OT_show_mossify_mode_info,
+    ASSETIFY_OT_show_apply_frame_attributes_info,
     OBJECT_OT_export_collection_as_fbx,
+    OBJECT_OT_export_collection_with_animations,
     CustomAttributeItem,          # Added        # Added
     AssetifyBakeSettings,         # Ensure these are after the above two
     ASSETIFY_OT_add_custom_attribute,
@@ -6805,25 +8073,100 @@ classes = (
 )
 
 def register():
-    # Register all classes first
+    import importlib
+
+    # Reload dependent modules
+    importlib.reload(animation_processor)
+    
+    animation_processor.register()
+    bpy.types.Scene.assetify_animation_settings = bpy.props.PointerProperty(type=animation_processor.AssetifyAnimationSettings)
+
+    print(animation_processor.AssetifyAnimationSettings)
+
+    # Register AssetifyAnimationSettings first
+    try:
+        bpy.utils.register_class(animation_processor.AssetifyAnimationSettings)
+        print("[INFO] AssetifyAnimationSettings registered successfully.")
+    except Exception as e:
+        print(f"[ERROR] Failed to register AssetifyAnimationSettings: {e}")
+
+    # Add PointerProperty for assetify_animation_settings
+    try:
+        bpy.types.Scene.assetify_animation_settings = bpy.props.PointerProperty(
+            type=animation_processor.AssetifyAnimationSettings
+        )
+        print("[INFO] assetify_animation_settings added to bpy.types.Scene.")
+    except Exception as e:
+        print(f"[ERROR] Failed to add assetify_animation_settings: {e}")
+
+    # Register animation operators
+    try:
+        bpy.utils.register_class(animation_processor.ASSETIFY_OT_process_animation)
+        bpy.utils.register_class(animation_processor.ANIMATION_OT_bake_geometry_assets)
+        bpy.utils.register_class(animation_processor.ANIMATION_OT_apply_bake_to_keyframes)
+        print("[INFO] Animation operators registered successfully.")
+    except Exception as e:
+        print(f"[ERROR] Failed to register animation operators: {e}")
+
+    # Debug checks
+    print("[DEBUG] Registered Scene properties:", dir(bpy.types.Scene))
+    print("[DEBUG] Registered Operators:", [op for op in dir(bpy.ops) if "assetify" in op])
+
+    # Register all custom classes
     for cls in classes:
-        bpy.utils.register_class(cls)
-    
+        try:
+            bpy.utils.unregister_class(cls)  # Unregister if already registered
+        except Exception as e:
+            print(f"[INFO] Class {cls.__name__} was not previously registered: {e}")
+        try:
+            bpy.utils.register_class(cls)
+            print(f"[INFO] Class {cls.__name__} registered successfully.")
+        except Exception as e:
+            print(f"[ERROR] Failed to register class {cls.__name__}: {e}")
+
+    # Load custom icons
     load_custom_icons()
-    
-    # Then assign the PointerProperty and other properties
-    bpy.types.Scene.assetify_bake_settings = bpy.props.PointerProperty(type=AssetifyBakeSettings)
-    bpy.types.Scene.custom_object = bpy.props.PointerProperty(type=bpy.types.Object)
-    bpy.types.Scene.custom_name = bpy.props.StringProperty(name="Custom Name", default="mosscolor")
-    bpy.types.Scene.custom_value_name = bpy.props.StringProperty(name="Custom Value Name", default="mosscolorvalue")
-    bpy.types.WindowManager.unbaked_assets = bpy.props.StringProperty(name="Unbaked Assets")
-    bpy.types.WindowManager.confirm_export = bpy.props.BoolProperty(name="Confirm Export", default=False)
-    
+
+    # Add other properties
+    try:
+        if not hasattr(bpy.types.Scene, "assetify_bake_settings"):
+            bpy.types.Scene.assetify_bake_settings = bpy.props.PointerProperty(type=AssetifyBakeSettings)
+            print("[INFO] assetify_bake_settings added.")
+        if not hasattr(bpy.types.Scene, "custom_object"):
+            bpy.types.Scene.custom_object = bpy.props.PointerProperty(type=bpy.types.Object)
+            print("[INFO] custom_object added.")
+        if not hasattr(bpy.types.Scene, "custom_name"):
+            bpy.types.Scene.custom_name = bpy.props.StringProperty(name="Custom Name", default="mosscolor")
+            print("[INFO] custom_name added.")
+        if not hasattr(bpy.types.Scene, "custom_value_name"):
+            bpy.types.Scene.custom_value_name = bpy.props.StringProperty(name="Custom Value Name", default="mosscolorvalue")
+            print("[INFO] custom_value_name added.")
+        if not hasattr(bpy.types.WindowManager, "unbaked_assets"):
+            bpy.types.WindowManager.unbaked_assets = bpy.props.StringProperty(name="Unbaked Assets")
+            print("[INFO] unbaked_assets added.")
+        if not hasattr(bpy.types.WindowManager, "confirm_export"):
+            bpy.types.WindowManager.confirm_export = bpy.props.BoolProperty(name="Confirm Export", default=False)
+            print("[INFO] confirm_export added.")
+    except Exception as e:
+        print(f"[ERROR] Failed to add properties: {e}")
+
+    # Initialize skip save check
     bpy.app.timers.register(initialize_skip_save_check)
-    
-    # Register addon_updater_ops after all operator classes are registered
-    addon_updater_ops.register(bl_info)
-    
+
+    # Register other dependent modules
+    try:
+        anim_geonode.register()
+        print("[INFO] anim_geonode registered successfully.")
+    except Exception as e:
+        print(f"[ERROR] Failed to register anim_geonode: {e}")
+
+    # Register addon updater operations
+    try:
+        addon_updater_ops.register(bl_info)
+        print("[INFO] Addon updater operations registered successfully.")
+    except Exception as e:
+        print(f"[ERROR] Failed to register addon updater operations: {e}")
+
     # Delay handler registration
     bpy.app.timers.register(register_handlers, first_interval=1.0)
 
@@ -6832,30 +8175,71 @@ def register_handlers():
     bpy.app.handlers.load_post.append(clear_baked_assets_on_startup)
 
 def unregister():
-    
-    # Unregister addon_updater_ops first
+    # Unregister dependent modules
+    try:
+        anim_geonode.unregister()
+    except Exception as e:
+        print(f"[INFO] anim_geonode was not previously registered: {e}")
+
+    try:
+        animation_processor.unregister()
+    except Exception as e:
+        print(f"[INFO] animation_processor was not previously registered: {e}")
+
+    print("[INFO] Unregistering Assetify addon...")
+
+    # Remove PointerProperty from Scene
+    if hasattr(bpy.types.Scene, "assetify_animation_settings"):
+        del bpy.types.Scene.assetify_animation_settings
+        print("[INFO] assetify_animation_settings removed from bpy.types.Scene.")
+
+    # Unregister classes
+    try:
+        bpy.utils.unregister_class(animation_processor.ASSETIFY_OT_process_animation)
+        bpy.utils.unregister_class(animation_processor.ANIMATION_OT_bake_geometry_assets)
+        bpy.utils.unregister_class(animation_processor.ANIMATION_OT_apply_bake_to_keyframes)
+        print("[INFO] Animation operators unregistered successfully.")
+    except Exception as e:
+        print(f"[ERROR] Failed to unregister animation operators: {e}")
+
+    try:
+        bpy.utils.unregister_class(animation_processor.AssetifyAnimationSettings)
+        print("[INFO] AssetifyAnimationSettings unregistered successfully.")
+    except Exception as e:
+        print(f"[ERROR] Failed to unregister AssetifyAnimationSettings: {e}")
+
+    # Unregister addon updater operations
     addon_updater_ops.unregister()
-    
+
+    # Unload custom icons
     unload_custom_icons()
-    
-    # Then unregister all classes in reverse order
+
+    # Unregister all custom classes in reverse order
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
-    
-    # Finally, remove the PointerProperty and other properties
-    del bpy.types.Scene.assetify_bake_settings
-    del bpy.types.Scene.custom_object
-    del bpy.types.Scene.custom_name
-    del bpy.types.Scene.custom_value_name
-    del bpy.types.WindowManager.unbaked_assets
-    del bpy.types.WindowManager.confirm_export
-    
-    # Safely remove handlers if they exist
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception as e:
+            print(f"[INFO] Class {cls.__name__} was not registered: {e}")
+
+    # Remove other properties
+    if hasattr(bpy.types.Scene, "assetify_bake_settings"):
+        del bpy.types.Scene.assetify_bake_settings
+    if hasattr(bpy.types.Scene, "custom_object"):
+        del bpy.types.Scene.custom_object
+    if hasattr(bpy.types.Scene, "custom_name"):
+        del bpy.types.Scene.custom_name
+    if hasattr(bpy.types.Scene, "custom_value_name"):
+        del bpy.types.Scene.custom_value_name
+    if hasattr(bpy.types.WindowManager, "unbaked_assets"):
+        del bpy.types.WindowManager.unbaked_assets
+    if hasattr(bpy.types.WindowManager, "confirm_export"):
+        del bpy.types.WindowManager.confirm_export
+
+    # Remove handlers safely
     if load_post_handler in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(load_post_handler)
     if clear_baked_assets_on_startup in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(clear_baked_assets_on_startup)
-
 
 if __name__ == "__main__":
     register()
