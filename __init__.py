@@ -2,7 +2,7 @@ bl_info = {
     "name": "Assetify",
     "description": "Convert objects and geometry nodes into game-ready assets with baked textures for Unreal Engine.",
     "author": "Nino Defoq",
-    "version": (2, 0, 0),
+    "version": (2, 0, 1),
     "blender": (4, 3, 0),
     "location": "3D View > Tool Shelf > Assetify",
     "warning": "",
@@ -1962,10 +1962,11 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
         animation_type = context.scene.assetify_animation_settings.animation_type
         file_format = context.scene.assetify_animation_settings.file_format
 
-        # Set new_obj as the active object
-        bpy.context.view_layer.objects.active = new_obj
+        # Make sure only new_obj is selected and set as active
+        bpy.ops.object.select_all(action='DESELECT')
         new_obj.select_set(True)
-        print(f"[DEBUG] Set {new_obj.name} as the active object.")
+        bpy.context.view_layer.objects.active = new_obj
+        print(f"[DEBUG] New Objectz: {new_obj.name}")
 
         debug_print(f"[DEBUG] Animation Type: {animation_type}, File Format: {file_format}")
         debug_print(f"[DEBUG] Skip Conditions: {skip_conditions}")
@@ -2013,9 +2014,9 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
             print(f"[DEBUG] Converted text object {new_obj.name} to mesh.")
 
         # Process particle systems and modifiers
-        if new_obj.particle_systems or new_obj.modifiers:
-            print(f"[DEBUG] Processing particle systems and modifiers on {new_obj.name}")
-            new_obj = apply_particle_systems(new_obj)
+        #if new_obj.particle_systems or new_obj.modifiers:
+         #   print(f"[DEBUG] Processing particle systems and modifiers on {new_obj.name}")
+          #  new_obj = apply_particle_systems(new_obj)
 
         # Process the object for game readiness
         process_object(
