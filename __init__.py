@@ -2,7 +2,7 @@ bl_info = {
     "name": "Assetify",
     "description": "Convert objects and geometry nodes into game-ready assets with baked textures for Unreal Engine.",
     "author": "Nino Defoq",
-    "version": (2, 0, 1),
+    "version": (2, 0, 2),
     "blender": (4, 3, 0),
     "location": "3D View > Tool Shelf > Assetify",
     "warning": "",
@@ -3324,6 +3324,12 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
         default='1024'
     )
     
+    ungroup_node_groups: bpy.props.BoolProperty(
+        name="Ungroup Node Groups",
+        description="If enabled, all node groups in materials will be ungrouped during baking.",
+        default=False  # Default is unchecked
+    )
+    
     # New property for the Asset List collapsible menu
     show_asset_list_menu: bpy.props.BoolProperty(
         name="Show Asset List Menu",
@@ -3770,8 +3776,6 @@ class ASSETIFY_OT_refresh_asset_collection_list(bpy.types.Operator):
         self.report({'INFO'}, "Asset and Collection lists refreshed.")
         return {'FINISHED'}
 
-import bpy
-
 def ungroup_nodes(material):
     """Ungroup all node groups in the material using Blender's built-in ungrouping system."""
     if not material or not material.use_nodes:
@@ -3876,11 +3880,25 @@ def ungroup_nodes(material):
         print("No suitable area found to switch to NODE_EDITOR. Cannot ungroup nodes.")
 
 def store_original_materials(obj):
-    """Store the original material setups for the given object."""
+    """Store the original material setups for the given object, replacing the previous backup."""
     original_materials = {}
+
     for slot in obj.material_slots:
         if slot.material:
-            original_materials[slot.material.name] = slot.material.copy()
+            mat_name = slot.material.name
+            backup_name = f"{mat_name}_backup"
+
+            # If a backup already exists, remove it before creating a new one
+            if backup_name in bpy.data.materials:
+                bpy.data.materials.remove(bpy.data.materials[backup_name])
+
+            # Create a new backup material
+            backup_material = slot.material.copy()
+            backup_material.name = backup_name
+            backup_material.use_fake_user = True  # Prevent deletion as orphan data
+
+            original_materials[mat_name] = backup_material  # Store the latest backup reference
+
     return original_materials
 
 def restore_original_materials(obj, original_materials):
@@ -4032,6 +4050,21 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
 
         # Update collection statuses before starting bake
         update_collection_statuses(assetify_settings)
+        
+        if not hasattr(self, '_original_materials'):
+            self._original_materials = {}
+        
+        # Check if ungrouping is enabled
+        if assetify_settings.ungroup_node_groups:
+            for slot in obj.material_slots:
+                if slot.material:
+                    #if assetify_settings.texturebake_mode == 'STILL' and obj.name not in self._original_materials:
+                    self._original_materials[obj.name] = store_original_materials(obj)  # ✅ Store before ungrouping (only once)
+
+                    ungroup_nodes(slot.material)  # Apply ungrouping
+
+                    #if assetify_settings.texturebake_mode == 'ANIMATION' and obj.name not in self._original_materials:
+                    #self._original_materials[obj.name] = store_original_materials(obj)  # ✅ Store after ungrouping (only once)
 
         return {'RUNNING_MODAL'}
 
@@ -4130,17 +4163,15 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                 platform = context.scene.assetify_bake_settings.platform_target
 
                 if self._step_index == 0:
+                    assetify_settings = context.scene.assetify_bake_settings
                     # Store original materials before ungrouping
-                    if not hasattr(self, '_original_materials'):
-                        self._original_materials = store_original_materials(obj)
+                    # Ensure we only store original materials once
+                        
+                    #if obj.name not in self._original_materials:  # ✅ Store materials only once per object
+                    #    self._original_materials[obj.name] = store_original_materials(obj)  
 
                     if not hasattr(self, '_uv_unwrapped_objects'):
                         self._uv_unwrapped_objects = set()
-
-                    # Ungroup nodes in all materials
-                    for slot in obj.material_slots:
-                        if slot.material:
-                            ungroup_nodes(slot.material)
 
                     # Perform UV unwrapping only if the object hasn't been unwrapped yet
                     if obj.name not in self._uv_unwrapped_objects:
@@ -4217,10 +4248,10 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                     if context.scene.assetify_bake_settings.texturebake_mode == 'ANIMATION':
                         # In ANIMATION mode, restore original materials
                         if obj.name in self.original_material_links:
-                            try:
-                                restore_material_links(obj, self.original_material_links[obj.name])
-                            except Exception as e:
-                                print(f"[ERROR] Failed to restore material links for {obj.name}: {e}")
+                            #try:
+                            #    restore_material_links(obj, self.original_material_links[obj.name])
+                            #except Exception as e:
+                            #    print(f"[ERROR] Failed to restore material links for {obj.name}: {e}")
                             remove_temporary_nodes(obj)  # Clean up temporary nodes
                     else:
                         # In STILL mode, KEEP baked textures and skip restoring original materials
@@ -4272,7 +4303,7 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
         remove_progress_bar(self)
 
         for obj in self._objects_to_bake:
-            if obj.name in self.original_material_links:
+            if obj.name in self.original_material_links and not context.scene.assetify_bake_settings.ungroup_node_groups:
                 restore_material_links(obj, self.original_material_links[obj.name])
             remove_temporary_nodes(obj)  # Clean up temporary nodes
 
@@ -6816,6 +6847,18 @@ class OBJECT_OT_export_collection_with_animations(bpy.types.Operator):
         populate_baked_assets_from_scene(assetify_settings)
         populate_baked_collections_from_scene(assetify_settings)
         self.report({'INFO'}, "Exported animations for selected assets/collections.")
+            
+    def find_armatures_in_selection(self, selected_objects):
+        """Find all armatures used by the selected objects and return them."""
+        armatures = set()
+
+        for obj in selected_objects:
+            if obj.type == 'MESH':
+                for modifier in obj.modifiers:
+                    if modifier.type == 'ARMATURE' and modifier.object:
+                        armatures.add(modifier.object)  # Add armature object to the set
+
+        return list(armatures)
 
     def export_animation_object(self, obj, export_path, assetify_settings, context):
         """Export the object with animations in the selected format."""
@@ -6827,19 +6870,29 @@ class OBJECT_OT_export_collection_with_animations(bpy.types.Operator):
         obj.select_set(True)
 
         if animation_export_format == 'FBX':
+            armatures = self.find_armatures_in_selection([obj])
+        
+            # Select all found armatures
+            for armature in armatures:
+                armature.select_set(True)
+            
+            # Export to FBX with the specified settings
             bpy.ops.export_scene.fbx(
                 filepath=export_file_path,
                 use_selection=True,
                 bake_anim=True,
-                bake_anim_force_startend_keying=True,
-                bake_anim_simplify_factor=0.0,
-                object_types={'MESH', 'ARMATURE'},
+                bake_anim_force_startend_keying=False,  # DISABLED: No forced start/end keying
+                bake_anim_simplify_factor=0.0,  # No animation reduction
+                use_armature_deform_only=True,  # Ensures only deform bones are exported
+                add_leaf_bones=False,  # Prevents adding extra bones that might interfere with game engines
+                object_types={'MESH', 'ARMATURE'},  # Only export Mesh and Armature
                 path_mode='COPY',
                 embed_textures=True,
-                axis_forward='-Z',
-                axis_up='Y'
+                axis_forward='Z',  # Set Z-forward
+                axis_up='Y',
+                apply_unit_scale=False  # DISABLED: Do not apply transforms
             )
-            
+        
         elif animation_export_format == 'OBJ':
             # Create a dedicated subfolder for OBJ animation frames
             obj_anim_folder = os.path.join(export_path, f"{sanitized_name}_OBJ_ANIM")
@@ -7618,7 +7671,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 )
                 
                 # Add label for the button
-                split = row.split(factor=0.45, align=True)
+                split = row.split(factor=0.465, align=True)
                 split.label(text="Apply Attributes")
                 
                 # Add the "Apply Attributes" button with enabled logic
@@ -7676,6 +7729,21 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             split = row.split(factor=0.5, align=True)
             split.label(text="Bake Samples")
             split.prop(assetify_settings, "bake_samples", text="")  # Numeric input on the right
+            
+            # Ungroup Nodes
+            row = box.row(align=True)
+
+            # Add an info button before the label
+            row.operator(
+                "assetify.show_ungroup_info",  
+                text="",
+                icon='INFO',
+                emboss=False
+            )
+
+            split = row.split(factor=0.465, align=True)
+            split.label(text="Ungroup Nodes")
+            split.prop(assetify_settings, "ungroup_node_groups", text="")
 
             # Bake button row with info icon
             bake_row = box.row(align=True)
@@ -7911,6 +7979,28 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             else:
                 print(f"Warning: Icon '{icon_key}' not found in custom_icons.")
 
+class ASSETIFY_OT_show_ungroup_info(bpy.types.Operator):
+    """Show detailed info about ungrouping node groups"""  
+    bl_idname = "assetify.show_ungroup_info"
+    bl_label = "Ungroup Node Groups Info"
+    
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=400)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="Ungroup Node Groups Explanation", icon='INFO')
+        layout.separator()
+        layout.label(text="Enabling this option will Ungroup all nodes in your shader.")
+        layout.label(text="Use this if the entire shader is grouped in one group,")
+        layout.label(text="meaning no principled BSDF is exposed to the group output.")
+        layout.label(text="Without direct connection between BSDF and group output,")
+        layout.label(text="Baking may not work properly!")
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+
 class ASSETIFY_OT_show_disable_original_collections_info(bpy.types.Operator):
     """Show information about the 'Disable Original Collections' option"""
     bl_idname = "assetify.show_disable_original_collections_info"
@@ -8055,6 +8145,7 @@ classes = (
     ASSETIFY_OT_switch_texturebake_mode,
     ASSETIFY_OT_show_mossify_mode_info,
     ASSETIFY_OT_show_apply_frame_attributes_info,
+    ASSETIFY_OT_show_ungroup_info,
     OBJECT_OT_export_collection_as_fbx,
     OBJECT_OT_export_collection_with_animations,
     CustomAttributeItem,          # Added        # Added
