@@ -2,7 +2,7 @@ bl_info = {
     "name": "Assetify",
     "description": "Convert objects and geometry nodes into game-ready assets with baked textures for Unreal Engine.",
     "author": "Nino Defoq",
-    "version": (2, 0, 2),
+    "version": (2, 0, 3),
     "blender": (4, 3, 0),
     "location": "3D View > Tool Shelf > Assetify",
     "warning": "",
@@ -1864,7 +1864,7 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
 
         # Process each object in the collection
         for obj in collection.objects:
-            if obj.type in {'MESH', 'CURVE', 'FONT'}:
+            if obj.type in {'MESH', 'CURVE', 'CURVES', 'FONT'}:
                 if obj.particle_systems:
                     print(f"Applying particle systems on {obj.name}")
                     obj = apply_particle_systems(obj)
@@ -2104,7 +2104,7 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
         return total_assets
 
     def count_assets_in_collection(self, collection):
-        count = len([obj for obj in collection.objects if obj.type in {'MESH', 'CURVE', 'FONT'}])
+        count = len([obj for obj in collection.objects if obj.type in {'MESH', 'CURVE', 'CURVES', 'FONT'}])
         for subcol in collection.children:
             count += self.count_assets_in_collection(subcol)
         return count
@@ -2124,7 +2124,7 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
 
         # Collect assets
         for obj in collection.objects:
-            if obj.type in {'MESH', 'CURVE', 'FONT'}:
+            if obj.type in {'MESH', 'CURVE', 'CURVES', 'FONT'}:
                 self._assets_to_process.append({'object': obj, 'original_collection': collection})
 
                 # Update asset count for the collection
@@ -4633,7 +4633,7 @@ def realize_geometry_node_instances(obj, skip_conversion=False):
             return {'SKIPPED'}
             print("[INFO] Bake mode is ANIMATION. Using skip conditions from animation processor.")
 
-    if obj.type not in {'MESH', 'CURVE'}:
+    if obj.type not in {'MESH', 'CURVE', 'CURVES'}:
         debug_print(f"Object {obj.name} is neither a mesh nor a curve. Skipping...")
         return {'SKIPPED'}
 
@@ -4662,6 +4662,11 @@ def realize_geometry_node_instances(obj, skip_conversion=False):
             bpy.context.view_layer.objects.active = obj
             bpy.ops.object.convert(target='MESH')  # Convert curve to mesh before applying modifiers
             debug_print(f"Curve object {obj.name} converted to mesh.")
+        elif obj.type == 'CURVES':
+            debug_print(f"Converting hair curves object {obj.name} to mesh.")
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.convert(target='MESH')  # Convert mesh to a final mesh after realizing instances
+            debug_print(f"Mesh object {obj.name} converted to final mesh.")
         elif obj.type == 'MESH':
             debug_print(f"Converting mesh object {obj.name} to final mesh.")
             bpy.context.view_layer.objects.active = obj
@@ -4796,7 +4801,7 @@ def duplicate_objects_in_collection(original_collection, game_ready_collection, 
     assetify_settings = bpy.context.scene.assetify_bake_settings
     
     for obj in original_collection.objects:
-        if obj.type in {'MESH', 'CURVE', 'FONT'}:
+        if obj.type in {'MESH', 'CURVE', 'CURVES', 'FONT'}:
             new_obj = obj.copy()
             new_obj.data = obj.data.copy()
             new_obj.name = obj.name + "_gameasset"
@@ -4859,7 +4864,7 @@ def process_collection(collection, game_ready_collection, assetify_settings, mai
 
     # Process all objects in the current collection
     for obj in collection.objects:
-        if obj.type in {'MESH', 'CURVE', 'FONT'}:
+        if obj.type in {'MESH', 'CURVE', 'CURVES', 'FONT'}:
             print(f"[DEBUG] Found object: {obj.name} of type {obj.type}")
 
             # Check if the asset is already in the baked_assets list to avoid duplication
