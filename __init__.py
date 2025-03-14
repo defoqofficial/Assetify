@@ -2,7 +2,7 @@ bl_info = {
     "name": "Assetify",
     "description": "Convert objects and geometry nodes into game-ready assets with baked textures for Unreal Engine.",
     "author": "Nino Defoq",
-    "version": (2, 0, 3),
+    "version": (2, 1, 0),
     "blender": (4, 3, 0),
     "location": "3D View > Tool Shelf > Assetify",
     "warning": "",
@@ -38,6 +38,8 @@ import math
 from mathutils import Vector
 import addon_utils
 import glob
+from collections import deque
+from . import non_principled_baking
 
 # Define a global dictionary to store the custom icon previews
 custom_icons = None
@@ -1864,7 +1866,7 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
 
         # Process each object in the collection
         for obj in collection.objects:
-            if obj.type in {'MESH', 'CURVE', 'CURVES', 'FONT'}:
+            if obj.type in {'MESH', 'CURVE', 'FONT'}:
                 if obj.particle_systems:
                     print(f"Applying particle systems on {obj.name}")
                     obj = apply_particle_systems(obj)
@@ -2104,7 +2106,7 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
         return total_assets
 
     def count_assets_in_collection(self, collection):
-        count = len([obj for obj in collection.objects if obj.type in {'MESH', 'CURVE', 'CURVES', 'FONT'}])
+        count = len([obj for obj in collection.objects if obj.type in {'MESH', 'CURVE', 'FONT'}])
         for subcol in collection.children:
             count += self.count_assets_in_collection(subcol)
         return count
@@ -2124,7 +2126,7 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
 
         # Collect assets
         for obj in collection.objects:
-            if obj.type in {'MESH', 'CURVE', 'CURVES', 'FONT'}:
+            if obj.type in {'MESH', 'CURVE', 'FONT'}:
                 self._assets_to_process.append({'object': obj, 'original_collection': collection})
 
                 # Update asset count for the collection
@@ -3324,6 +3326,25 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
         default='1024'
     )
     
+    bake_basecolor: bpy.props.BoolProperty(
+        name="Base Color", default=True, description="Bake Base Color map")
+    bake_normal: bpy.props.BoolProperty(
+        name="Normal", default=True, description="Bake Normal map")
+    bake_roughness: bpy.props.BoolProperty(
+        name="Roughness", default=True, description="Bake Roughness map")
+    bake_metallic: bpy.props.BoolProperty(
+        name="Metallic", default=True, description="Bake Metallic map")
+    bake_alpha: bpy.props.BoolProperty(
+        name="Alpha", default=True, description="Bake Alpha map")
+    bake_emission: bpy.props.BoolProperty(
+        name="Emission", default=False, description="Bake Emission map")
+    bake_transmission: bpy.props.BoolProperty(
+        name="Transmission", default=False, description="Bake Transmission map")
+    non_principled_baking: bpy.props.BoolProperty(
+        name="Non-PrincipledBSDF Baking", default=False, description="Enable baking using non-principled node chains.")
+    force_transparent_black: bpy.props.BoolProperty(
+        name="Force Transparent to Black", default=False, description="Force the mix color input of Transparent BSDF to black regardless of its input color.")
+    
     ungroup_node_groups: bpy.props.BoolProperty(
         name="Ungroup Node Groups",
         description="If enabled, all node groups in materials will be ungrouped during baking.",
@@ -4032,6 +4053,15 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
 
         # Run cleanup for images before baking
         self.cleanup_images_for_baking()
+        
+        if assetify_settings.non_principled_baking:
+            for obj in self._objects_to_bake:
+                bpy.context.view_layer.objects.active = obj
+                for i, mat in enumerate(obj.data.materials):
+                    if mat:
+                        obj.active_material_index = i
+                        non_principled_baking.create_mix_chains_and_principled()
+                        non_principled_baking.create_node_group("NonPrincipled Setup")
 
         # Initialize frame tracking for ANIMATION mode
         if assetify_settings.texturebake_mode == 'ANIMATION':
@@ -4055,7 +4085,7 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
             self._original_materials = {}
         
         # Check if ungrouping is enabled
-        if assetify_settings.ungroup_node_groups:
+        if not assetify_settings.ungroup_node_groups:
             for slot in obj.material_slots:
                 if slot.material:
                     #if assetify_settings.texturebake_mode == 'STILL' and obj.name not in self._original_materials:
@@ -4113,8 +4143,19 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                 if self._frame_index > context.scene.frame_end:
                     # Restore original frame
                     context.scene.frame_set(self._current_frame)
-
-                    # Finalize baking
+                    platform = context.scene.assetify_bake_settings.platform_target
+                    
+                    # FINALIZATION FOR ANIMATION MODE:
+                    # For each object, perform UV/Material finalization and apply baked textures.
+                    for obj in self._objects_to_bake:
+                        # Simplify the materials and UV maps
+                        simplify_materials_and_uv_maps(obj)
+                        # Finalize the UV map naming
+                        finalize_uv_maps(obj)
+                        # Apply the baked textures (this will now handle sequences if needed)
+                        apply_baked_textures(obj, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)
+                    
+                    # Finalize baking process
                     self.current_operation = "Baking Complete."
                     self.current_sub_operation = ""
                     print(f"Baking complete for all frames. Removing timer.")
@@ -4127,7 +4168,6 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                     update_baked_collections_status(context)
                     context.scene.assetify_bake_settings.assets_baked = True
 
-                    # Cleanup
                     if hasattr(self, 'original_materials'):
                         del self.original_materials  # Clean up memory
 
@@ -4149,6 +4189,7 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                 print(f"Baking frame {self._frame_index} - Progress: {self.progress_value * 100:.2f}%")
                 
             if self._bake_index < len(self._objects_to_bake):
+                assetify_settings = context.scene.assetify_bake_settings
                 obj = self._objects_to_bake[self._bake_index]
 
                 # Deselect all objects without using bpy.ops
@@ -4190,9 +4231,31 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                         {"name": "Baking BaseColor", "func": lambda: bake_and_save(obj, 'DIFFUSE', 'BaseColor', context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
                         {"name": "Baking MetallicSmoothness", "func": lambda: bake_and_save(obj, 'COMBINED', 'MetallicSmoothness', context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
                         {"name": "Baking Normal", "func": lambda: bake_and_save(obj, 'NORMAL', 'Normal', context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
-                        {"name": "Baking Alpha", "func": lambda: bake_alpha_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder))},
+                        #{"name": "Baking Alpha", "func": lambda: bake_alpha_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder))}
                     ]
-
+                    
+                    if context.scene.assetify_bake_settings.bake_alpha:
+                        baking_steps.append({
+                            "name": "Baking Alpha",
+                            "func": lambda: bake_alpha_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder))
+                        })
+                        
+                    if context.scene.assetify_bake_settings.bake_transmission:
+                        baking_steps.append({
+                            "name": "Baking Transmission",
+                            "func": lambda: bake_transmission_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)
+                        })
+                    
+                    if context.scene.assetify_bake_settings.bake_emission:
+                        baking_steps.append({
+                            "name": "Baking Emission Color",
+                            "func": lambda: bake_emission_color_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)
+                        })
+                        baking_steps.append({
+                            "name": "Baking Emission Strength",
+                            "func": lambda: bake_emission_strength_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)
+                        })
+                    
                     if context.scene.assetify_bake_settings.texturebake_mode == 'STILL':
                         baking_steps.extend([
                             {"name": "Simplifying Materials and UV Maps", "func": lambda: simplify_materials_and_uv_maps(obj)},
@@ -4205,9 +4268,31 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                         {"name": "Baking Roughness", "func": lambda: bake_and_save(obj, 'ROUGHNESS', 'Roughness', context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
                         {"name": "Baking Metallic", "func": lambda: bake_and_save(obj, 'COMBINED', 'Metallic', context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
                         {"name": "Baking Normal", "func": lambda: bake_and_save(obj, 'NORMAL', 'Normal', context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
-                        {"name": "Baking Alpha", "func": lambda: bake_alpha_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder))},
+                        #{"name": "Baking Alpha", "func": lambda: bake_alpha_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder))}
                     ]
-
+                    
+                    if context.scene.assetify_bake_settings.bake_alpha:
+                        baking_steps.append({
+                            "name": "Baking Alpha",
+                            "func": lambda: bake_alpha_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder))
+                        })
+                        
+                    if context.scene.assetify_bake_settings.bake_transmission:
+                        baking_steps.append({
+                            "name": "Baking Transmission",
+                            "func": lambda: bake_transmission_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)
+                        })
+                    
+                    if context.scene.assetify_bake_settings.bake_emission:
+                        baking_steps.append({
+                            "name": "Baking Emission Color",
+                            "func": lambda: bake_emission_color_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)
+                        })
+                        baking_steps.append({
+                            "name": "Baking Emission Strength",
+                            "func": lambda: bake_emission_strength_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)
+                        })
+                    
                     if context.scene.assetify_bake_settings.texturebake_mode == 'STILL':
                         baking_steps.extend([
                             {"name": "Simplifying Materials and UV Maps", "func": lambda: simplify_materials_and_uv_maps(obj)},
@@ -4243,7 +4328,7 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                         return {'CANCELLED'}
 
                     self._step_index += 1
-                    
+                                    
                 else:
                     if context.scene.assetify_bake_settings.texturebake_mode == 'ANIMATION':
                         # In ANIMATION mode, restore original materials
@@ -4251,8 +4336,8 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                             #try:
                             #    restore_material_links(obj, self.original_material_links[obj.name])
                             #except Exception as e:
-                            #    print(f"[ERROR] Failed to restore material links for {obj.name}: {e}")
-                            remove_temporary_nodes(obj)  # Clean up temporary nodes
+                                print(f"[ERROR] Failed to restore material links for {obj.name}")
+                            #remove_temporary_nodes(obj)  # Clean up temporary nodes
                     else:
                         # In STILL mode, KEEP baked textures and skip restoring original materials
                         print(f"[INFO] Skipping material restoration for {obj.name} in STILL mode.")
@@ -4633,7 +4718,7 @@ def realize_geometry_node_instances(obj, skip_conversion=False):
             return {'SKIPPED'}
             print("[INFO] Bake mode is ANIMATION. Using skip conditions from animation processor.")
 
-    if obj.type not in {'MESH', 'CURVE', 'CURVES'}:
+    if obj.type not in {'MESH', 'CURVE'}:
         debug_print(f"Object {obj.name} is neither a mesh nor a curve. Skipping...")
         return {'SKIPPED'}
 
@@ -4662,11 +4747,6 @@ def realize_geometry_node_instances(obj, skip_conversion=False):
             bpy.context.view_layer.objects.active = obj
             bpy.ops.object.convert(target='MESH')  # Convert curve to mesh before applying modifiers
             debug_print(f"Curve object {obj.name} converted to mesh.")
-        elif obj.type == 'CURVES':
-            debug_print(f"Converting hair curves object {obj.name} to mesh.")
-            bpy.context.view_layer.objects.active = obj
-            bpy.ops.object.convert(target='MESH')  # Convert mesh to a final mesh after realizing instances
-            debug_print(f"Mesh object {obj.name} converted to final mesh.")
         elif obj.type == 'MESH':
             debug_print(f"Converting mesh object {obj.name} to final mesh.")
             bpy.context.view_layer.objects.active = obj
@@ -4801,7 +4881,7 @@ def duplicate_objects_in_collection(original_collection, game_ready_collection, 
     assetify_settings = bpy.context.scene.assetify_bake_settings
     
     for obj in original_collection.objects:
-        if obj.type in {'MESH', 'CURVE', 'CURVES', 'FONT'}:
+        if obj.type in {'MESH', 'CURVE', 'FONT'}:
             new_obj = obj.copy()
             new_obj.data = obj.data.copy()
             new_obj.name = obj.name + "_gameasset"
@@ -4864,7 +4944,7 @@ def process_collection(collection, game_ready_collection, assetify_settings, mai
 
     # Process all objects in the current collection
     for obj in collection.objects:
-        if obj.type in {'MESH', 'CURVE', 'CURVES', 'FONT'}:
+        if obj.type in {'MESH', 'CURVE', 'FONT'}:
             print(f"[DEBUG] Found object: {obj.name} of type {obj.type}")
 
             # Check if the asset is already in the baked_assets list to avoid duplication
@@ -5116,7 +5196,12 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
         metallic_image.colorspace_settings.name = 'Non-Color'
         if is_metallic_input_connected(obj):
             # If metallic input is connected, bake the metallic map using emission
-            bake_metallic_as_emission(obj, metallic_image)
+            bake_metallic_as_emission(
+                 obj,
+                 resolution,
+                 bpy.path.abspath(bpy.context.scene.assetify_bake_settings.bake_folder),
+                 platform
+            )
         else:
             # If metallic input is not connected, bake a black metallic map
             assign_image_to_material(obj, metallic_image, "Metallic")
@@ -5133,7 +5218,7 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
 
         debug_print(f"Packed Roughness/Metallic for {obj.name} and saved as {packed_image.filepath_raw}")
         
-            # Restore original material setup
+        # Restore original material setup
         for mat_slot in obj.material_slots:
             if mat_slot.material and mat_slot.material.use_nodes:
                 node_tree = mat_slot.material.node_tree
@@ -5169,24 +5254,30 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
         # Store original metallic settings to restore after baking
         metallic_settings = {}
         if map_type == "BaseColor":
-            # Disconnect metallic inputs and set to 0
+            # Disconnect metallic inputs and store their original values/links,
+            # then set them to 0 for the bake.
             for mat in obj.data.materials:
                 if not mat.use_nodes:
                     continue
 
                 node_tree = mat.node_tree
-                principled_node = next((node for node in node_tree.nodes if node.type == 'BSDF_PRINCIPLED'), None)
-                
-                if principled_node:
-                    metallic_input = principled_node.inputs['Metallic']
-                    if metallic_input.is_linked:
-                        # Store the link to reconnect later
-                        metallic_settings[mat.name] = metallic_input.links[0]
-                        node_tree.links.remove(metallic_input.links[0])
-                    else:
-                        # Store the original value to restore later
-                        metallic_settings[mat.name] = metallic_input.default_value
-                    metallic_input.default_value = 0  # Set metallic to 0 for baking
+                # Find the Principled BSDF node connected to the Material Output.
+                principled_node = find_principled_from_output(node_tree)
+                if not principled_node:
+                    print(f"[WARNING] No Principled BSDF connected to the Material Output in material {mat.name}, skipping metallic disconnect.")
+                    continue
+
+                metallic_input = principled_node.inputs['Metallic']
+                # If the input is linked, store the link details; otherwise, store the default value.
+                if metallic_input.is_linked:
+                    # Assume only one link exists for simplicity.
+                    link = metallic_input.links[0]
+                    metallic_settings[mat.name] = (link.from_node.name, link.from_socket.name)
+                    node_tree.links.remove(link)
+                else:
+                    metallic_settings[mat.name] = metallic_input.default_value
+                # Set metallic to 0 for the baking process.
+                metallic_input.default_value = 0
 
             bpy.context.scene.cycles.bake_type = 'DIFFUSE'
             bpy.context.scene.render.bake.use_pass_direct = False
@@ -5202,12 +5293,17 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
             bake_type_used = 'ROUGHNESS'
         elif map_type == "Metallic":
             # Correctly bake the metallic map using emission
-            bake_metallic_as_emission(obj, image)
-            image.filepath_raw = texture_file_path
-            image.file_format = 'PNG'
-            image.save()
-            debug_print(f"Baked {map_type} for {obj.name} and saved as {image.filepath_raw}")
-            return image
+            bake_metallic_as_emission(
+                 obj,
+                 resolution,
+                 bpy.path.abspath(bpy.context.scene.assetify_bake_settings.bake_folder),
+                 platform
+            )
+#            image.filepath_raw = texture_file_path
+#            image.file_format = 'PNG'
+#            image.save()
+#            debug_print(f"Baked {map_type} for {obj.name} and saved as {image.filepath_raw}")
+#            return image
         else:
             bpy.context.scene.cycles.bake_type = bake_type
             bake_type_used = bake_type
@@ -5220,25 +5316,37 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
             image.save()
             debug_print(f"Baked {map_type} for {obj.name} and saved as {image.filepath_raw}")
             
-            # Restore metallic settings
-            if map_type == "BaseColor":
-                for mat in obj.data.materials:
-                    if not mat.use_nodes:
-                        continue
+            # Restore original metallic settings after baking
+            for mat in obj.data.materials:
+                if not mat.use_nodes:
+                    continue
 
-                    node_tree = mat.node_tree
-                    principled_node = next((node for node in node_tree.nodes if node.type == 'BSDF_PRINCIPLED'), None)
-                    
-                    if principled_node and mat.name in metallic_settings:
-                        metallic_input = principled_node.inputs['Metallic']
-                        saved_setting = metallic_settings[mat.name]
-                        
-                        if isinstance(saved_setting, bpy.types.NodeLink):
-                            # Reconnect the original link
-                            node_tree.links.new(saved_setting.from_socket, metallic_input)
+                node_tree = mat.node_tree
+                principled_node = find_principled_from_output(node_tree)
+                if not principled_node:
+                    continue
+
+                metallic_input = principled_node.inputs['Metallic']
+                saved_setting = metallic_settings.get(mat.name)
+                if saved_setting is not None:
+                    if isinstance(saved_setting, tuple):
+                        # If a link was originally present, restore that link.
+                        from_node_name, from_socket_name = saved_setting
+                        from_node = node_tree.nodes.get(from_node_name)
+                        if from_node:
+                            from_socket = next((sock for sock in from_node.outputs if sock.name == from_socket_name), None)
+                            if from_socket:
+                                try:
+                                    node_tree.links.new(from_socket, metallic_input)
+                                except Exception as e:
+                                    print(f"[ERROR] Could not restore link for {mat.name}: {e}")
+                            else:
+                                print(f"[WARNING] Could not find socket '{from_socket_name}' in node '{from_node_name}' for material {mat.name}")
                         else:
-                            # Restore the original value
-                            metallic_input.default_value = saved_setting
+                            print(f"[WARNING] Original linking node '{from_node_name}' not found for material {mat.name}")
+                    else:
+                        # Otherwise, restore the default value.
+                        metallic_input.default_value = saved_setting
             
                 # Restore original material setup
                 for mat_slot in obj.material_slots:
@@ -5298,13 +5406,10 @@ def is_metallic_input_connected(obj):
         node_tree = mat.node_tree
         principled_node = None
 
-        # Find the Principled BSDF node
-        for node in node_tree.nodes:
-            if node.type == 'BSDF_PRINCIPLED':
-                principled_node = node
-                break
-
+        # Find the last Principled BSDF node connected to the Material Output.
+        principled_node = find_principled_from_output(node_tree)
         if not principled_node:
+            print(f"[WARNING] No Principled BSDF connected to the Material Output in material {mat.name}, skipping emission strength bake.")
             continue
 
         # Check if the Metallic input is connected
@@ -5350,131 +5455,175 @@ def pack_metallic_roughness(metallic_image, roughness_image, output_image_name="
 
     return dst_image
 
-def bake_metallic_as_emission(obj, image):
-    """Bakes the metallic map into the provided image using the emission method."""
-    debug_print(f"[DEBUG] Starting metallic bake for object {obj.name}")
-
-    # Dictionary to store original links for each material
-    original_links_dict = {}
-
-    # Dictionary to store added nodes for each material
-    added_nodes_dict = {}
-
-    # Iterate through all materials on the object
-    for mat in obj.data.materials:
-        if not mat or not mat.use_nodes:
-            debug_print(f"[WARNING] Material {mat.name if mat else 'None'} does not use nodes, skipping.")
+def bake_metallic_as_emission(obj, resolution, save_dir, platform):
+    """Bake the metallic map for all materials on the object into a single image using the emission method."""
+    import os, bpy
+    assetify_settings = bpy.context.scene.assetify_bake_settings
+    ensure_cycles_render_engine()
+    
+    resolution = int(resolution)
+    
+    # Setup file paths for Metallic bake
+    if assetify_settings.texturebake_mode == 'ANIMATION':
+        object_folder = os.path.join(save_dir, f"{obj.name}_textures")
+        os.makedirs(object_folder, exist_ok=True)
+        map_folder = os.path.join(object_folder, "Metallic")
+        os.makedirs(map_folder, exist_ok=True)
+        frame_number = bpy.context.scene.frame_current
+        file_name = f"Frame{frame_number:04d}.png"
+        texture_file_path = os.path.join(map_folder, file_name)
+    else:
+        textures_folder = os.path.join(save_dir, "textures")
+        os.makedirs(textures_folder, exist_ok=True)
+        texture_file_path = os.path.join(textures_folder, f"{obj.name}_Metallic.png")
+    
+    if os.path.exists(texture_file_path):
+        os.remove(texture_file_path)
+        print(f"[DEBUG] Removed existing file: {texture_file_path}")
+    
+    # Create or get the bake image
+    image_name = (f"{obj.name}_Metallic_Frame{bpy.context.scene.frame_current:04d}"
+                  if assetify_settings.texturebake_mode == 'ANIMATION'
+                  else f"{obj.name}_Metallic")
+    image = bpy.data.images.get(image_name) or bpy.data.images.new(
+        name=image_name, width=resolution, height=resolution, alpha=True)
+    image.colorspace_settings.name = 'Non-Color'
+    
+    materials_original_links = {}
+    temporary_output_nodes = {}
+    added_nodes = {}  # Dictionary keyed by material name; each value is a list of nodes we add.
+    
+    # Process each material on the object
+    for mat_slot in obj.material_slots:
+        mat = mat_slot.material
+        if not (mat and mat.use_nodes):
+            print(f"[WARNING] Material {mat.name if mat else 'None'} does not use nodes, skipping.")
             continue
-
-        debug_print(f"[DEBUG] Processing material {mat.name}")
-
         node_tree = mat.node_tree
-
-        # Find the Principled BSDF node
-        principled_node = next((node for node in node_tree.nodes if node.type == 'BSDF_PRINCIPLED'), None)
+        
+        # Remove any previously added temporary nodes for this bake.
+        for node in list(node_tree.nodes):
+            if node.name.startswith("Assetify_Temp_"):
+                node_tree.nodes.remove(node)
+        
+        # Create a new texture node for baking and set it active.
+        tex_node = node_tree.nodes.new(type='ShaderNodeTexImage')
+        tex_node.image = image
+        tex_node.name = "Assetify_Temp_TEX_" + tex_node.name
+        node_tree.nodes.active = tex_node
+        added_nodes.setdefault(mat.name, []).append(tex_node)
+        
+        # Find the last Principled BSDF node connected to the Material Output.
+        principled_node = find_principled_from_output(node_tree)
         if not principled_node:
-            debug_print(f"[WARNING] No Principled BSDF found in material {mat.name}, skipping.")
+            print(f"[WARNING] No Principled BSDF connected to the Material Output in material {mat.name}, skipping metallic bake.")
             continue
-
-        # Find the Material Output node by type
+        
+        # Access the 'Metallic' input from the Principled BSDF.
+        metallic_input = principled_node.inputs.get('Metallic')
+        if not metallic_input:
+            print(f"[WARNING] Material {mat.name} has no Metallic input, skipping.")
+            continue
+        
+        # Create an Emission node that will output the metallic value as color.
+        emission_node = node_tree.nodes.new(type='ShaderNodeEmission')
+        emission_node.name = "Assetify_Temp_Emission_" + emission_node.name
+        emission_node.location = (principled_node.location.x - 200, principled_node.location.y)
+        
+        # For metallic, link the Metallic input source to the Emission node's Color input.
+        if metallic_input.is_linked:
+            color_source = metallic_input.links[0].from_socket
+            # If the metallic source is a float value, convert it to a color using CombineRGB.
+            if color_source.type in {'VALUE', 'FLOAT'}:
+                combine_node = node_tree.nodes.new(type='ShaderNodeCombineRGB')
+                combine_node.name = "Assetify_Temp_CombineRGB_" + combine_node.name
+                # Position the combine node near the color_source's node.
+                combine_node.location = (color_source.node.location.x - 200, color_source.node.location.y)
+                node_tree.links.new(color_source, combine_node.inputs['R'])
+                node_tree.links.new(color_source, combine_node.inputs['G'])
+                node_tree.links.new(color_source, combine_node.inputs['B'])
+                node_tree.links.new(combine_node.outputs['Image'], emission_node.inputs['Color'])
+                print(f"[DEBUG] Metallic input is a value; created CombineRGB for {mat.name}")
+                added_nodes.setdefault(mat.name, []).append(combine_node)
+            else:
+                node_tree.links.new(color_source, emission_node.inputs['Color'])
+                print(f"[DEBUG] Linked Metallic input for {mat.name}")
+        else:
+            default_metallic = metallic_input.default_value
+            emission_node.inputs['Color'].default_value = (default_metallic, default_metallic, default_metallic, 1.0)
+            print(f"[DEBUG] Metallic input not linked for {mat.name}, using default value {default_metallic}")
+        added_nodes.setdefault(mat.name, []).append(emission_node)
+        
+        # Find the Material Output node (create one if necessary)
         material_output_node = next((node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
         if not material_output_node:
-            debug_print(f"[ERROR] No Material Output node found in material {mat.name}, skipping.")
-            continue
-
-        # Store original links to the Material Output node
+            material_output_node = node_tree.nodes.new(type='ShaderNodeOutputMaterial')
+            material_output_node.name = "Assetify_Temp_Output_" + material_output_node.name
+            material_output_node.location = (0, 0)
+            temporary_output_nodes[mat.name] = material_output_node
+        
+        # Store original links from the Material Output node.
         original_links = [
             (link.from_socket, link.to_socket)
-            for link in node_tree.links
-            if link.to_node == material_output_node
+            for link in node_tree.links if link.to_node == material_output_node
         ]
-        original_links_dict[mat] = original_links
-
-        # Create a list to store added nodes
-        added_nodes = []
-
-        # Create an Emission shader for baking
-        emission_node = node_tree.nodes.new(type='ShaderNodeEmission')
-        emission_node.location = principled_node.location
-        emission_node.location.x -= 200
-        added_nodes.append(emission_node)
-
-        # Get the Metallic input from the Principled BSDF
-        metallic_input = principled_node.inputs.get('Metallic')
-        if metallic_input:
-            if metallic_input.is_linked:
-                try:
-                    # Link the Metallic input source to the Emission shader
-                    node_tree.links.new(metallic_input.links[0].from_socket, emission_node.inputs['Color'])
-                    debug_print(f"[DEBUG] Metallic input linked for material {mat.name}.")
-                except Exception as e:
-                    debug_print(f"[ERROR] Failed to link Metallic input for material {mat.name}: {e}")
-                    continue
-            else:
-                try:
-                    # Use the Metallic value from the Principled BSDF
-                    metallic_value = metallic_input.default_value
-                    emission_node.inputs['Color'].default_value = (metallic_value, metallic_value, metallic_value, 1.0)
-                    debug_print(f"[DEBUG] Metallic input not linked for material {mat.name}, using value {metallic_value}.")
-                except AttributeError as e:
-                    debug_print(f"[ERROR] Failed to access Metallic input value for material {mat.name}: {e}")
-                    continue
-        else:
-            # Fallback if Metallic input doesn't exist
-            emission_node.inputs['Color'].default_value = (0.0, 0.0, 0.0, 1.0)
-            debug_print(f"[WARNING] No Metallic input found in material {mat.name}, using default value (0.0).")
-
-        # Link the Emission shader to the Material Output node
+        materials_original_links[mat.name] = original_links
+        for from_socket, to_socket in original_links:
+            for link in list(node_tree.links):
+                if link.from_socket == from_socket and link.to_socket == to_socket:
+                    node_tree.links.remove(link)
+                    break
+        
+        # Reroute: Connect the Emission node's output to the Material Output node's Surface input.
         try:
             node_tree.links.new(emission_node.outputs['Emission'], material_output_node.inputs['Surface'])
+            print(f"[DEBUG] Connected Emission shader to Material Output for {mat.name}.")
         except Exception as e:
-            debug_print(f"[ERROR] Failed to connect Emission shader to Material Output for material {mat.name}: {e}")
-            continue
-
-        # Assign the bake image to the active material for baking
-        try:
-            image_node = node_tree.nodes.new(type='ShaderNodeTexImage')
-            image_node.image = image
-            node_tree.nodes.active = image_node  # Set this node as active for baking
-            added_nodes.append(image_node)
-        except Exception as e:
-            debug_print(f"[ERROR] Failed to assign image node for material {mat.name}: {e}")
-            continue
-
-        # Store the added nodes for cleanup
-        added_nodes_dict[mat] = added_nodes
-
-    # Perform the bake for the entire object
+            print(f"[ERROR] Linking error in {mat.name}: {e}")
+        
+    # Set bake type to 'EMIT' and perform the bake.
     bpy.context.scene.cycles.bake_type = 'EMIT'
     try:
         bpy.ops.object.bake(type='EMIT')
-        debug_print(f"[DEBUG] Successfully baked metallic map for {obj.name}")
+        print(f"[DEBUG] Successfully baked Metallic map for {obj.name}")
     except RuntimeError as e:
-        debug_print(f"[ERROR] Error during baking for object {obj.name}: {e}")
-
-    # Restore the original material links and remove added nodes
-    for mat in obj.data.materials:
-        if not mat or not mat.use_nodes:
+        print(f"[ERROR] Baking error for {obj.name}: {e}")
+    
+    # Save the baked image.
+    try:
+        image.filepath_raw = texture_file_path
+        image.file_format = 'PNG'
+        image.save()
+        print(f"[DEBUG] Saved Metallic map at {image.filepath_raw}.")
+    except Exception as e:
+        print(f"[ERROR] Saving error for {obj.name}: {e}")
+    
+    #(Optional) Cleanup: If you want to immediately restore the original material setups,
+    #consider deferring cleanup to a later frame. For now, the cleanup is commented out.
+    #If you do restore here, only remove nodes with our "Assetify_Temp_" prefix.
+    for mat_slot in obj.material_slots:
+        mat = mat_slot.material
+        if not (mat and mat.use_nodes):
             continue
-
         node_tree = mat.node_tree
-
-        # Remove only the nodes that were added
-        added_nodes = added_nodes_dict.get(mat, [])
-        for node in added_nodes:
-            node_tree.nodes.remove(node)
-
-        # Restore original links to the Material Output node
+        for node in list(node_tree.nodes):
+            if node.name.startswith("Assetify_Temp_"):
+                node_tree.nodes.remove(node)
+        for key, temp_node in temporary_output_nodes.items():
+            if temp_node in node_tree.nodes:
+                node_tree.nodes.remove(temp_node)
         material_output_node = next((node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
-        original_links = original_links_dict.get(mat, [])
-        # Remove all links to the Material Output node
+        original_links = materials_original_links.get(mat.name, [])
         for link in list(node_tree.links):
             if link.to_node == material_output_node:
                 node_tree.links.remove(link)
-        # Restore the original links
         for from_socket, to_socket in original_links:
-            node_tree.links.new(from_socket, to_socket)
-        debug_print(f"[DEBUG] Restored original shader connections for material {mat.name}")
+            try:
+                node_tree.links.new(from_socket, to_socket)
+            except Exception as e:
+                print(f"[ERROR] Restoring link in {mat.name}: {e}")
+        print(f"[DEBUG] Restored original shader connections for material {mat.name}")
+
 
 def bake_metallic_map(obj, image):
     """Bakes the metallic map into the provided image."""
@@ -5487,396 +5636,895 @@ def bake_roughness_map(obj, image):
     assign_image_to_material(obj, image, "Roughness")
     bpy.context.scene.cycles.bake_type = 'ROUGHNESS'
     bpy.ops.object.bake(type='ROUGHNESS')
- 
-def bake_alpha_map(obj, resolution, save_dir):
-    """Bake the alpha channel for all materials on the object into a single image."""
+
+def is_connected_to_output(node, node_tree):
+    """Return True if any output from 'node' eventually connects to a Material Output node."""
+    visited = set()
+    stack = list(node.outputs)
+    while stack:
+        socket = stack.pop()
+        for link in socket.links:
+            target_node = link.to_node
+            if target_node.type == 'OUTPUT_MATERIAL':
+                return True
+            if target_node not in visited:
+                visited.add(target_node)
+                stack.extend(target_node.outputs)
+    return False
+
+def traverse_for_principled(node, visited):
+    """
+    Recursively traverse backward from the given node.
+    If the node is a BSDF_PRINCIPLED, return it.
+    If the node is a GROUP, enter its node tree via its Group Output.
+    Otherwise, traverse all input sockets.
+    """
+    if node.type == 'BSDF_PRINCIPLED':
+        return node
+
+    # If the node is a group, try to enter it.
+    if node.type == 'GROUP' and node.node_tree:
+        # Find the Group Output node inside the group.
+        group_output = next((n for n in node.node_tree.nodes if n.type == 'GROUP_OUTPUT'), None)
+        if group_output:
+            # Traverse all input sockets of the group output.
+            for sock in group_output.inputs:
+                result = traverse_socket_for_principled(sock, visited)
+                if result:
+                    return result
+    # For any other node, traverse its inputs.
+    for sock in node.inputs:
+        result = traverse_socket_for_principled(sock, visited)
+        if result:
+            return result
+    return None
+
+def traverse_socket_for_principled(socket, visited):
+    """
+    Recursively follow links from the given socket.
+    If a link’s from_node is a BSDF_PRINCIPLED, return it.
+    If it’s a GROUP, enter the group (via traverse_for_principled) and continue.
+    Otherwise, traverse further back.
+    """
+    for link in socket.links:
+        from_node = link.from_node
+        if from_node in visited:
+            continue
+        visited.add(from_node)
+        result = traverse_for_principled(from_node, visited)
+        if result:
+            return result
+    return None
+
+def find_principled_from_output(node_tree):
+    """
+    Starting at the Material Output node, traverse backward through all connections
+    (entering groups as needed) to return the first encountered BSDF_PRINCIPLED node.
+    """
+    output_node = next((n for n in node_tree.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+    if not output_node:
+        return None
+    visited = set()
+    for sock in output_node.inputs:
+        result = traverse_socket_for_principled(sock, visited)
+        if result:
+            return result
+    return None
+
+def bake_emission_strength_map(obj, resolution, save_dir, platform):
+    """Bake the emission strength for all materials on the object into a single grayscale image."""
+    import os, bpy
     assetify_settings = bpy.context.scene.assetify_bake_settings
     ensure_cycles_render_engine()
     
     resolution = int(resolution)
     
+    # Setup file paths
     if assetify_settings.texturebake_mode == 'ANIMATION':
-        # Create a subfolder for the object being baked
         object_folder = os.path.join(save_dir, f"{obj.name}_textures")
         os.makedirs(object_folder, exist_ok=True)
-
-        # Create a subfolder for the Alpha map
-        map_folder = os.path.join(object_folder, "Alpha")
+        map_folder = os.path.join(object_folder, "EmissionStrength")
         os.makedirs(map_folder, exist_ok=True)
-
-        # Generate a file name based on the current frame
         frame_number = bpy.context.scene.frame_current
         file_name = f"Frame{frame_number:04d}.png"
         texture_file_path = os.path.join(map_folder, file_name)
     else:
-        # For STILL mode, save directly in the "textures" folder
         textures_folder = os.path.join(save_dir, "textures")
         os.makedirs(textures_folder, exist_ok=True)
-
-        # Save the Alpha map as a single file
-        texture_file_path = os.path.join(textures_folder, f"{obj.name}_Alpha.png")
-
-    # Delete the file if it already exists
+        texture_file_path = os.path.join(textures_folder, f"{obj.name}_EmissionStrength.png")
+    
     if os.path.exists(texture_file_path):
         os.remove(texture_file_path)
         print(f"[DEBUG] Removed existing file: {texture_file_path}")
-
-    # Create a new bake image for each frame
-    image_name = f"{obj.name}_Alpha_Frame{bpy.context.scene.frame_current:04d}"
+    
+    # Create or get the bake image
+    image_name = (f"{obj.name}_EmissionStrength_Frame{bpy.context.scene.frame_current:04d}"
+                  if assetify_settings.texturebake_mode == 'ANIMATION'
+                  else f"{obj.name}_EmissionStrength")
     image = bpy.data.images.get(image_name) or bpy.data.images.new(
-        name=image_name,
-        width=resolution,
-        height=resolution,
-        alpha=True
-    )
+        name=image_name, width=resolution, height=resolution, alpha=True)
     image.colorspace_settings.name = 'Non-Color'
-
-    # Clean up previously added image nodes and add a new one
-    for mat_slot in obj.material_slots:
-        if mat_slot.material and mat_slot.material.use_nodes:
-            node_tree = mat_slot.material.node_tree
-
-            # Remove previously added texture nodes for this bake
-            nodes_to_remove = [
-                node for node in node_tree.nodes
-                if node.type == 'TEX_IMAGE' and node.image and node.image.name.startswith(f"{obj.name}_Alpha_Frame")
-            ]
-            for node in nodes_to_remove:
-                node_tree.nodes.remove(node)
-
-            # Create a new texture node for the current frame
-            tex_node = node_tree.nodes.new(type='ShaderNodeTexImage')
-            tex_node.image = image
-            node_tree.nodes.active = tex_node  # Set as active for baking
-
-    # Store original connections and modifications
+    
     materials_original_links = {}
     temporary_output_nodes = {}
-
+    added_nodes = {}  # Track only our temporary nodes by material name.
+    
+    # Process each material on the object
     for mat_slot in obj.material_slots:
         mat = mat_slot.material
-        if not mat or not mat.use_nodes:
-            debug_print(f"[WARNING] Material {mat.name if mat else 'None'} does not use nodes, skipping.")
+        if not (mat and mat.use_nodes):
+            print(f"[WARNING] Material {mat.name if mat else 'None'} does not use nodes, skipping.")
             continue
-
-        debug_print(f"[DEBUG] Processing material {mat.name}")
-
         node_tree = mat.node_tree
-
-        # Collect all Principled BSDF nodes in the material's node tree
-        principled_nodes = [node for node in node_tree.nodes if node.type == 'BSDF_PRINCIPLED']
-        if not principled_nodes:
-            debug_print(f"[WARNING] No Principled BSDF nodes found in the material's node tree.")
+        
+        # Remove previously added temporary TEX_IMAGE nodes
+        for node in list(node_tree.nodes):
+            if node.type == 'TEX_IMAGE' and node.name.startswith("Assetify_Temp_TEX_"):
+                node_tree.nodes.remove(node)
+        
+        # Create a new TEX_IMAGE node for baking
+        tex_node = node_tree.nodes.new(type='ShaderNodeTexImage')
+        tex_node.image = image
+        tex_node.name = "Assetify_Temp_TEX_" + tex_node.name
+        node_tree.nodes.active = tex_node
+        added_nodes.setdefault(mat.name, []).append(tex_node)
+        
+        # Find the last Principled BSDF node connected to the Material Output.
+        principled_node = find_principled_from_output(node_tree)
+        if not principled_node:
+            print(f"[WARNING] No Principled BSDF connected to the Material Output in material {mat.name}, skipping emission strength bake.")
             continue
+        
+        # Get the 'Emission Strength' input from the Principled BSDF.
+        strength_input = principled_node.inputs.get('Emission Strength')
+        if not strength_input:
+            print(f"[WARNING] Material {mat.name} has no 'Emission Strength' input, skipping.")
+            continue
+        
+        # Create an EMISSION node to output the strength as a color.
+        emission_node = node_tree.nodes.new(type='ShaderNodeEmission')
+        emission_node.name = "Assetify_Temp_Emission_" + emission_node.name
+        emission_node.location = (principled_node.location.x - 200, principled_node.location.y)
+        emission_node.inputs['Strength'].default_value = 1.0
+        
+        # Link the emission strength value.
+        if strength_input.is_linked:
+            strength_source = strength_input.links[0].from_socket
+            node_tree.links.new(strength_source, emission_node.inputs['Color'])
+            print(f"[DEBUG] Linked Emission Strength for {mat.name}.")
         else:
-            debug_print(f"[DEBUG] Found {len(principled_nodes)} Principled BSDF node(s) in the material.")
-
-        # Function to count the number of connected inputs for a node
-        def count_connected_inputs(node):
-            return sum(1 for input in node.inputs if input.is_linked)
-
-        # Find the node with the most connected inputs
-        principled_node = max(principled_nodes, key=count_connected_inputs)
-        connected_inputs_count = count_connected_inputs(principled_node)
-        debug_print(f"[DEBUG] Selected Principled BSDF node '{principled_node.name}' with {connected_inputs_count} connected input(s).")
-
-        # Access the 'Alpha' input of the selected Principled BSDF node
-        alpha_input = principled_node.inputs.get('Alpha')
-        if alpha_input:
-            is_linked = alpha_input.is_linked
-            debug_print(f"[DEBUG] 'Alpha' input is linked: {is_linked}")
-            if is_linked:
-                # There might be multiple links; iterate over them
-                for link in alpha_input.links:
-                    from_node = link.from_node
-                    from_socket = link.from_socket
-                    debug_print(f"[DEBUG] 'Alpha' input is linked to node: '{from_node.name}' (type: {from_node.type})")
-                    debug_print(f"[DEBUG] From socket: '{from_socket.name}' (type: {from_socket.type})")
-                # Use the first linked socket as the alpha source
-                alpha_source = alpha_input.links[0].from_socket
-            else:
-                # If not linked, use the default value
-                default_value = alpha_input.default_value
-                debug_print(f"[DEBUG] 'Alpha' input is not linked. Default value: {default_value}")
-                alpha_source = None
-        else:
-            debug_print("[WARNING] 'Alpha' input not found on the Principled BSDF node.")
-            alpha_source = None
-
-        # Find the Material Output node
+            default_strength = strength_input.default_value
+            emission_node.inputs['Color'].default_value = (default_strength, default_strength, default_strength, 1.0)
+            print(f"[DEBUG] Using default Emission Strength for {mat.name}: {default_strength}")
+        added_nodes.setdefault(mat.name, []).append(emission_node)
+        
+        # Find or create the Material Output node.
         material_output_node = next((node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
         if not material_output_node:
-            # Create a temporary Material Output node if missing
             material_output_node = node_tree.nodes.new(type='ShaderNodeOutputMaterial')
+            material_output_node.name = "Assetify_Temp_Output_" + material_output_node.name
             material_output_node.location = (0, 0)
             temporary_output_nodes[mat.name] = material_output_node
-            debug_print(f"[INFO] Created temporary Material Output node for material {mat.name}.")
-
-        # Store original links to the Material Output node
+            print(f"[INFO] Created temporary Material Output node for {mat.name}.")
+        
+        # Store original links from the Material Output node.
         original_links = [
             (link.from_socket, link.to_socket)
-            for link in node_tree.links
-            if link.to_node == material_output_node
+            for link in node_tree.links if link.to_node == material_output_node
         ]
         materials_original_links[mat.name] = original_links
-
-        # Disconnect existing links to the Material Output node
         for from_socket, to_socket in original_links:
-            for link in node_tree.links:
+            for link in list(node_tree.links):
                 if link.from_socket == from_socket and link.to_socket == to_socket:
                     node_tree.links.remove(link)
                     break
-
-        # Create an Emission shader
-        emission_node = node_tree.nodes.new(type='ShaderNodeEmission')
-        emission_node.location = (principled_node.location.x - 200, principled_node.location.y)
-
-        if alpha_source:
-            try:
-                # Handle float to color conversion if needed
-                if alpha_source.type in {'VALUE', 'FLOAT'}:
-                    combine_node = node_tree.nodes.new(type='ShaderNodeCombineRGB')
-                    combine_node.location = (alpha_source.node.location.x - 200, alpha_source.node.location.y)
-                    node_tree.links.new(alpha_source, combine_node.inputs['R'])
-                    node_tree.links.new(alpha_source, combine_node.inputs['G'])
-                    node_tree.links.new(alpha_source, combine_node.inputs['B'])
-                    node_tree.links.new(combine_node.outputs['Image'], emission_node.inputs['Color'])
-                    debug_print(f"[DEBUG] Connected Alpha source through CombineRGB node for material {mat.name}.")
-                else:
-                    node_tree.links.new(alpha_source, emission_node.inputs['Color'])
-                    debug_print(f"[DEBUG] Linked Alpha source to Emission shader for material {mat.name}.")
-            except Exception as e:
-                debug_print(f"[ERROR] Failed to link Alpha source for material {mat.name}: {e}")
-        else:
-            # Use default alpha value
-            if alpha_input:
-                default_value = alpha_input.default_value
-            else:
-                default_value = 1.0
-            emission_node.inputs['Color'].default_value = (default_value, default_value, default_value, 1.0)
-            debug_print(f"[DEBUG] Using default Alpha value {default_value} for material {mat.name}.")
-
-        # Link the Emission shader to the Material Output node
+        
+        # Connect the EMISSION node output to the Material Output node's Surface input.
         try:
             node_tree.links.new(emission_node.outputs['Emission'], material_output_node.inputs['Surface'])
-            debug_print(f"[DEBUG] Connected Emission shader to Material Output for material {mat.name}.")
+            print(f"[DEBUG] Connected Emission node to Material Output for {mat.name}.")
         except Exception as e:
-            debug_print(f"[ERROR] Failed to connect Emission shader to Material Output for material {mat.name}: {e}")
-
-        # Assign the bake image to the material
-        image_node = node_tree.nodes.new(type='ShaderNodeTexImage')
-        image_node.image = image
-        node_tree.nodes.active = image_node  # Set this node as active for baking
-
-    # Perform the bake for all materials on the object
+            print(f"[ERROR] Linking error in {mat.name}: {e}")
+        
+    # Set bake type and perform the bake.
     bpy.context.scene.cycles.bake_type = 'EMIT'
     try:
         bpy.ops.object.bake(type='EMIT')
-        debug_print(f"[DEBUG] Successfully baked Alpha map for {obj.name}")
+        print(f"[DEBUG] Successfully baked Emission Strength map for {obj.name}.")
     except RuntimeError as e:
-        debug_print(f"[ERROR] Error during baking for object {obj.name}: {e}")
-
-    # Save the baked image
+        print(f"[ERROR] Baking error for {obj.name}: {e}")
+    
+    # Save the baked image.
     try:
         image.filepath_raw = texture_file_path
         image.file_format = 'PNG'
         image.save()
-        debug_print(f"Baked Alpha map saved at {image.filepath_raw}")
+        print(f"[DEBUG] Saved Emission Strength map at {image.filepath_raw}.")
     except Exception as e:
-        debug_print(f"[ERROR] Error saving Alpha map for {obj.name}: {e}")
-        
-    # Restore original material setup
+        print(f"[ERROR] Saving error for {obj.name}: {e}")
+    
+    # Cleanup: Restore original material setups.
     for mat_slot in obj.material_slots:
         mat = mat_slot.material
-        if not mat or not mat.use_nodes:
+        if not (mat and mat.use_nodes):
             continue
-
         node_tree = mat.node_tree
-
-        # Remove Emission, CombineRGB, and Image nodes
-        nodes_to_remove = [node for node in node_tree.nodes if node.type in {'EMISSION', 'TEX_IMAGE', 'COMBRGB'}]
-        for node in nodes_to_remove:
-            node_tree.nodes.remove(node)
-
+        
+        # Remove only temporary nodes (with our prefix)
+        for node in list(node_tree.nodes):
+            if node.name.startswith("Assetify_Temp_"):
+                node_tree.nodes.remove(node)
+        
         # Remove temporary Material Output nodes
-        if mat.name in temporary_output_nodes:
-            node_tree.nodes.remove(temporary_output_nodes[mat.name])
-
-        # Restore original links to the Material Output node
+        for key, temp_node in temporary_output_nodes.items():
+            if temp_node in node_tree.nodes:
+                node_tree.nodes.remove(temp_node)
+        
         material_output_node = next((node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
         original_links = materials_original_links.get(mat.name, [])
-        # Remove all links to the Material Output node
         for link in list(node_tree.links):
             if link.to_node == material_output_node:
                 node_tree.links.remove(link)
-        # Restore the original links
         for from_socket, to_socket in original_links:
-            node_tree.links.new(from_socket, to_socket)
-        debug_print(f"[DEBUG] Restored original shader connections for material {mat.name}")        
+            try:
+                node_tree.links.new(from_socket, to_socket)
+            except Exception as e:
+                print(f"[ERROR] Restoring link in {mat.name}: {e}")
+        print(f"[DEBUG] Restored original shader connections for material {mat.name}")
+
+def bake_emission_color_map(obj, resolution, save_dir, platform):
+    """Bake the emission color for all materials on the object into a single image."""
+    import os, bpy
+    assetify_settings = bpy.context.scene.assetify_bake_settings
+    ensure_cycles_render_engine()
+    
+    resolution = int(resolution)
+    
+    # Setup file paths
+    if assetify_settings.texturebake_mode == 'ANIMATION':
+        object_folder = os.path.join(save_dir, f"{obj.name}_textures")
+        os.makedirs(object_folder, exist_ok=True)
+        map_folder = os.path.join(object_folder, "EmissionColor")
+        os.makedirs(map_folder, exist_ok=True)
+        frame_number = bpy.context.scene.frame_current
+        file_name = f"Frame{frame_number:04d}.png"
+        texture_file_path = os.path.join(map_folder, file_name)
+    else:
+        textures_folder = os.path.join(save_dir, "textures")
+        os.makedirs(textures_folder, exist_ok=True)
+        texture_file_path = os.path.join(textures_folder, f"{obj.name}_EmissionColor.png")
+    
+    if os.path.exists(texture_file_path):
+        os.remove(texture_file_path)
+        print(f"[DEBUG] Removed existing file: {texture_file_path}")
+    
+    # Create or get the bake image
+    image_name = (f"{obj.name}_EmissionColor_Frame{bpy.context.scene.frame_current:04d}"
+                  if assetify_settings.texturebake_mode == 'ANIMATION'
+                  else f"{obj.name}_EmissionColor")
+    image = bpy.data.images.get(image_name) or bpy.data.images.new(
+        name=image_name, width=resolution, height=resolution, alpha=True)
+    image.colorspace_settings.name = 'Non-Color'
+    
+    materials_original_links = {}
+    temporary_output_nodes = {}
+    added_nodes = {}
+    
+    # Process each material on the object
+    for mat_slot in obj.material_slots:
+        mat = mat_slot.material
+        if not (mat and mat.use_nodes):
+            continue
+        node_tree = mat.node_tree
+        
+        # Remove previously added temporary TEX_IMAGE nodes for this bake
+        for node in list(node_tree.nodes):
+            if node.type == 'TEX_IMAGE' and node.name.startswith("Assetify_Temp_TEX_"):
+                node_tree.nodes.remove(node)
+        
+        # Create a new TEX_IMAGE node and set it active.
+        tex_node = node_tree.nodes.new(type='ShaderNodeTexImage')
+        tex_node.image = image
+        tex_node.name = "Assetify_Temp_TEX_" + tex_node.name
+        node_tree.nodes.active = tex_node
+        added_nodes.setdefault(mat.name, []).append(tex_node)
+        
+        # Find the last Principled BSDF node connected to the Material Output.
+        principled_node = find_principled_from_output(node_tree)
+        if not principled_node:
+            print(f"[WARNING] No Principled BSDF connected to the Material Output in material {mat.name}, skipping emission color bake.")
+            continue
+        
+        # Get the 'Emission Color' input from the Principled BSDF.
+        emission_color_input = principled_node.inputs.get('Emission Color')
+        if not emission_color_input:
+            print(f"[WARNING] Material {mat.name} has no Emission input, skipping.")
+            continue
+        
+        # Create an EMISSION node to output the emission color.
+        emission_node = node_tree.nodes.new(type='ShaderNodeEmission')
+        emission_node.name = "Assetify_Temp_Emission_" + emission_node.name
+        emission_node.location = (principled_node.location.x - 200, principled_node.location.y)
+        
+        # For emission color, link the emission color value.
+        if emission_color_input.is_linked:
+            color_source = emission_color_input.links[0].from_socket
+            node_tree.links.new(color_source, emission_node.inputs['Color'])
+            print(f"[DEBUG] Linked Emission Color for {mat.name}")
+        else:
+            default_color = emission_color_input.default_value if emission_color_input else (0, 0, 0, 1)
+            emission_node.inputs['Color'].default_value = default_color
+            print(f"[DEBUG] Using default Emission Color for {mat.name}")
+        added_nodes.setdefault(mat.name, []).append(emission_node)
+        
+        # Find or create the Material Output node.
+        material_output_node = next((node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
+        if not material_output_node:
+            material_output_node = node_tree.nodes.new(type='ShaderNodeOutputMaterial')
+            material_output_node.name = "Assetify_Temp_Output_" + material_output_node.name
+            material_output_node.location = (0, 0)
+            temporary_output_nodes[mat.name] = material_output_node
+        
+        # Store original links from the Material Output node.
+        original_links = [
+            (link.from_socket, link.to_socket)
+            for link in node_tree.links if link.to_node == material_output_node
+        ]
+        materials_original_links[mat.name] = original_links
+        for from_socket, to_socket in original_links:
+            for link in list(node_tree.links):
+                if link.from_socket == from_socket and link.to_socket == to_socket:
+                    node_tree.links.remove(link)
+                    break
+        
+        try:
+            node_tree.links.new(emission_node.outputs['Emission'], material_output_node.inputs['Surface'])
+        except Exception as e:
+            print(f"[ERROR] Linking error in {mat.name}: {e}")
+    
+    bpy.context.scene.cycles.bake_type = 'EMIT'
+    try:
+        bpy.ops.object.bake(type='EMIT')
+        print(f"[DEBUG] Successfully baked Emission Color map for {obj.name}")
+    except RuntimeError as e:
+        print(f"[ERROR] Baking error for {obj.name}: {e}")
+    
+    try:
+        image.filepath_raw = texture_file_path
+        image.file_format = 'PNG'
+        image.save()
+        print(f"[DEBUG] Saved Emission Color map at {image.filepath_raw}")
+    except Exception as e:
+        print(f"[ERROR] Saving error for {obj.name}: {e}")
+    
+    # Cleanup: Restore original material setups.
+    for mat_slot in obj.material_slots:
+        mat = mat_slot.material
+        if not (mat and mat.use_nodes):
+            continue
+        node_tree = mat.node_tree
+        for node in list(node_tree.nodes):
+            if node.name.startswith("Assetify_Temp_"):
+                node_tree.nodes.remove(node)
+        for key, temp_node in temporary_output_nodes.items():
+            if temp_node in node_tree.nodes:
+                node_tree.nodes.remove(temp_node)
+        material_output_node = next((node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
+        original_links = materials_original_links.get(mat.name, [])
+        for link in list(node_tree.links):
+            if link.to_node == material_output_node:
+                node_tree.links.remove(link)
+        for from_socket, to_socket in original_links:
+            try:
+                node_tree.links.new(from_socket, to_socket)
+            except Exception as e:
+                print(f"[ERROR] Restoring link in {mat.name}: {e}")
+        print(f"[DEBUG] Restored original shader connections for material {mat.name}")
+        
+def bake_transmission_map(obj, resolution, save_dir, platform):
+    """Bake the transmission for all materials on the object into a single grayscale image."""
+    import os, bpy
+    assetify_settings = bpy.context.scene.assetify_bake_settings
+    ensure_cycles_render_engine()
+    
+    resolution = int(resolution)
+    
+    # Setup file paths for Transmission bake
+    if assetify_settings.texturebake_mode == 'ANIMATION':
+        object_folder = os.path.join(save_dir, f"{obj.name}_textures")
+        os.makedirs(object_folder, exist_ok=True)
+        map_folder = os.path.join(object_folder, "Transmission")
+        os.makedirs(map_folder, exist_ok=True)
+        frame_number = bpy.context.scene.frame_current
+        file_name = f"Frame{frame_number:04d}.png"
+        texture_file_path = os.path.join(map_folder, file_name)
+    else:
+        textures_folder = os.path.join(save_dir, "textures")
+        os.makedirs(textures_folder, exist_ok=True)
+        texture_file_path = os.path.join(textures_folder, f"{obj.name}_Transmission.png")
+    
+    if os.path.exists(texture_file_path):
+        os.remove(texture_file_path)
+        print(f"[DEBUG] Removed existing file: {texture_file_path}")
+    
+    # Create or get the bake image
+    image_name = (f"{obj.name}_Transmission_Frame{bpy.context.scene.frame_current:04d}"
+                  if assetify_settings.texturebake_mode == 'ANIMATION'
+                  else f"{obj.name}_Transmission")
+    image = bpy.data.images.get(image_name) or bpy.data.images.new(
+        name=image_name, width=resolution, height=resolution, alpha=True)
+    image.colorspace_settings.name = 'Non-Color'
+    
+    materials_original_links = {}
+    temporary_output_nodes = {}
+    added_nodes = {}
+    
+    # Process each material on the object
+    for mat_slot in obj.material_slots:
+        mat = mat_slot.material
+        if not (mat and mat.use_nodes):
+            print(f"[WARNING] Material {mat.name if mat else 'None'} does not use nodes, skipping.")
+            continue
+        node_tree = mat.node_tree
+        
+        # Remove temporary TEX_IMAGE nodes for Transmission bake.
+        for node in list(node_tree.nodes):
+            if node.type == 'TEX_IMAGE' and node.name.startswith("Assetify_Temp_TEX_"):
+                node_tree.nodes.remove(node)
+        
+        # Create a new TEX_IMAGE node for baking.
+        tex_node = node_tree.nodes.new(type='ShaderNodeTexImage')
+        tex_node.image = image
+        tex_node.name = "Assetify_Temp_TEX_" + tex_node.name
+        node_tree.nodes.active = tex_node
+        added_nodes.setdefault(mat.name, []).append(tex_node)
+        
+        # Find the last Principled BSDF node.
+        principled_node = find_principled_from_output(node_tree)
+        if not principled_node:
+            print(f"[WARNING] No Principled BSDF connected to the Material Output in material {mat.name}, skipping transmission bake.")
+            continue
+        
+        # Access 'Transmission Weight' input.
+        transmission_input = principled_node.inputs.get("Transmission Weight")
+        if transmission_input:
+            if transmission_input.is_linked:
+                for link in transmission_input.links:
+                    print(f"[DEBUG] 'Transmission Weight' in {mat.name} linked from '{link.from_node.name}' (socket: {link.from_socket.name}).")
+                transmission_source = transmission_input.links[0].from_socket
+            else:
+                print(f"[DEBUG] 'Transmission Weight' in {mat.name} not linked; default value: {transmission_input.default_value}.")
+                transmission_source = None
+        else:
+            print(f"[WARNING] Material {mat.name} has no 'Transmission Weight' input, skipping.")
+            continue
+        
+        # Find or create the Material Output node.
+        material_output_node = next((node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
+        if not material_output_node:
+            material_output_node = node_tree.nodes.new(type='ShaderNodeOutputMaterial')
+            material_output_node.name = "Assetify_Temp_Output_" + material_output_node.name
+            material_output_node.location = (0, 0)
+            temporary_output_nodes[mat.name] = material_output_node
+            print(f"[INFO] Created temporary Material Output node for {mat.name}.")
+        
+        # Store original links.
+        original_links = [
+            (link.from_socket, link.to_socket)
+            for link in node_tree.links if link.to_node == material_output_node
+        ]
+        materials_original_links[mat.name] = original_links
+        for from_socket, to_socket in original_links:
+            for link in list(node_tree.links):
+                if link.from_socket == from_socket and link.to_socket == to_socket:
+                    node_tree.links.remove(link)
+                    break
+        
+        # Build the Transmission chain: Create an EMISSION node.
+        emission_node = node_tree.nodes.new(type='ShaderNodeEmission')
+        emission_node.name = "Assetify_Temp_Emission_" + emission_node.name
+        emission_node.location = (principled_node.location.x - 200, principled_node.location.y)
+        emission_node.inputs['Color'].default_value = (1.0, 1.0, 1.0, 1.0)
+        emission_node.inputs['Strength'].default_value = 1.0
+        added_nodes.setdefault(mat.name, []).append(emission_node)
+        
+        # Convert transmission value (a float) to grayscale.
+        if transmission_source:
+            if transmission_source.type in {'VALUE', 'FLOAT'}:
+                combine_node = node_tree.nodes.new(type='ShaderNodeCombineRGB')
+                combine_node.name = "Assetify_Temp_CombineRGB_" + combine_node.name
+                combine_node.location = (transmission_source.node.location.x - 200, transmission_source.node.location.y)
+                node_tree.links.new(transmission_source, combine_node.inputs['R'])
+                node_tree.links.new(transmission_source, combine_node.inputs['G'])
+                node_tree.links.new(transmission_source, combine_node.inputs['B'])
+                node_tree.links.new(combine_node.outputs['Image'], emission_node.inputs['Color'])
+                print(f"[DEBUG] Connected Transmission Weight through CombineRGB for {mat.name}.")
+                added_nodes.setdefault(mat.name, []).append(combine_node)
+            else:
+                node_tree.links.new(transmission_source, emission_node.inputs['Color'])
+                print(f"[DEBUG] Linked Transmission Weight directly for {mat.name}.")
+        else:
+            default_val = transmission_input.default_value if transmission_input is not None else 0.0
+            emission_node.inputs['Color'].default_value = (default_val, default_val, default_val, 1.0)
+            print(f"[DEBUG] Using default Transmission Weight for {mat.name}: {default_val}")
+        
+        # Connect EMISSION node to Material Output.
+        try:
+            node_tree.links.new(emission_node.outputs['Emission'], material_output_node.inputs['Surface'])
+            print(f"[DEBUG] Connected Transmission chain for {mat.name}.")
+        except Exception as e:
+            print(f"[ERROR] Failed to connect Transmission chain in {mat.name}: {e}")
+        
+        # Create a new TEX_IMAGE node for baking.
+        tex_node = node_tree.nodes.new(type='ShaderNodeTexImage')
+        tex_node.image = image
+        tex_node.name = "Assetify_Temp_TEX_" + tex_node.name
+        node_tree.nodes.active = tex_node
+        added_nodes.setdefault(mat.name, []).append(tex_node)
+    
+    bpy.context.scene.cycles.bake_type = 'EMIT'
+    try:
+        bpy.ops.object.bake(type='EMIT')
+        print(f"[DEBUG] Successfully baked Transmission map for {obj.name}.")
+    except RuntimeError as e:
+        print(f"[ERROR] Baking error for {obj.name}: {e}")
+    
+    try:
+        image.filepath_raw = texture_file_path
+        image.file_format = 'PNG'
+        image.save()
+        print(f"[DEBUG] Saved Transmission map at {image.filepath_raw}.")
+    except Exception as e:
+        print(f"[ERROR] Saving error for {obj.name}: {e}")
+    
+    # Cleanup: Remove temporary nodes and restore original links.
+    for mat_slot in obj.material_slots:
+        mat = mat_slot.material
+        if not (mat and mat.use_nodes):
+            continue
+        node_tree = mat.node_tree
+        for node in list(node_tree.nodes):
+            if node.name.startswith("Assetify_Temp_"):
+                node_tree.nodes.remove(node)
+        for key, temp_node in temporary_output_nodes.items():
+            if temp_node in node_tree.nodes:
+                node_tree.nodes.remove(temp_node)
+        material_output_node = next((node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
+        original_links = materials_original_links.get(mat.name, [])
+        for link in list(node_tree.links):
+            if link.to_node == material_output_node:
+                node_tree.links.remove(link)
+        for from_socket, to_socket in original_links:
+            try:
+                node_tree.links.new(from_socket, to_socket)
+            except Exception as e:
+                print(f"[ERROR] Restoring link in {mat.name}: {e}")
+        print(f"[DEBUG] Restored original shader connections for material {mat.name}")
+
+def bake_alpha_map(obj, resolution, save_dir):
+    """Bake the alpha channel for all materials on the object into a single image."""
+    import os, bpy
+    assetify_settings = bpy.context.scene.assetify_bake_settings
+    ensure_cycles_render_engine()
+    
+    resolution = int(resolution)
+    
+    # Setup file paths for Alpha bake
+    if assetify_settings.texturebake_mode == 'ANIMATION':
+        object_folder = os.path.join(save_dir, f"{obj.name}_textures")
+        os.makedirs(object_folder, exist_ok=True)
+        map_folder = os.path.join(object_folder, "Alpha")
+        os.makedirs(map_folder, exist_ok=True)
+        frame_number = bpy.context.scene.frame_current
+        file_name = f"Frame{frame_number:04d}.png"
+        texture_file_path = os.path.join(map_folder, file_name)
+    else:
+        textures_folder = os.path.join(save_dir, "textures")
+        os.makedirs(textures_folder, exist_ok=True)
+        texture_file_path = os.path.join(textures_folder, f"{obj.name}_Alpha.png")
+    
+    if os.path.exists(texture_file_path):
+        os.remove(texture_file_path)
+        print(f"[DEBUG] Removed existing file: {texture_file_path}")
+    
+    # Create or get the bake image
+    image_name = (f"{obj.name}_Alpha_Frame{bpy.context.scene.frame_current:04d}"
+                  if assetify_settings.texturebake_mode == 'ANIMATION'
+                  else f"{obj.name}_Alpha")
+    image = bpy.data.images.get(image_name) or bpy.data.images.new(
+        name=image_name, width=resolution, height=resolution, alpha=True)
+    image.colorspace_settings.name = 'Non-Color'
+    
+    materials_original_links = {}
+    temporary_output_nodes = {}
+    added_nodes = {}
+    
+    # Process each material on the object
+    for mat_slot in obj.material_slots:
+        mat = mat_slot.material
+        if not (mat and mat.use_nodes):
+            print(f"[WARNING] Material {mat.name if mat else 'None'} does not use nodes, skipping.")
+            continue
+        node_tree = mat.node_tree
+        
+        # Remove previously added temporary TEX_IMAGE nodes for alpha bake.
+        for node in list(node_tree.nodes):
+            if node.type == 'TEX_IMAGE' and node.name.startswith("Assetify_Temp_TEX_"):
+                node_tree.nodes.remove(node)
+        
+        # Create a new TEX_IMAGE node and set it active.
+        tex_node = node_tree.nodes.new(type='ShaderNodeTexImage')
+        tex_node.image = image
+        tex_node.name = "Assetify_Temp_TEX_" + tex_node.name
+        node_tree.nodes.active = tex_node
+        added_nodes.setdefault(mat.name, []).append(tex_node)
+        
+        # Find the last Principled BSDF node.
+        principled_node = find_principled_from_output(node_tree)
+        if not principled_node:
+            print(f"[WARNING] No Principled BSDF connected to the Material Output in material {mat.name}, skipping alpha bake.")
+            continue
+        
+        # Access the 'Alpha' input from the Principled BSDF.
+        alpha_input = principled_node.inputs.get('Alpha')
+        if not alpha_input:
+            print(f"[WARNING] Material {mat.name} has no 'Alpha' input, skipping alpha bake.")
+            continue
+        
+        # Create an EMISSION node to output the alpha as a grayscale color.
+        emission_node = node_tree.nodes.new(type='ShaderNodeEmission')
+        emission_node.name = "Assetify_Temp_Emission_" + emission_node.name
+        emission_node.location = (principled_node.location.x - 200, principled_node.location.y)
+        # Set strength to 1.
+        emission_node.inputs['Strength'].default_value = 1.0
+        
+        # Convert the alpha value: if the alpha source is a float, use a CombineRGB node.
+        if alpha_input.is_linked:
+            alpha_source = alpha_input.links[0].from_socket
+            if alpha_source.type in {'VALUE', 'FLOAT'}:
+                combine_node = node_tree.nodes.new(type='ShaderNodeCombineRGB')
+                combine_node.name = "Assetify_Temp_CombineRGB_" + combine_node.name
+                combine_node.location = (alpha_source.node.location.x - 200, alpha_source.node.location.y)
+                node_tree.links.new(alpha_source, combine_node.inputs['R'])
+                node_tree.links.new(alpha_source, combine_node.inputs['G'])
+                node_tree.links.new(alpha_source, combine_node.inputs['B'])
+                node_tree.links.new(combine_node.outputs['Image'], emission_node.inputs['Color'])
+                print(f"[DEBUG] Connected Alpha value through CombineRGB for {mat.name}.")
+                added_nodes.setdefault(mat.name, []).append(combine_node)
+            else:
+                node_tree.links.new(alpha_source, emission_node.inputs['Color'])
+                print(f"[DEBUG] Linked Alpha value directly for {mat.name}.")
+        else:
+            default_alpha = alpha_input.default_value if alpha_input is not None else 1.0
+            emission_node.inputs['Color'].default_value = (default_alpha, default_alpha, default_alpha, 1.0)
+            print(f"[DEBUG] Using default Alpha value for {mat.name}: {default_alpha}")
+        added_nodes.setdefault(mat.name, []).append(emission_node)
+        
+        # Find or create the Material Output node.
+        material_output_node = next((node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
+        if not material_output_node:
+            material_output_node = node_tree.nodes.new(type='ShaderNodeOutputMaterial')
+            material_output_node.name = "Assetify_Temp_Output_" + material_output_node.name
+            material_output_node.location = (0, 0)
+            temporary_output_nodes[mat.name] = material_output_node
+            print(f"[INFO] Created temporary Material Output node for {mat.name}.")
+        
+        # Store original links.
+        original_links = [
+            (link.from_socket, link.to_socket)
+            for link in node_tree.links if link.to_node == material_output_node
+        ]
+        materials_original_links[mat.name] = original_links
+        for from_socket, to_socket in original_links:
+            for link in list(node_tree.links):
+                if link.from_socket == from_socket and link.to_socket == to_socket:
+                    node_tree.links.remove(link)
+                    break
+        
+        try:
+            node_tree.links.new(emission_node.outputs['Emission'], material_output_node.inputs['Surface'])
+            print(f"[DEBUG] Connected Alpha baking chain for {mat.name}.")
+        except Exception as e:
+            print(f"[ERROR] Failed to connect Alpha baking chain in {mat.name}: {e}")
+        
+        # Create a new TEX_IMAGE node and set it active.
+        tex_node = node_tree.nodes.new(type='ShaderNodeTexImage')
+        tex_node.image = image
+        tex_node.name = "Assetify_Temp_TEX_" + tex_node.name
+        node_tree.nodes.active = tex_node
+        added_nodes.setdefault(mat.name, []).append(tex_node)
+    
+    bpy.context.scene.cycles.bake_type = 'EMIT'
+    try:
+        bpy.ops.object.bake(type='EMIT')
+        print(f"[DEBUG] Successfully baked Alpha map for {obj.name}.")
+    except RuntimeError as e:
+        print(f"[ERROR] Baking error for {obj.name}: {e}")
+    
+    try:
+        image.filepath_raw = texture_file_path
+        image.file_format = 'PNG'
+        image.save()
+        print(f"[DEBUG] Saved Alpha map at {image.filepath_raw}.")
+    except Exception as e:
+        print(f"[ERROR] Saving error for {obj.name}: {e}")
+    
+    # Cleanup: Restore original material setups.
+    for mat_slot in obj.material_slots:
+        mat = mat_slot.material
+        if not (mat and mat.use_nodes):
+            continue
+        node_tree = mat.node_tree
+        for node in list(node_tree.nodes):
+            if node.name.startswith("Assetify_Temp_"):
+                node_tree.nodes.remove(node)
+        for key, temp_node in temporary_output_nodes.items():
+            if temp_node in node_tree.nodes:
+                node_tree.nodes.remove(temp_node)
+        material_output_node = next((node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
+        original_links = materials_original_links.get(mat.name, [])
+        for link in list(node_tree.links):
+            if link.to_node == material_output_node:
+                node_tree.links.remove(link)
+        for from_socket, to_socket in original_links:
+            try:
+                node_tree.links.new(from_socket, to_socket)
+            except Exception as e:
+                print(f"[ERROR] Restoring link in {mat.name}: {e}")
+        print(f"[DEBUG] Restored original shader connections for material {mat.name}")
 
 def apply_baked_textures(obj, save_dir, platform="UE5"):
-    """Apply the baked textures to the object's material by setting up a Principled BSDF shader."""
-    # Ensure the object has a material, or create a new one
+    """
+    Apply baked textures to the object's material using a Principled BSDF shader.
+    In ANIMATION mode, it loads an image sequence by loading the first frame from:
+       <save_dir>/<obj.name>_textures/<map_type>/Frame0001.png
+    and sets its source to 'SEQUENCE'. The texture node's Image User properties
+    are then set to control playback.
+    """
+    import os
+    import bpy
+
+    assetify_settings = bpy.context.scene.assetify_bake_settings
+    is_animation = assetify_settings.texturebake_mode == 'ANIMATION'
+    
+    # Ensure the object has a material; if not, create one.
     if not obj.data.materials:
         new_material = bpy.data.materials.new(name=f"{obj.name}_Material")
         obj.data.materials.append(new_material)
     else:
-        new_material = obj.data.materials[0]  # Assuming we use the first material for simplicity
-
-    # Enable 'Use Nodes' if not already enabled
-    if not new_material.use_nodes:
-        new_material.use_nodes = True
-
-    # Get the node tree of the material
+        new_material = obj.data.materials[0]
+    
+    new_material.use_nodes = True
     node_tree = new_material.node_tree
-
-    # Clear existing nodes
     node_tree.nodes.clear()
-
-    # Create new Principled BSDF node
+    
+    # Create the Principled BSDF and Material Output nodes.
     bsdf_node = node_tree.nodes.new(type='ShaderNodeBsdfPrincipled')
     bsdf_node.location = (200, 0)
-    
-    # Create a new Translucent BSDF node
-    #translucent_node = node_tree.nodes.new(type='ShaderNodeBsdfTranslucent')
-    #translucent_node.location = (0, 400)  # Position it below the Principled BSDF
-    
-    # Create an Add Shader node
-    #add_shader_node = node_tree.nodes.new(type='ShaderNodeAddShader')
-    #add_shader_node.location = (550, 0)
-
-    # Create a Material Output node
     output_node = node_tree.nodes.new(type='ShaderNodeOutputMaterial')
     output_node.location = (700, 0)
-    
-    # Add a H/S/V node
-    #hsv_node = node_tree.nodes.new(type='ShaderNodeHueSaturation')
-    #hsv_node.location = (-200, 400)
-    #hsv_node.inputs['Value'].default_value = 0.5
-    
-    # Connect the Principled BSDF node to the Add Shader node
-    #node_tree.links.new(bsdf_node.outputs['BSDF'], add_shader_node.inputs[0])
-    
-    # Connect the Principled BSDF node to the Add Shader node
     node_tree.links.new(bsdf_node.outputs['BSDF'], output_node.inputs['Surface'])
-
-    # Connect the Translucent BSDF node to the Add Shader node
-    #node_tree.links.new(translucent_node.outputs['BSDF'], add_shader_node.inputs[1])
     
-    # Connect the Add Shader node to the Material Output node
-    #node_tree.links.new(add_shader_node.outputs['Shader'], output_node.inputs['Surface'])
+    # Vertical layout parameters for node placement.
+    current_y = 250
+    spacing = 250
 
-    # Define the path for the texture folder (inside the main save directory)
-    textures_folder = os.path.join(save_dir, "textures")
-
-    # Load and assign the BaseColor texture
-    basecolor_path = os.path.join(textures_folder, f"{obj.name}_BaseColor.png")
-    print(f"Looking for BaseColor texture at: {basecolor_path}")
-
-    if os.path.exists(basecolor_path):
-        basecolor_node = node_tree.nodes.new('ShaderNodeTexImage')
-        basecolor_node.image = bpy.data.images.load(basecolor_path)
-        basecolor_node.location = (-200, 250)
-        basecolor_node.image.colorspace_settings.name = 'sRGB'
-        node_tree.links.new(basecolor_node.outputs['Color'], bsdf_node.inputs['Base Color'])
-        #node_tree.links.new(basecolor_node.outputs['Color'], hsv_node.inputs['Color'])
-        #node_tree.links.new(hsv_node.outputs['Color'], translucent_node.inputs['Color'])
-        print(f"Loaded BaseColor texture from {basecolor_path}")
-    else:
-        print(f"BaseColor texture not found at {basecolor_path}")
-
-    # Load and assign the Normal map
-    normal_path = os.path.join(textures_folder, f"{obj.name}_Normal.png")
-    print(f"Looking for Normal texture at: {normal_path}")
-
-    if os.path.exists(normal_path):
-        normal_node = node_tree.nodes.new('ShaderNodeTexImage')
-        normal_node.image = bpy.data.images.load(normal_path)
-        normal_node.location = (-200, -500)
-        normal_node.image.colorspace_settings.name = 'Non-Color'
-        normal_map_node = node_tree.nodes.new('ShaderNodeNormalMap')
-        normal_map_node.location = (0, -500)
-        node_tree.links.new(normal_node.outputs['Color'], normal_map_node.inputs['Color'])
-        node_tree.links.new(normal_map_node.outputs['Normal'], bsdf_node.inputs['Normal'])
-        print(f"Loaded Normal texture from {normal_path}")
-    else:
-        print(f"Normal texture not found at {normal_path}")
-
-    if platform == 'UNITY':
-        metallic_smoothness_path = os.path.join(textures_folder, f"{obj.name}_MetallicSmoothness.png")
-        print(f"Looking for MetallicSmoothness texture at: {metallic_smoothness_path}")
-
-        if os.path.exists(metallic_smoothness_path):
-            metallic_smoothness_node = node_tree.nodes.new('ShaderNodeTexImage')
-            metallic_smoothness_node.image = bpy.data.images.load(metallic_smoothness_path)
-            metallic_smoothness_node.location = (-200, 0)
-            metallic_smoothness_node.image.colorspace_settings.name = 'Non-Color'
-
-            # Check if the image has an alpha channel (4 channels: RGBA)
-            if metallic_smoothness_node.image.depth == 32:  # 32 bits = RGBA
-                # Add Separate RGBA node
-                separate_rgba_node = node_tree.nodes.new('ShaderNodeSeparateColor')
-                separate_rgba_node.location = (0, 0)
-                node_tree.links.new(metallic_smoothness_node.outputs['Color'], separate_rgba_node.inputs['Color'])
-
-                # Connect Metallic (R channel)
-                node_tree.links.new(separate_rgba_node.outputs['Red'], bsdf_node.inputs['Metallic'])
-
-                # Connect Roughness (1 - A channel)
-                invert_node = node_tree.nodes.new('ShaderNodeInvert')
-                invert_node.location = (200, 0)
-                node_tree.links.new(metallic_smoothness_node.outputs['Alpha'], invert_node.inputs['Color'])
-                node_tree.links.new(invert_node.outputs['Color'], bsdf_node.inputs['Roughness'])
-
-                print(f"Loaded and applied MetallicSmoothness texture from {metallic_smoothness_path}")
+    # Helper to load a texture image or sequence.
+    def load_texture(map_type, colorspace='sRGB'):
+        if is_animation:
+            # Folder structure: <save_dir>/<obj.name>_textures/<map_type>/
+            object_folder = os.path.join(save_dir, f"{obj.name}_textures")
+            map_folder = os.path.join(object_folder, map_type)
+            first_frame_path = os.path.join(map_folder, "Frame0001.png")
+            if os.path.exists(map_folder) and os.path.exists(first_frame_path):
+                # Load the first frame to use as the basis for the sequence.
+                seq_image = bpy.data.images.load(first_frame_path)
+                seq_image.source = 'SEQUENCE'
+                seq_image.colorspace_settings.name = colorspace
+                # The node's Image User will later be configured.
+                return seq_image
             else:
-                print(f"Warning: {metallic_smoothness_path} does not contain an Alpha channel.")
+                print(f"No sequence images found for {map_type} at: {map_folder}")
+                return None
         else:
-            print(f"MetallicSmoothness texture not found at {metallic_smoothness_path}")
+            # STILL mode: images are stored in a common "textures" folder.
+            textures_folder = os.path.join(save_dir, "textures")
+            texture_path = os.path.join(textures_folder, f"{obj.name}_{map_type}.png")
+            if os.path.exists(texture_path):
+                image = bpy.data.images.load(texture_path)
+                image.colorspace_settings.name = colorspace
+                return image
+            else:
+                print(f"No texture found for {map_type} at: {texture_path}")
+                return None
 
-    else:
-        # Handle separate Metallic and Roughness maps for Unreal Engine
-        roughness_path = os.path.join(textures_folder, f"{obj.name}_Roughness.png")
-        metallic_path = os.path.join(textures_folder, f"{obj.name}_Metallic.png")
+    # Helper to create an image texture node and configure its Image User.
+    def create_tex_node(image, input_socket):
+        tex_node = node_tree.nodes.new('ShaderNodeTexImage')
+        tex_node.image = image
+        tex_node.location = (-400, current_y)
+        if image and image.source == 'SEQUENCE':
+            # Mimic your provided snippet:
+            tex_node.image_user.use_auto_refresh = True
+            # Set frame_duration to the number of frames in the scene (or use a fixed value, e.g., 350)
+            frame_duration = bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
+            tex_node.image_user.frame_duration = frame_duration
+            tex_node.image_user.frame_start = bpy.context.scene.frame_start
+            tex_node.image_user.frame_offset = 0
+        node_tree.links.new(tex_node.outputs["Color"], input_socket)
+        return tex_node
 
-        print(f"Looking for Roughness texture at: {roughness_path}")
-        print(f"Looking for Metallic texture at: {metallic_path}")
+    # --- Load and assign textures for each map type ---
 
-        if os.path.exists(roughness_path):
-            roughness_node = node_tree.nodes.new('ShaderNodeTexImage')
-            roughness_node.image = bpy.data.images.load(roughness_path)
-            roughness_node.location = (-200, 0)
-            roughness_node.image.colorspace_settings.name = 'Non-Color'
-            node_tree.links.new(roughness_node.outputs['Color'], bsdf_node.inputs['Roughness'])
-            print(f"Loaded Roughness texture from {roughness_path}")
-        else:
-            print(f"Roughness texture not found at {roughness_path}")
+    # BaseColor
+    basecolor_image = load_texture("BaseColor", colorspace='sRGB')
+    if basecolor_image:
+        create_tex_node(basecolor_image, bsdf_node.inputs['Base Color'])
+        print(f"Loaded BaseColor {'sequence' if is_animation else 'texture'} for {obj.name}")
+        current_y -= spacing
 
-        if os.path.exists(metallic_path):
-            metallic_node = node_tree.nodes.new('ShaderNodeTexImage')
-            metallic_node.image = bpy.data.images.load(metallic_path)
-            metallic_node.location = (-200, -250)
-            metallic_node.image.colorspace_settings.name = 'Non-Color'
-            node_tree.links.new(metallic_node.outputs['Color'], bsdf_node.inputs['Metallic'])
-            print(f"Loaded Metallic texture from {metallic_path}")
-        else:
-            print(f"Metallic texture not found at {metallic_path}")
+    # Normal Map
+    normal_image = load_texture("Normal", colorspace='Non-Color')
+    if normal_image:
+        normal_node = node_tree.nodes.new('ShaderNodeTexImage')
+        normal_node.image = normal_image
+        normal_node.location = (-400, current_y)
+        normal_node.image.colorspace_settings.name = 'Non-Color'
+        if normal_image.source == 'SEQUENCE':
+            normal_node.image_user.use_auto_refresh = True
+            frame_duration = bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
+            normal_node.image_user.frame_duration = frame_duration
+            normal_node.image_user.frame_start = bpy.context.scene.frame_start
+            normal_node.image_user.frame_offset = 0
+        normal_map_node = node_tree.nodes.new('ShaderNodeNormalMap')
+        normal_map_node.location = (-50, current_y)
+        node_tree.links.new(normal_node.outputs["Color"], normal_map_node.inputs["Color"])
+        node_tree.links.new(normal_map_node.outputs["Normal"], bsdf_node.inputs["Normal"])
+        print(f"Loaded Normal {'sequence' if is_animation else 'texture'} for {obj.name}")
+        current_y -= spacing
 
-    # Load and assign the Alpha map
-    alpha_path = os.path.join(textures_folder, f"{obj.name}_Alpha.png")
-    print(f"Looking for Alpha texture at: {alpha_path}")
+    # For non-UNITY platforms, load Roughness and Metallic.
+    if platform != 'UNITY':
+        roughness_image = load_texture("Roughness", colorspace='Non-Color')
+        if roughness_image:
+            create_tex_node(roughness_image, bsdf_node.inputs['Roughness'])
+            print(f"Loaded Roughness {'sequence' if is_animation else 'texture'} for {obj.name}")
+            current_y -= spacing
 
-    if os.path.exists(alpha_path):
-        alpha_node = node_tree.nodes.new('ShaderNodeTexImage')
-        alpha_node.image = bpy.data.images.load(alpha_path)
-        alpha_node.location = (-200, -750)
-        alpha_node.image.colorspace_settings.name = 'Non-Color'
-        node_tree.links.new(alpha_node.outputs['Color'], bsdf_node.inputs['Alpha'])
-        print(f"Loaded Alpha texture from {alpha_path}")
-    else:
-        print(f"Alpha texture not found at {alpha_path}")
+        metallic_image = load_texture("Metallic", colorspace='Non-Color')
+        if metallic_image:
+            create_tex_node(metallic_image, bsdf_node.inputs['Metallic'])
+            print(f"Loaded Metallic {'sequence' if is_animation else 'texture'} for {obj.name}")
+            current_y -= spacing
 
-    print(f"Applied baked textures to material of {obj.name}")
+    # Alpha Map (if baking alpha is enabled)
+    alpha_image = load_texture("Alpha", colorspace='Non-Color')
+    if alpha_image and bpy.context.scene.assetify_bake_settings.bake_alpha:
+        create_tex_node(alpha_image, bsdf_node.inputs['Alpha'])
+        print(f"Loaded Alpha {'sequence' if is_animation else 'texture'} for {obj.name}")
+        current_y -= spacing
+
+    # Emission Textures
+    emissioncolor_image = load_texture("EmissionColor", colorspace='sRGB')
+    if emissioncolor_image and bpy.context.scene.assetify_bake_settings.bake_emission:
+        create_tex_node(emissioncolor_image, bsdf_node.inputs["Emission Color"])
+        print(f"Loaded EmissionColor {'sequence' if is_animation else 'texture'} for {obj.name}")
+        current_y -= spacing
+
+        emissionstrength_image = load_texture("EmissionStrength", colorspace='sRGB')
+        if emissionstrength_image:
+            create_tex_node(emissionstrength_image, bsdf_node.inputs["Emission Strength"])
+            print(f"Loaded EmissionStrength {'sequence' if is_animation else 'texture'} for {obj.name}")
+            current_y -= spacing
+
+    # Transmission Map
+    transmission_image = load_texture("Transmission", colorspace='sRGB')
+    if transmission_image and bpy.context.scene.assetify_bake_settings.bake_transmission:
+        create_tex_node(transmission_image, bsdf_node.inputs['Transmission Weight'])
+        print(f"Loaded Transmission {'sequence' if is_animation else 'texture'} for {obj.name}")
+        current_y -= spacing
+
+    print(f"Applied baked {'animation sequences' if is_animation else 'textures'} to material of {obj.name}")
 
 def simplify_materials_and_uv_maps(obj):
     
@@ -7642,44 +8290,29 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         # Bake Settings Section
         box = layout.box()
         row = box.row()
-        row.prop(assetify_settings, "bake_menu_expanded", text="", icon="TRIA_DOWN" if assetify_settings.bake_menu_expanded else "TRIA_RIGHT", emboss=False)
+        row.prop(assetify_settings, "bake_menu_expanded", text="", 
+                 icon="TRIA_DOWN" if assetify_settings.bake_menu_expanded else "TRIA_RIGHT", emboss=False)
         row.label(text="Bake Assets")
-        
-        if assetify_settings.bake_menu_expanded:
-            
-            # Button for Still Mode (Highlight if selected)
-            texbake_button = row.operator(
-                "assetify.switch_texturebake_mode",
-                text="Still",
-                depress=assetify_settings.texturebake_mode == 'STILL'
-            )
-            texbake_button.mode = 'STILL'
 
-            # Button for Animation Mode (Highlight if selected)
-            animbake_button = row.operator(
-                "assetify.switch_texturebake_mode",
-                text="Animation",
-                depress=assetify_settings.texturebake_mode == 'ANIMATION'
-            )
+        if assetify_settings.bake_menu_expanded:
+
+            # Texture Bake Mode Buttons
+            row = box.row()
+            texbake_button = row.operator("assetify.switch_texturebake_mode",
+                                          text="Still",
+                                          depress=assetify_settings.texturebake_mode == 'STILL')
+            texbake_button.mode = 'STILL'
+            animbake_button = row.operator("assetify.switch_texturebake_mode",
+                                           text="Animation",
+                                           depress=assetify_settings.texturebake_mode == 'ANIMATION')
             animbake_button.mode = 'ANIMATION'
-            
+
             # Show "Apply Attributes" button only in Animation mode
             if assetify_settings.texturebake_mode == 'ANIMATION':
                 row = box.row(align=True)
-                
-                # Add an info button with emboss disabled
-                row.operator(
-                    "assetify.show_apply_frame_attributes_info",  # Info operator for explanation
-                    text="",
-                    icon='INFO',
-                    emboss=False
-                )
-                
-                # Add label for the button
+                row.operator("assetify.show_apply_frame_attributes_info", text="", icon='INFO', emboss=False)
                 split = row.split(factor=0.465, align=True)
                 split.label(text="Apply Attributes")
-                
-                # Add the "Apply Attributes" button with enabled logic
                 apply_button_col = split.column()
                 apply_button_col.enabled = (
                     (assetify_settings.asset_mode == 'ASSET' and any(
@@ -7690,70 +8323,91 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                     ))
                 )
                 apply_button_col.operator("animation.add_frame_dependent_attributes", text="Apply Attributes")
-                        
-            row = box.row(align=True)
-            split = row.split(factor=0.5, align=True)  # Adjust factor for alignment
-            split.label(text="Skip UV Unwrap")
-            split.prop(assetify_settings, "skip_uv_unwrap")
+
+            # --- Map Options Box ---
+            maps_box = box.box()
+            maps_box.label(text="Extra Map Bakes", icon='IMAGE_RGB')
+
+            # ALPHA (label + 2 checkboxes on the same row)
+            row = maps_box.row(align=True)
+            split = row.split(factor=0.52, align=True)
+            split.label(text="Alpha")
+            # Now the second half of the row for the checkboxes
+            split.prop(assetify_settings, "bake_alpha", text="")
+            split.prop(assetify_settings, "force_transparent_black",
+                     text="", icon='GHOST_ENABLED', toggle=True)
+
+            # EMISSION (label + 1 checkbox)
+            row = maps_box.row(align=True)
+            split = row.split(factor=0.5, align=True)
+            split.label(text="Emission")
+            split.prop(assetify_settings, "bake_emission", text="")
+
+            # TRANSMISSION (label + 1 checkbox)
+            row = maps_box.row(align=True)
+            split = row.split(factor=0.5, align=True)
+            split.label(text="Transmission")
+            split.prop(assetify_settings, "bake_transmission", text="")
+
+            # --- Bake Settings Box ---
+            settings_box = box.box()
+            settings_box.label(text="Bake Settings", icon='SETTINGS')
             
-            row = box.row(align=True)
+            row = settings_box.row(align=True)
+            split = row.split(factor=0.5, align=True)
+            split.label(text="Non-PrincipledBSDF Baking")
+            split.prop(assetify_settings, "non_principled_baking", text="")
+            
+            row = settings_box.row(align=True)
+            split = row.split(factor=0.5, align=True)
+            split.label(text="Skip UV Unwrap")
+            split.prop(assetify_settings, "skip_uv_unwrap", text="")
+            
+            # Ungroup Nodes with Info
+            row = settings_box.row(align=True)
+            row.operator("assetify.show_ungroup_info", text="", icon='INFO', emboss=False)
+            split = row.split(factor=0.45, align=True)
+            split.label(text="Skip Ungrouping")
+            split.prop(assetify_settings, "ungroup_node_groups", text="")
+            
+            row = settings_box.row(align=True)
             split = row.split(factor=0.5, align=True)
             split.label(text="Target Platform")
             split.prop(assetify_settings, "platform_target", text="")
             
-            row = box.row(align=True)
+            row = settings_box.row(align=True)
             split = row.split(factor=0.5, align=True)
             split.label(text="Render Device")
             split.prop(assetify_settings, "render_device", text="")
             
-            row = box.row(align=True)
-            split = row.split(factor=0.5, align=True)  # Adjust factor for alignment
+            row = settings_box.row(align=True)
+            split = row.split(factor=0.5, align=True)
             split.label(text="Use Tiling")
             split.prop(assetify_settings, "use_tiling", text="")  # Checkbox only
             
-            if assetify_settings.use_tiling:  # Show Tile Size only if Use Tiling is enabled
-                row = box.row(align=True)
+            if assetify_settings.use_tiling:
+                row = settings_box.row(align=True)
                 split = row.split(factor=0.5, align=True)
                 split.label(text="Tile Size")
-                split.prop(assetify_settings, "tile_size", text="")  # Numeric input on the right
-                
-            # Bake Folder (50/50 split)
-            row = box.row(align=True)
+                split.prop(assetify_settings, "tile_size", text="")  # Numeric input
+            
+            row = settings_box.row(align=True)
             split = row.split(factor=0.5, align=True)
             split.label(text="Bake Folder")
             split.prop(assetify_settings, "bake_folder", text="")
             
-            # Bake Resolution (50/50 split)
-            row = box.row(align=True)
+            row = settings_box.row(align=True)
             split = row.split(factor=0.5, align=True)
             split.label(text="Bake Resolution")
             split.prop(assetify_settings, "bake_resolution", text="")
             
-            # Bake Samples (two-column layout)
-            row = box.row(align=True)
+            row = settings_box.row(align=True)
             split = row.split(factor=0.5, align=True)
             split.label(text="Bake Samples")
-            split.prop(assetify_settings, "bake_samples", text="")  # Numeric input on the right
+            split.prop(assetify_settings, "bake_samples", text="")  # Numeric input
             
-            # Ungroup Nodes
-            row = box.row(align=True)
-
-            # Add an info button before the label
-            row.operator(
-                "assetify.show_ungroup_info",  
-                text="",
-                icon='INFO',
-                emboss=False
-            )
-
-            split = row.split(factor=0.465, align=True)
-            split.label(text="Ungroup Nodes")
-            split.prop(assetify_settings, "ungroup_node_groups", text="")
-
-            # Bake button row with info icon
+            # Bake Button Row
             bake_row = box.row(align=True)
-
-            # Info button (always enabled)
             info_col = bake_row.column()
             info_col.operator("assetify.show_bake_info", text="", icon='INFO', emboss=False)
             
@@ -7761,8 +8415,6 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 "Bake Selected Assets (STILL)" if assetify_settings.texturebake_mode == 'STILL'
                 else "Bake Selected Assets (ANIM)"
             )
-
-            # Bake button (enabled based on selected items)
             bake_button_col = bake_row.column()
             bake_button_col.enabled = (
                 (assetify_settings.asset_mode == 'ASSET' and any(
