@@ -2,7 +2,7 @@ bl_info = {
     "name": "Assetify",
     "description": "Convert objects and geometry nodes into game-ready assets with baked textures for Unreal Engine.",
     "author": "Nino Defoq",
-    "version": (2, 1, 0),
+    "version": (2, 1, 1),
     "blender": (4, 3, 0),
     "location": "3D View > Tool Shelf > Assetify",
     "warning": "",
@@ -3326,6 +3326,24 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
         default='1024'
     )
     
+    use_device_override: bpy.props.BoolProperty(
+        name="Override Device",
+        description="Enable to override the automatic device selection for rendering",
+        default=False
+    )
+    
+    device_override: bpy.props.EnumProperty(
+        name="Render Device",
+        description="Select the GPU device type to override the auto-detection",
+        items=[
+            ('OPTIX', "OptiX", "Force use of OptiX GPU acceleration"),
+            ('CUDA', "CUDA", "Force use of CUDA GPU acceleration"),
+            ('METAL', "Metal", "Force use of macOS Metal acceleration"),
+            ('OPENCL', "OpenCL", "Force use of OpenCL GPU acceleration")
+        ],
+        default='OPTIX'
+    )
+    
     bake_basecolor: bpy.props.BoolProperty(
         name="Base Color", default=True, description="Bake Base Color map")
     bake_normal: bpy.props.BoolProperty(
@@ -4417,42 +4435,50 @@ def ensure_cycles_render_engine():
         debug_print("Switched render engine to Cycles for baking.")
         
 def ensure_gpu_rendering():
-    """Ensure the GPU is set for rendering if available, including support for macOS Metal."""
     prefs = bpy.context.preferences.addons['cycles'].preferences
+    assetify_settings = bpy.context.scene.assetify_bake_settings
 
     # Refresh device list
     prefs.get_devices()
-    
-    # Get the list of device types
-    device_types = {device.type for device in prefs.devices}
 
-    # Set the compute device type based on available devices
-    if 'OPTIX' in device_types:
-        prefs.compute_device_type = 'OPTIX'
-    elif 'CUDA' in device_types:
-        prefs.compute_device_type = 'CUDA'
-    elif 'METAL' in device_types:  # Add support for macOS Metal
-        prefs.compute_device_type = 'METAL'
-    elif 'OPENCL' in device_types:
-        prefs.compute_device_type = 'OPENCL'
+    # Determine compute device type:
+    if assetify_settings.use_device_override:
+        compute_type = assetify_settings.device_override
     else:
-        prefs.compute_device_type = 'NONE'
+        device_types = {device.type for device in prefs.devices}
+        if 'OPTIX' in device_types:
+            compute_type = 'OPTIX'
+        elif 'CUDA' in device_types:
+            compute_type = 'CUDA'
+        elif 'METAL' in device_types:
+            compute_type = 'METAL'
+        elif 'OPENCL' in device_types:
+            compute_type = 'OPENCL'
+        else:
+            compute_type = 'NONE'
+    
+    prefs.compute_device_type = compute_type
 
-    # Enable GPU devices
+    # Enable GPU devices based on the chosen type
     for device in prefs.devices:
-        device.use = (device.type != 'CPU')
+        if assetify_settings.use_device_override:
+            device.use = (device.type == compute_type)
+        else:
+            device.use = (device.type != 'CPU')
 
-    # Ensure the scene is set to use GPU compute if available
-    if prefs.compute_device_type != 'NONE':
+    # Set the scene to use GPU if a valid compute device is found
+    if compute_type != 'NONE':
         bpy.context.scene.cycles.device = 'GPU'
-        debug_print(f"GPU rendering enabled using {prefs.compute_device_type}.")
+        debug_print(f"GPU rendering enabled using {compute_type}.")
     else:
         bpy.context.scene.cycles.device = 'CPU'
         debug_print("No GPU found, using CPU for baking.")
         
 def ensure_optix_denoiser():
     """Ensure OptiX denoiser is enabled if available, otherwise fallback to OpenImageDenoise or disable if unsupported."""
+    import sys
     scene = bpy.context.scene
+    assetify_settings = scene.assetify_bake_settings
 
     # Ensure the Cycles engine is active
     if scene.render.engine != 'CYCLES':
@@ -4470,7 +4496,7 @@ def ensure_optix_denoiser():
         print("[ERROR] Could not retrieve Cycles preferences, possibly due to a compatibility issue.")
         return
 
-    # Check system type for platform-specific adjustments
+    # Check if the system is macOS (OptiX is not available on macOS)
     is_mac = sys.platform == "darwin"
 
     # Ensure Cycles denoising settings exist
@@ -4478,12 +4504,16 @@ def ensure_optix_denoiser():
         print("[ERROR] Scene does not have denoiser settings. This Blender version might not support denoising.")
         return
 
-    # Check if OptiX is available among devices
-    optix_available = any(device.type == 'OPTIX' and device.use for device in prefs.devices)
+    # Determine if OptiX is available:
+    if assetify_settings.use_device_override:
+        optix_available = (assetify_settings.device_override == 'OPTIX')
+    else:
+        optix_available = any(device.type == 'OPTIX' and device.use for device in prefs.devices)
+
+    # Check if OpenImageDenoise is available
     oidn_available = hasattr(scene.cycles, 'denoiser') and 'OPENIMAGEDENOISE' in scene.cycles.denoiser
 
-    # Apply denoising settings based on availability
-    if optix_available and not is_mac:  # OptiX is not available on macOS
+    if optix_available and not is_mac:
         scene.cycles.use_denoising = True
         scene.cycles.denoiser = 'OPTIX'
         print("[DEBUG] OptiX denoiser enabled.")
@@ -8363,22 +8393,34 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             split.label(text="Skip UV Unwrap")
             split.prop(assetify_settings, "skip_uv_unwrap", text="")
             
-            # Ungroup Nodes with Info
-            row = settings_box.row(align=True)
-            row.operator("assetify.show_ungroup_info", text="", icon='INFO', emboss=False)
-            split = row.split(factor=0.45, align=True)
-            split.label(text="Skip Ungrouping")
-            split.prop(assetify_settings, "ungroup_node_groups", text="")
+#            # Ungroup Nodes with Info
+#            row = settings_box.row(align=True)
+#            row.operator("assetify.show_ungroup_info", text="", icon='INFO', emboss=False)
+#            split = row.split(factor=0.45, align=True)
+#            split.label(text="Skip Ungrouping")
+#            split.prop(assetify_settings, "ungroup_node_groups", text="")
             
             row = settings_box.row(align=True)
             split = row.split(factor=0.5, align=True)
             split.label(text="Target Platform")
             split.prop(assetify_settings, "platform_target", text="")
-            
+
             row = settings_box.row(align=True)
             split = row.split(factor=0.5, align=True)
-            split.label(text="Render Device")
+            split.label(text="Render Mode")
             split.prop(assetify_settings, "render_device", text="")
+            
+            # Checkbox for device override
+            row = settings_box.row(align=True)
+            split = row.split(factor=0.5, align=True)
+            split.label(text="Override Device")
+            split.prop(assetify_settings, "use_device_override", text="")
+            
+            if assetify_settings.use_device_override:
+                row = settings_box.row(align=True)
+                split = row.split(factor=0.5, align=True)
+                split.label(text="Render Device")
+                split.prop(assetify_settings, "device_override", text="")
             
             row = settings_box.row(align=True)
             split = row.split(factor=0.5, align=True)
