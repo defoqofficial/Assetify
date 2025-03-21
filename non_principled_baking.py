@@ -1,4 +1,5 @@
 import bpy
+import mathutils
 from mathutils import Vector
 from bpy.types import NodeSocket
 
@@ -8,6 +9,157 @@ def ensure_vector3(val):
         if len(val) >= 3:
             return (val[0], val[1], val[2])
     return (0, 0, 0)
+
+import bpy
+
+def ungroup_node_preserve_inputs(group_node, node_tree):
+    """
+    Ungroup a single node group, preserving any unlinked input values by
+    creating small stub nodes (Value or RGB) and linking them to the group inputs.
+    This ensures Blender does not reset those defaults to 0 or white upon ungrouping.
+    """
+    # Make sure we have a valid group node and node tree
+    if not group_node or not group_node.node_tree:
+        return
+
+    # Create stubs for each unlinked input to preserve the default_value
+    for i, input_socket in enumerate(group_node.inputs):
+        if input_socket.is_linked:
+            continue  # Already linked externally, so no stub is needed
+        
+        socket_type = input_socket.type  # e.g. 'VALUE', 'RGBA', 'VECTOR', 'SHADER', etc.
+        if socket_type == 'SHADER':
+            print(f"Socket {i}: is a SHADER socket; skipping stub creation.")
+            continue
+
+        # Retrieve the default value
+        default_val = input_socket.default_value
+        socket_type = input_socket.type  # e.g. 'VALUE', 'RGBA', 'VECTOR', etc.
+
+        # Debug print: show default value and its type for each socket
+        print(f"Socket {i} (type {socket_type}) default value: {default_val} (type: {type(default_val)})")
+
+        if socket_type == 'VALUE':
+            # Single float -> ShaderNodeValue
+            val_node = node_tree.nodes.new("ShaderNodeValue")
+            val_node.label = f"GroupValue_{group_node.name}_{i}"
+            try:
+                val_node.outputs[0].default_value = float(default_val)
+            except (TypeError, ValueError):
+                val_node.outputs[0].default_value = 1.0
+            val_node.location.x = group_node.location.x - 200
+            val_node.location.y = group_node.location.y - (i * 40)
+            node_tree.links.new(val_node.outputs[0], input_socket)
+
+        elif socket_type == 'RGBA':
+            # Color input -> ShaderNodeRGB
+            rgb_node = node_tree.nodes.new("ShaderNodeRGB")
+            rgb_node.label = f"GroupColor_{group_node.name}_{i}"
+            rgb_node.location.x = group_node.location.x - 200
+            rgb_node.location.y = group_node.location.y - (i * 40)
+            # Start with a fallback color (white)
+            color_4 = (1.0, 1.0, 1.0, 1.0)
+            
+            # If default_val is a mathutils.Color, convert it to a 4-tuple.
+            if isinstance(default_val, mathutils.Color):
+                color_4 = (default_val.r, default_val.g, default_val.b, 1.0)
+                print(f"Socket {i}: Detected mathutils.Color, converting to {color_4}")
+            # Otherwise, if it's iterable (like a bpy_prop_array), convert it to a tuple.
+            elif hasattr(default_val, '__iter__'):
+                temp = tuple(default_val)
+                if len(temp) == 3:
+                    color_4 = (temp[0], temp[1], temp[2], 1.0)
+                    print(f"Socket {i}: Found iterable of length 3, using {color_4}")
+                elif len(temp) == 4:
+                    color_4 = temp
+                    print(f"Socket {i}: Found iterable of length 4, using {color_4}")
+                else:
+                    print(f"Socket {i}: Iterable length not 3 or 4; using fallback white.")
+            else:
+                print(f"Socket {i}: Default value not iterable; using fallback white.")
+            
+            rgb_node.outputs[0].default_value = color_4
+            node_tree.links.new(rgb_node.outputs[0], input_socket)
+
+        else:
+            # Handle other socket types if needed.
+            print(f"Socket {i}: Unsupported socket type '{socket_type}'—skipping stub creation.")
+            pass
+
+    # Now select only this group node so we can call ungroup
+    for n in node_tree.nodes:
+        n.select = False
+    group_node.select = True
+    node_tree.nodes.active = group_node
+
+    # We must override the context to a Node Editor that is actually editing this node_tree
+    context = bpy.context
+    override = None
+    for area in context.screen.areas:
+        if area.type == 'NODE_EDITOR':
+            for space in area.spaces:
+                if space.type == 'NODE_EDITOR' and space.node_tree == node_tree:
+                    override = {
+                        'window': context.window,
+                        'screen': context.screen,
+                        'area': area,
+                        'region': area.regions[-1],
+                        'space_data': space,
+                        'edit_tree': node_tree,
+                    }
+                    break
+            if override:
+                break
+
+    print("Override:", override)  # Debug print to verify context
+
+    # Perform the ungroup operation in that override context
+    if override:
+        with context.temp_override(**override):
+            bpy.ops.node.group_ungroup()
+    else:
+        bpy.ops.node.group_ungroup('INVOKE_DEFAULT')
+
+
+def ungroup_all_node_groups(node_tree):
+    """
+    Ungroup all GROUP-type nodes in the node_tree, preserving
+    unlinked input values for each group.
+    Repeats until there are no more group nodes (handles nesting).
+    """
+    while True:
+        group_nodes = [n for n in node_tree.nodes if n.type == 'GROUP']
+        if not group_nodes:
+            break
+        for g_node in group_nodes:
+            ungroup_node_preserve_inputs(g_node, node_tree)
+
+def dissolve_node(node, node_tree):
+    """
+    Dissolve a muted mix or add shader node by re-routing its output links.
+    For a Mix or Add Shader node, this bypasses the node by connecting its first shader input (index 1)
+    directly to any sockets linked from the node’s outputs.
+    """
+    if node.type not in ('MIX_SHADER', 'ADD_SHADER'):
+        return
+
+    # Choose the shader input to pass through (index 1, "Shader 1")
+    input_sock = node.inputs[1]
+    if not input_sock.is_linked:
+        return  # Nothing to dissolve if there's no connection
+    source_socket = input_sock.links[0].from_socket
+
+    # Collect all output links from this node so we can rewire them.
+    links_to_rewire = []
+    for out_sock in node.outputs:
+        for link in out_sock.links:
+            links_to_rewire.append(link)
+    # Re-route each link from the muted node to the source socket.
+    for link in links_to_rewire:
+        try:
+            node_tree.links.new(source_socket, link.to_socket)
+        except Exception as e:
+            print(f"Error re-wiring link: {e}")
 
 # Helper: ensure a 4-item tuple for color/float values
 def ensure_color4(val):
@@ -198,19 +350,30 @@ def is_alpha_linked(shader_node):
 def create_mix_chains_and_principled():
     mat = bpy.context.active_object.active_material
     node_tree = mat.node_tree
+    
     nodes = node_tree.nodes
+    
+    ungroup_all_node_groups(node_tree)
+    
+    return
 
     # Deselect all nodes
     for node in nodes:
         node.select = False
 
-    # 1) Gather all Mix Shader nodes and connected shader nodes.
+    # 1) Gather all Mix and Add Shader nodes and their connected shader nodes,
+    #    dissolving any mix/add nodes that are muted so the chain remains intact.
     mix_shader_info = []
     for node in nodes:
-        if node.type == 'MIX_SHADER':
+        if node.type in ('MIX_SHADER', 'ADD_SHADER'):
+            if node.mute:
+                # Dissolve the muted mix or add shader node
+                dissolve_node(node, node_tree)
+                continue
             fac_input = node.inputs[0]
             shader1_input = node.inputs[1]
             shader2_input = node.inputs[2]
+            # Get the connected nodes for top and bottom (no dissolution for these even if muted)
             top_shader = shader1_input.links[0].from_node if shader1_input.is_linked else None
             bot_shader = shader2_input.links[0].from_node if shader2_input.is_linked else None
             info = {
@@ -220,6 +383,11 @@ def create_mix_chains_and_principled():
                 'shader2': bot_shader,
             }
             mix_shader_info.append(info)
+            
+    # If there are no active (non-muted) mix shaders, skip the baking setup.
+    if not mix_shader_info:
+        print("No active Mix Shader nodes found. Skipping non-principled BSDF baking setup.")
+        return
 
     # 2) Build chain mapping (which mix feeds into which).
     chain_map = {}
@@ -849,6 +1017,6 @@ def create_node_group(custom_name="Custom_NodeGroup"):
     print("Exited node group.")
 
 # Run the function to create a node group with a custom name
+
 #create_mix_chains_and_principled()
 #create_node_group("PrincipledBSDF Setup")
-
