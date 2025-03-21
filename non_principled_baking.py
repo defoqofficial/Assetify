@@ -354,8 +354,6 @@ def create_mix_chains_and_principled():
     nodes = node_tree.nodes
     
     ungroup_all_node_groups(node_tree)
-    
-    return
 
     # Deselect all nodes
     for node in nodes:
