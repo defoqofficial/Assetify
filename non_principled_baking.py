@@ -10,37 +10,81 @@ def ensure_vector3(val):
             return (val[0], val[1], val[2])
     return (0, 0, 0)
 
-import bpy
+def get_ungroup_override_context(node_tree):
+    """
+    Search for an existing NODE_EDITOR area displaying the given node_tree.
+    If none is found, temporarily switch an available area (skipping non-usable types)
+    to NODE_EDITOR and set its tree_type and node_tree.
+    Returns an override dictionary or None if no area is found.
+    """
+    context = bpy.context
+    # First, try to find an existing NODE_EDITOR area.
+    for window in context.window_manager.windows:
+        screen = window.screen
+        for area in screen.areas:
+            if area.type == 'NODE_EDITOR':
+                # Set up the override dictionary.
+                override = {
+                    'window': window,
+                    'screen': screen,
+                    'area': area,
+                    'region': next((r for r in area.regions if r.type == 'WINDOW'), None),
+                    'space_data': area.spaces.active,
+                }
+                # Ensure the Node Editor is showing a ShaderNodeTree and the correct node_tree.
+                area.spaces.active.tree_type = 'ShaderNodeTree'
+                area.spaces.active.node_tree = node_tree
+                return override
+
+    # If no NODE_EDITOR area is found, try to temporarily switch an area.
+    for window in context.window_manager.windows:
+        screen = window.screen
+        for area in screen.areas:
+            original_type = area.type
+            # Skip areas that should not be changed.
+            if original_type in {'TOPBAR', 'STATUSBAR'}:
+                continue
+            area.type = 'NODE_EDITOR'
+            area.spaces.active.tree_type = 'ShaderNodeTree'
+            area.spaces.active.node_tree = node_tree
+            override = {
+                'window': window,
+                'screen': screen,
+                'area': area,
+                'region': next((r for r in area.regions if r.type == 'WINDOW'), None),
+                'space_data': area.spaces.active,
+                'original_type': original_type,
+            }
+            return override
+    return None
 
 def ungroup_node_preserve_inputs(group_node, node_tree):
     """
     Ungroup a single node group, preserving any unlinked input values by
-    creating small stub nodes (Value or RGB) and linking them to the group inputs.
+    creating stub nodes (Value or RGB) and linking them to the group inputs.
     This ensures Blender does not reset those defaults to 0 or white upon ungrouping.
     """
-    # Make sure we have a valid group node and node tree
+    # Make sure we have a valid group node and node tree.
     if not group_node or not group_node.node_tree:
         return
 
-    # Create stubs for each unlinked input to preserve the default_value
+    # Create stubs for each unlinked input to preserve the default_value.
     for i, input_socket in enumerate(group_node.inputs):
         if input_socket.is_linked:
-            continue  # Already linked externally, so no stub is needed
-        
-        socket_type = input_socket.type  # e.g. 'VALUE', 'RGBA', 'VECTOR', 'SHADER', etc.
+            continue  # Skip if already linked.
+
+        # Check socket type.
+        socket_type = input_socket.type  # 'VALUE', 'RGBA', 'VECTOR', 'SHADER', etc.
         if socket_type == 'SHADER':
             print(f"Socket {i}: is a SHADER socket; skipping stub creation.")
             continue
 
-        # Retrieve the default value
+        # Retrieve the default value.
         default_val = input_socket.default_value
-        socket_type = input_socket.type  # e.g. 'VALUE', 'RGBA', 'VECTOR', etc.
-
-        # Debug print: show default value and its type for each socket
         print(f"Socket {i} (type {socket_type}) default value: {default_val} (type: {type(default_val)})")
 
         if socket_type == 'VALUE':
-            # Single float -> ShaderNodeValue
+            # Create a Value node for float inputs.
             val_node = node_tree.nodes.new("ShaderNodeValue")
             val_node.label = f"GroupValue_{group_node.name}_{i}"
             try:
@@ -52,19 +96,15 @@ def ungroup_node_preserve_inputs(group_node, node_tree):
             node_tree.links.new(val_node.outputs[0], input_socket)
 
         elif socket_type == 'RGBA':
-            # Color input -> ShaderNodeRGB
+            # Create an RGB node for color inputs.
             rgb_node = node_tree.nodes.new("ShaderNodeRGB")
             rgb_node.label = f"GroupColor_{group_node.name}_{i}"
             rgb_node.location.x = group_node.location.x - 200
             rgb_node.location.y = group_node.location.y - (i * 40)
-            # Start with a fallback color (white)
-            color_4 = (1.0, 1.0, 1.0, 1.0)
-            
-            # If default_val is a mathutils.Color, convert it to a 4-tuple.
+            color_4 = (1.0, 1.0, 1.0, 1.0)  # Fallback white.
             if isinstance(default_val, mathutils.Color):
                 color_4 = (default_val.r, default_val.g, default_val.b, 1.0)
                 print(f"Socket {i}: Detected mathutils.Color, converting to {color_4}")
-            # Otherwise, if it's iterable (like a bpy_prop_array), convert it to a tuple.
             elif hasattr(default_val, '__iter__'):
                 temp = tuple(default_val)
                 if len(temp) == 3:
@@ -77,55 +117,42 @@ def ungroup_node_preserve_inputs(group_node, node_tree):
                     print(f"Socket {i}: Iterable length not 3 or 4; using fallback white.")
             else:
                 print(f"Socket {i}: Default value not iterable; using fallback white.")
-            
             rgb_node.outputs[0].default_value = color_4
             node_tree.links.new(rgb_node.outputs[0], input_socket)
-
         else:
-            # Handle other socket types if needed.
             print(f"Socket {i}: Unsupported socket type '{socket_type}'—skipping stub creation.")
             pass
 
-    # Now select only this group node so we can call ungroup
+    # Select only the group node.
     for n in node_tree.nodes:
         n.select = False
     group_node.select = True
     node_tree.nodes.active = group_node
 
-    # We must override the context to a Node Editor that is actually editing this node_tree
+    # Get an override context using our helper.
     context = bpy.context
-    override = None
-    for area in context.screen.areas:
-        if area.type == 'NODE_EDITOR':
-            for space in area.spaces:
-                if space.type == 'NODE_EDITOR' and space.node_tree == node_tree:
-                    override = {
-                        'window': context.window,
-                        'screen': context.screen,
-                        'area': area,
-                        'region': area.regions[-1],
-                        'space_data': space,
-                        'edit_tree': node_tree,
-                    }
-                    break
-            if override:
-                break
+    override = get_ungroup_override_context(node_tree)
+    print("Override context:", override)
 
-    print("Override:", override)  # Debug print to verify context
-
-    # Perform the ungroup operation in that override context
+    # Perform the ungroup operation using the override.
     if override:
-        with context.temp_override(**override):
-            bpy.ops.node.group_ungroup()
+        try:
+            with context.temp_override(**override):
+                bpy.ops.node.group_ungroup()
+        except RuntimeError as e:
+            print(f"Failed to ungroup node: {e}")
+        finally:
+            # Restore original area type if we changed it.
+            if 'original_type' in override:
+                override['area'].type = override['original_type']
     else:
+        print("No valid NODE_EDITOR context found; cannot ungroup nodes.")
         bpy.ops.node.group_ungroup('INVOKE_DEFAULT')
-
 
 def ungroup_all_node_groups(node_tree):
     """
-    Ungroup all GROUP-type nodes in the node_tree, preserving
-    unlinked input values for each group.
-    Repeats until there are no more group nodes (handles nesting).
+    Ungroup all GROUP-type nodes in the node_tree, preserving unlinked input values for each group.
+    Repeats until no GROUP nodes remain.
     """
     while True:
         group_nodes = [n for n in node_tree.nodes if n.type == 'GROUP']
