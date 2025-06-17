@@ -2,8 +2,8 @@ bl_info = {
     "name": "Assetify",
     "description": "Convert objects and geometry nodes into game-ready assets with baked textures for Unreal Engine.",
     "author": "Nino Defoq",
-    "version": (2, 1, 3),
-    "blender": (4, 3, 0),
+    "version": (2, 1, 4),
+    "blender": (4, 0, 0),
     "location": "3D View > Tool Shelf > Assetify",
     "warning": "",
     "support": "Nino Defoq on socials",
@@ -3315,6 +3315,17 @@ def apply_global_animation_setting(assetify_settings):
             print(f"[DEBUG] Set animation processing for '{asset.name}' to {assetify_settings.process_animations_global}.")        
 
 class AssetifyBakeSettings(bpy.types.PropertyGroup):
+    bake_direct_light: bpy.props.BoolProperty(
+        name="Direct Light",
+        default=False,
+        description="Include direct lighting in the bake"
+    )
+    bake_indirect_light: bpy.props.BoolProperty(
+        name="Indirect Light",
+        default=False,
+        description="Include indirect lighting in the bake"
+    )
+    
     bake_resolution: bpy.props.EnumProperty(
         name="Bake Resolution",
         description="Resolution for the baked textures",
@@ -5310,8 +5321,8 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
                 metallic_input.default_value = 0
 
             bpy.context.scene.cycles.bake_type = 'DIFFUSE'
-            bpy.context.scene.render.bake.use_pass_direct = False
-            bpy.context.scene.render.bake.use_pass_indirect = False
+            bpy.context.scene.render.bake.use_pass_direct = assetify_settings.bake_direct_light
+            bpy.context.scene.render.bake.use_pass_indirect = assetify_settings.bake_indirect_light
             bpy.context.scene.render.bake.use_pass_color = True
             bake_type_used = 'DIFFUSE'
         elif map_type == "Normal":
@@ -8357,6 +8368,16 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             # --- Map Options Box ---
             maps_box = box.box()
             maps_box.label(text="Extra Map Bakes", icon='IMAGE_RGB')
+            
+            # Direct / Indirect Light toggles
+            row = maps_box.row(align=True)
+            split = row.split(factor=0.5, align=True)
+            split.label(text="Bake Direct Light")
+            split.prop(assetify_settings, "bake_direct_light", text="")
+            row = maps_box.row(align=True)
+            split = row.split(factor=0.5, align=True)
+            split.label(text="Bake Indirect Light")
+            split.prop(assetify_settings, "bake_indirect_light", text="")
 
             # ALPHA (label + 2 checkboxes on the same row)
             row = maps_box.row(align=True)
