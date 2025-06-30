@@ -2,7 +2,7 @@ bl_info = {
     "name": "Assetify",
     "description": "Convert objects and geometry nodes into game-ready assets with baked textures for Unreal Engine.",
     "author": "Nino Defoq",
-    "version": (2, 1, 4),
+    "version": (2, 1, 5),
     "blender": (4, 0, 0),
     "location": "3D View > Tool Shelf > Assetify",
     "warning": "",
@@ -5213,7 +5213,7 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
             # Remove previously added texture nodes for this bake
             nodes_to_remove = [
                 node for node in node_tree.nodes
-                if node.type == 'TEX_IMAGE' and node.image and node.image.name.startswith(f"{obj.name}_{map_type}_Frame")
+                if node.type == 'TEX_IMAGE' and node.image and node.image.name.startswith(f"{obj.name}_{map_type}")
             ]
             for node in nodes_to_remove:
                 node_tree.nodes.remove(node)
@@ -5264,9 +5264,10 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
             if mat_slot.material and mat_slot.material.use_nodes:
                 node_tree = mat_slot.material.node_tree
 
-                # Remove texture nodes added for baking
+                # Remove previously added texture nodes for this bake
                 nodes_to_remove = [
-                    node for node in node_tree.nodes if node.type == 'TEX_IMAGE'
+                    node for node in node_tree.nodes
+                    if node.type == 'TEX_IMAGE' and node.image and node.image.name.startswith(f"{obj.name}_{map_type}")
                 ]
                 for node in nodes_to_remove:
                     node_tree.nodes.remove(node)
@@ -5394,9 +5395,10 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
                     if mat_slot.material and mat_slot.material.use_nodes:
                         node_tree = mat_slot.material.node_tree
 
-                        # Remove texture nodes added for baking
+                        # Remove previously added texture nodes for this bake
                         nodes_to_remove = [
-                            node for node in node_tree.nodes if node.type == 'TEX_IMAGE'
+                            node for node in node_tree.nodes
+                            if node.type == 'TEX_IMAGE' and node.image and node.image.name.startswith(f"{obj.name}_{map_type}")
                         ]
                         for node in nodes_to_remove:
                             node_tree.nodes.remove(node)
