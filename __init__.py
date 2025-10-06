@@ -1,12 +1,12 @@
 bl_info = {
     "name": "Assetify",
-    "description": "Convert objects and geometry nodes into game-ready assets with baked textures for Unreal Engine.",
+    "description": "Convert ANYTHING into game-ready assets with baked textures.",
     "author": "Nino Defoq",
-    "version": (2, 1, 5),
+    "version": (2, 1, 6),
     "blender": (4, 0, 0),
     "location": "3D View > Tool Shelf > Assetify",
     "warning": "",
-    "support": "Nino Defoq on socials",
+    "support": "COMMUNITY",
     "category": "Object",
 }
 
@@ -7439,6 +7439,28 @@ class OBJECT_OT_export_collection_as_fbx(bpy.types.Operator):
         context.window_manager.event_timer_remove(self._timer)
         remove_progress_bar(self)
         self.report({'INFO'}, "Export canceled.")
+        
+def bake_particle_caches_for_object(obj, start_frame, end_frame, use_disk=True):
+    # Make object active for operators
+    bpy.ops.object.select_all(action='DESELECT')
+    if obj and obj.name in bpy.context.scene.objects:
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+
+    # Walk modifiers/particle systems and bake their point caches
+    for psys in getattr(obj, "particle_systems", []):
+        pc = psys.point_cache
+        # Configure cache range and disk cache (optional but recommended)
+        pc.frame_start = start_frame
+        pc.frame_end   = end_frame
+        pc.use_disk_cache = use_disk
+
+    # Clear any previous bakes, then bake this object’s caches
+    try:
+        bpy.ops.ptcache.free_bake()                  # free existing bakes on active object
+        bpy.ops.ptcache.bake(bake=True)              # bake caches on active object
+    except Exception as e:
+        print(f"[Assetify] Particle cache bake failed on {obj.name}: {e}")
 
 class OBJECT_OT_export_collection_with_animations(bpy.types.Operator):
     """Export selected assets or collections with animations"""
@@ -7623,12 +7645,26 @@ class OBJECT_OT_export_collection_with_animations(bpy.types.Operator):
                 )
         
         elif animation_export_format == 'ALEMBIC':
-            export_file_path = os.path.join(export_path, f"{sanitized_name}_ALEMBIC_ANIM.abc")
+            start = bpy.context.scene.frame_start
+            end   = bpy.context.scene.frame_end
+
+            # ✅ Bake particle caches first
+            bake_particle_caches_for_object(obj, start, end, use_disk=True)
+
+            export_file_path = os.path.join(
+                export_path, f"{sanitized_name}_ALEMBIC_ANIM.abc"
+            )
             bpy.ops.wm.alembic_export(
                 filepath=export_file_path,
                 selected=True,
-                start=bpy.context.scene.frame_start,
-                end=bpy.context.scene.frame_end
+                visible_objects_only=True,
+                flatten=True,
+                use_instancing=False,
+                export_custom_properties=False,
+                export_hair=True,
+                export_particles=True,
+                start=start,
+                end=end
             )
         elif animation_export_format == 'GLTF':
             if obj.type == 'MESH':
