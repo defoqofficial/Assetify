@@ -2,7 +2,7 @@ bl_info = {
     "name": "Assetify",
     "description": "Convert ANYTHING into game-ready assets with baked textures.",
     "author": "Nino Defoq",
-    "version": (2, 1, 6),
+    "version": (2, 1, 7),
     "blender": (4, 0, 0),
     "location": "3D View > Tool Shelf > Assetify",
     "warning": "",
@@ -653,26 +653,31 @@ def populate_baked_collections_from_scene(assetify_settings):
     """
     print("[DEBUG] Populating baked collections from scene.")
 
-    # Create a mapping of existing collections to preserve their properties
+    # 1. SAFELY CACHE EXISTING DATA AS PURE PYTHON VALUES
+    # We must store the VALUES (bools/strings), not the RNA objects, 
+    # because .clear() will destroy the RNA objects immediately.
     existing_collections = {
         collection.name: {
             'include_in_send': collection.include_in_send,
             'assets_swapped': collection.assets_swapped,
             'is_baked': collection.is_baked,
             'is_fbx_exported': collection.is_fbx_exported,
-            'assets': {asset.name: asset for asset in collection.assets}
+            'assets': {
+                asset.name: {
+                    'include_in_send': asset.include_in_send,
+                    'is_baked': asset.is_baked  # Cache the baked status too
+                } for asset in collection.assets
+            }
         }
         for collection in assetify_settings.baked_collections
     }
 
-    # Clear the current baked collections list
+    # Clear the current baked collections list (Destroys RNA objects)
     assetify_settings.baked_collections.clear()
 
     # Ensure we are dealing only with _GameReady collections
     for collection in bpy.data.collections:
         if collection.name.endswith("_GameReady"):
-            print(f"[DEBUG] Processing game-ready collection: {collection.name}")
-
             # Create a baked collection entry for the _GameReady collection
             baked_collection = assetify_settings.baked_collections.add()
             baked_collection.name = collection.name
@@ -698,52 +703,70 @@ def populate_baked_collections_from_scene(assetify_settings):
 
             # Recursively add assets from the collection and subcollections
             for obj in collect_objects_from_collection(collection):
-                if "_gameasset" in obj.name or obj.name in [asset.name for asset in assetify_settings.baked_assets]:
+                # Safety check: Ensure object is valid before processing
+                if not obj or not obj.name:
+                    continue
+
+                # Check if asset should be included
+                is_known_asset = False
+                if "_gameasset" in obj.name:
+                    is_known_asset = True
+                else:
+                    # Check against baked_assets list safely
+                    for baked_a in assetify_settings.baked_assets:
+                        if baked_a.name == obj.name:
+                            is_known_asset = True
+                            break
+
+                if is_known_asset:
                     collection_asset = baked_collection.assets.add()
                     collection_asset.name = obj.name
                     collection_asset.is_game_asset = "_gameasset" in obj.name
-                    collection_asset.is_baked = check_if_baked(obj) or any(
-                        obj.name == asset.name and asset.is_baked
-                        for col in assetify_settings.baked_collections
-                        for asset in col.assets
-                    )
+                    
+                    # 2. DETERMINING BAKED STATUS SAFELY
+                    # Check file system first
+                    is_baked_fs = check_if_baked(obj)
+                    
+                    # Check cache second (avoiding RNA recursion)
+                    is_baked_cached = False
+                    if existing_props and obj.name in existing_props['assets']:
+                        is_baked_cached = existing_props['assets'][obj.name].get('is_baked', False)
+                    
+                    # Also check global baked assets list safely
+                    is_baked_global = False
+                    for ba in assetify_settings.baked_assets:
+                        if ba.name == obj.name and ba.is_baked:
+                            is_baked_global = True
+                            break
+
+                    collection_asset.is_baked = is_baked_fs or is_baked_cached or is_baked_global
                     collection_asset.is_fbx_exported = check_if_exported(obj)
 
                     # Try to restore asset's include_in_send from existing properties
                     if existing_props and obj.name in existing_props['assets']:
-                        existing_asset = existing_props['assets'][obj.name]
-                        collection_asset.include_in_send = existing_asset.include_in_send
+                        collection_asset.include_in_send = existing_props['assets'][obj.name].get('include_in_send', False)
                     else:
                         collection_asset.include_in_send = False  # Default value
 
                     asset_count += 1
 
-                    # Update baked/exported status
+                    # Update baked/exported status for the parent collection
                     if not collection_asset.is_baked:
                         all_assets_baked = False
                     if not collection_asset.is_fbx_exported:
                         all_assets_exported = False
 
-                    print(f"[DEBUG] Added '{obj.name}' to baked collection '{baked_collection.name}' with baked status '{collection_asset.is_baked}'.")
-
             # Update the baked collection's overall status based on assets
             baked_collection.is_baked = all_assets_baked if asset_count > 0 else False
             baked_collection.is_fbx_exported = all_assets_exported if asset_count > 0 else False
 
-            print(f"[DEBUG] Baked collection '{baked_collection.name}' populated with {asset_count} assets. Export status: {baked_collection.is_fbx_exported}")
-        else:
-            print(f"[DEBUG] Skipping original collection: {collection.name}")
-
     update_collection_statuses(assetify_settings)
-
-    # Debug output: list the baked collections
-    print(f"[DEBUG] Baked collections populated. Current collections: {[col.name for col in assetify_settings.baked_collections]}")
 
     # Redraw the UI to reflect the changes in the UI panel
     for area in bpy.context.screen.areas:
         if area.type == 'VIEW_3D':
             area.tag_redraw()
-
+            
 def collect_objects_from_collection(collection):
     """
     Recursively collect all mesh objects from the specified collection and its subcollections.
@@ -5135,14 +5158,13 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
         # Ensure resolution is an integer
     resolution = int(resolution)
 
-    # Set tile size for Cycles
+    # Set tile size for Cycles (Blender 3.0+)
     if assetify_settings.use_tiling:
-        bpy.context.scene.cycles.tile_x = assetify_settings.tile_size
-        bpy.context.scene.cycles.tile_y = assetify_settings.tile_size
-        print(f"[DEBUG] Using tiling with size {assetify_settings.tile_size}x{assetify_settings.tile_size}")
+        bpy.context.scene.cycles.tile_size = assetify_settings.tile_size
+        print(f"[DEBUG] Using tiling with size {assetify_settings.tile_size}")
     else:
-        bpy.context.scene.cycles.tile_x = int(resolution)
-        bpy.context.scene.cycles.tile_y = int(resolution)
+        # To bake in one pass, set the tile size to the full resolution
+        bpy.context.scene.cycles.tile_size = int(resolution)
         print("[DEBUG] Tiling disabled. Baking in one pass.")
 
     print(f"[DEBUG] Using {assetify_settings.render_device} with tile size {assetify_settings.tile_size}")
@@ -6907,69 +6929,111 @@ class ASSETIFY_OT_separate_by_material(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
-        if event.type == 'TIMER':
-            if self._separation_index < len(self._objects_to_separate):
-                obj = self._objects_to_separate[self._separation_index]
+            if event.type == 'TIMER':
+                if self._separation_index < len(self._objects_to_separate):
+                    obj = self._objects_to_separate[self._separation_index]
 
-                # Separate object by each material
-                if self._current_material_index < len(obj.material_slots):
-                    self.separate_material_step(obj)
-                    self._current_material_index += 1
-                    self.progress_value = (self._separation_index + self._current_material_index / len(obj.material_slots)) / self.total_separation_steps
+                    # --- NEW CODE START ---
+                    # Clean up unused slots ONCE before iterating through this object.
+                    # This prevents the 'Nothing selected' error and skips empty slots entirely.
+                    if self._current_material_index == 0:
+                        bpy.context.view_layer.objects.active = obj
+                        # Only run this if the object is valid and in Object mode
+                        if obj.mode != 'OBJECT':
+                            bpy.ops.object.mode_set(mode='OBJECT')
+                        bpy.ops.object.material_slot_remove_unused()
+                    # --- NEW CODE END ---
+
+                    # Separate object by each material
+                    if self._current_material_index < len(obj.material_slots):
+                        self.separate_material_step(obj)
+                        self._current_material_index += 1
+                        
+                        # Update progress bar
+                        current_progress = (self._separation_index + self._current_material_index / max(len(obj.material_slots), 1))
+                        self.progress_value = current_progress / self.total_separation_steps
+                    else:
+                        # Move to next object after finishing all materials
+                        self._separation_index += 1
+                        self._current_material_index = 0
                 else:
-                    # Move to next object after finishing all materials
-                    self._separation_index += 1
-                    self._current_material_index = 0
-            else:
-                # Clean up: Delete original objects after separation is complete
-                for original_obj in self._objects_to_separate:
-                    if original_obj and original_obj.name in bpy.data.objects:
-                        bpy.data.objects.remove(original_obj, do_unlink=True)
+                    # Clean up: Delete original objects after separation is complete
+                    for original_obj in self._objects_to_separate:
+                        if original_obj and original_obj.name in bpy.data.objects:
+                            bpy.data.objects.remove(original_obj, do_unlink=True)
 
-                # Refresh baked assets list after separation
-                populate_baked_assets_from_scene(context.scene.assetify_bake_settings)
+                    # Refresh baked assets list after separation
+                    populate_baked_assets_from_scene(context.scene.assetify_bake_settings)
 
-                # Separation complete
-                self.end_progress_bar()
-                context.window_manager.event_timer_remove(self._timer)
-                self.report({'INFO'}, "Separation by material complete.")
-                return {'FINISHED'}
+                    # Separation complete
+                    self.end_progress_bar()
+                    context.window_manager.event_timer_remove(self._timer)
+                    self.report({'INFO'}, "Separation by material complete.")
+                    return {'FINISHED'}
 
-            # Update UI
-            bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+                # Update UI
+                bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
 
-        return {'PASS_THROUGH'}
+            return {'PASS_THROUGH'}
 
     def separate_material_step(self, obj):
-        """Separates the object by the current material index, renames, and assigns only relevant material."""
-        material_slot = obj.material_slots[self._current_material_index]
-        material = material_slot.material
-        self.current_material = material.name  # Update the material name
+            """Separates the object by the current material index, renames, and assigns only relevant material."""
+            # Ensure the object is the active one contextually
+            bpy.context.view_layer.objects.active = obj
+            
+            material_slot = obj.material_slots[self._current_material_index]
+            material = material_slot.material
+            
+            if material:
+                self.current_material = material.name  # Update the material name
+            else:
+                return  # Skip empty material slots
+
+            # Set the active material index
+            obj.active_material_index = self._current_material_index
+
+            # Enter edit mode to separate based on material
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='DESELECT')
+            bpy.ops.object.material_slot_select()
+            
+            # ATTEMPT SEPARATION SAFELY
+            separated = False
+            try:
+                # This will raise RuntimeError if the material slot is not assigned to any faces
+                bpy.ops.mesh.separate(type='SELECTED')
+                separated = True
+            except RuntimeError:
+                print(f"[Assetify] Material '{material.name}' is not assigned to any faces on '{obj.name}'. Skipping.")
+                separated = False
+                
+            bpy.ops.object.mode_set(mode='OBJECT')
+            
+            # If no separation occurred, exit here
+            if not separated:
+                return
+            
+            # Get the new object and set its name and material
+            # We filter selected objects to find the one that isn't the original 'obj'
+            new_candidates = [o for o in bpy.context.selected_objects if o != obj]
+            
+            if not new_candidates:
+                return # Safety check
+                
+            new_obj = new_candidates[0]
+            new_obj.name = f"{obj.name}_{material.name}".replace(f"{obj.name}_", "", 1)
+
+            # Clear and reassign materials on the NEW object
+            new_obj.data.materials.clear()
+            new_obj.data.materials.append(material)
+
+            # Deselect new object to prepare for next separation
+            new_obj.select_set(False)
+            
+            # Ensure the original object remains active for the next loop iteration
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
         
-        if not material:
-            return  # Skip empty material slots
-
-        # Set the active material index
-        obj.active_material_index = self._current_material_index
-
-        # Enter edit mode to separate based on material
-        bpy.ops.object.mode_set(mode='EDIT')
-        bpy.ops.mesh.select_all(action='DESELECT')
-        bpy.ops.object.material_slot_select()
-        bpy.ops.mesh.separate(type='SELECTED')
-        bpy.ops.object.mode_set(mode='OBJECT')
-        
-        # Get the new object and set its name and material
-        new_obj = [o for o in bpy.context.selected_objects if o != obj][0]
-        new_obj.name = f"{obj.name}_{material.name}".replace(f"{obj.name}_", "", 1)
-
-        # Clear and reassign materials
-        new_obj.data.materials.clear()
-        new_obj.data.materials.append(material)
-
-        # Deselect new object to prepare for next separation
-        new_obj.select_set(False)
-
     def start_progress_bar(self, context):
         """Initialize progress bar."""
         override = self.set_active_3d_view()
