@@ -11,19 +11,11 @@ def ensure_vector3(val):
     return (0, 0, 0)
 
 def get_ungroup_override_context(node_tree):
-    """
-    Search for an existing NODE_EDITOR area displaying the given node_tree.
-    If none is found, temporarily switch an available area (skipping non-usable types)
-    to NODE_EDITOR and set its tree_type and node_tree.
-    Returns an override dictionary or None if no area is found.
-    """
     context = bpy.context
-    # First, try to find an existing NODE_EDITOR area.
     for window in context.window_manager.windows:
         screen = window.screen
         for area in screen.areas:
             if area.type == 'NODE_EDITOR':
-                # Set up the override dictionary.
                 override = {
                     'window': window,
                     'screen': screen,
@@ -31,17 +23,14 @@ def get_ungroup_override_context(node_tree):
                     'region': next((r for r in area.regions if r.type == 'WINDOW'), None),
                     'space_data': area.spaces.active,
                 }
-                # Ensure the Node Editor is showing a ShaderNodeTree and the correct node_tree.
                 area.spaces.active.tree_type = 'ShaderNodeTree'
                 area.spaces.active.node_tree = node_tree
                 return override
 
-    # If no NODE_EDITOR area is found, try to temporarily switch an area.
     for window in context.window_manager.windows:
         screen = window.screen
         for area in screen.areas:
             original_type = area.type
-            # Skip areas that should not be changed.
             if original_type in {'TOPBAR', 'STATUSBAR'}:
                 continue
             area.type = 'NODE_EDITOR'
@@ -59,32 +48,20 @@ def get_ungroup_override_context(node_tree):
     return None
 
 def ungroup_node_preserve_inputs(group_node, node_tree):
-    """
-    Ungroup a single node group, preserving any unlinked input values by
-    creating stub nodes (Value or RGB) and linking them to the group inputs.
-    This ensures Blender does not reset those defaults to 0 or white upon ungrouping.
-    """
-    # Make sure we have a valid group node and node tree.
     if not group_node or not group_node.node_tree:
         return
 
-    # Create stubs for each unlinked input to preserve the default_value.
     for i, input_socket in enumerate(group_node.inputs):
         if input_socket.is_linked:
-            continue  # Skip if already linked.
+            continue 
 
-        # Check socket type.
-        socket_type = input_socket.type  # 'VALUE', 'RGBA', 'VECTOR', 'SHADER', etc.
+        socket_type = input_socket.type
         if socket_type == 'SHADER':
-            print(f"Socket {i}: is a SHADER socket; skipping stub creation.")
             continue
 
-        # Retrieve the default value.
         default_val = input_socket.default_value
-        print(f"Socket {i} (type {socket_type}) default value: {default_val} (type: {type(default_val)})")
 
         if socket_type == 'VALUE':
-            # Create a Value node for float inputs.
             val_node = node_tree.nodes.new("ShaderNodeValue")
             val_node.label = f"GroupValue_{group_node.name}_{i}"
             try:
@@ -96,45 +73,30 @@ def ungroup_node_preserve_inputs(group_node, node_tree):
             node_tree.links.new(val_node.outputs[0], input_socket)
 
         elif socket_type == 'RGBA':
-            # Create an RGB node for color inputs.
             rgb_node = node_tree.nodes.new("ShaderNodeRGB")
             rgb_node.label = f"GroupColor_{group_node.name}_{i}"
             rgb_node.location.x = group_node.location.x - 200
             rgb_node.location.y = group_node.location.y - (i * 40)
-            color_4 = (1.0, 1.0, 1.0, 1.0)  # Fallback white.
+            color_4 = (1.0, 1.0, 1.0, 1.0)
             if isinstance(default_val, mathutils.Color):
                 color_4 = (default_val.r, default_val.g, default_val.b, 1.0)
-                print(f"Socket {i}: Detected mathutils.Color, converting to {color_4}")
             elif hasattr(default_val, '__iter__'):
                 temp = tuple(default_val)
                 if len(temp) == 3:
                     color_4 = (temp[0], temp[1], temp[2], 1.0)
-                    print(f"Socket {i}: Found iterable of length 3, using {color_4}")
                 elif len(temp) == 4:
                     color_4 = temp
-                    print(f"Socket {i}: Found iterable of length 4, using {color_4}")
-                else:
-                    print(f"Socket {i}: Iterable length not 3 or 4; using fallback white.")
-            else:
-                print(f"Socket {i}: Default value not iterable; using fallback white.")
             rgb_node.outputs[0].default_value = color_4
             node_tree.links.new(rgb_node.outputs[0], input_socket)
-        else:
-            print(f"Socket {i}: Unsupported socket type '{socket_type}'—skipping stub creation.")
-            pass
 
-    # Select only the group node.
     for n in node_tree.nodes:
         n.select = False
     group_node.select = True
     node_tree.nodes.active = group_node
 
-    # Get an override context using our helper.
     context = bpy.context
     override = get_ungroup_override_context(node_tree)
-    print("Override context:", override)
 
-    # Perform the ungroup operation using the override.
     if override:
         try:
             with context.temp_override(**override):
@@ -142,18 +104,12 @@ def ungroup_node_preserve_inputs(group_node, node_tree):
         except RuntimeError as e:
             print(f"Failed to ungroup node: {e}")
         finally:
-            # Restore original area type if we changed it.
             if 'original_type' in override:
                 override['area'].type = override['original_type']
     else:
-        print("No valid NODE_EDITOR context found; cannot ungroup nodes.")
         bpy.ops.node.group_ungroup('INVOKE_DEFAULT')
 
 def ungroup_all_node_groups(node_tree):
-    """
-    Ungroup all GROUP-type nodes in the node_tree, preserving unlinked input values for each group.
-    Repeats until no GROUP nodes remain.
-    """
     while True:
         group_nodes = [n for n in node_tree.nodes if n.type == 'GROUP']
         if not group_nodes:
@@ -162,33 +118,28 @@ def ungroup_all_node_groups(node_tree):
             ungroup_node_preserve_inputs(g_node, node_tree)
 
 def dissolve_node(node, node_tree):
-    """
-    Dissolve a muted mix or add shader node by re-routing its output links.
-    For a Mix or Add Shader node, this bypasses the node by connecting its first shader input (index 1)
-    directly to any sockets linked from the node’s outputs.
-    """
     if node.type not in ('MIX_SHADER', 'ADD_SHADER'):
         return
+    
+    if node.type == 'ADD_SHADER':
+        input_sock = node.inputs[0]
+    else:
+        input_sock = node.inputs[1]
 
-    # Choose the shader input to pass through (index 1, "Shader 1")
-    input_sock = node.inputs[1]
     if not input_sock.is_linked:
-        return  # Nothing to dissolve if there's no connection
+        return 
     source_socket = input_sock.links[0].from_socket
 
-    # Collect all output links from this node so we can rewire them.
     links_to_rewire = []
     for out_sock in node.outputs:
         for link in out_sock.links:
             links_to_rewire.append(link)
-    # Re-route each link from the muted node to the source socket.
     for link in links_to_rewire:
         try:
             node_tree.links.new(source_socket, link.to_socket)
         except Exception as e:
             print(f"Error re-wiring link: {e}")
 
-# Helper: ensure a 4-item tuple for color/float values
 def ensure_color4(val):
     if isinstance(val, (int, float)):
         return (val, val, val, 1.0)
@@ -199,7 +150,6 @@ def ensure_color4(val):
             return (val[0], val[1], val[2], 1.0)
     return (0.0, 0.0, 0.0, 1.0)
 
-# Helper: get a socket output by name (explicit loop)
 def get_output_socket(node, socket_name="Color"):
     if node is None:
         return None
@@ -224,7 +174,6 @@ def get_node_input_by_name(shader_node, input_name):
                 return inp
     return None
 
-# Emission Helpers
 def has_emission(shader_node):
     if shader_node:
         if shader_node.bl_idname == "ShaderNodeEmission":
@@ -265,7 +214,6 @@ def get_emission_strength_default(shader_node):
                 return sock.links[0].from_socket if sock.is_linked else sock.default_value
     return 0.0
 
-# Normal Helper
 def get_normal_value(shader_node):
     if shader_node:
         sock = shader_node.inputs.get("Normal")
@@ -273,7 +221,6 @@ def get_normal_value(shader_node):
             return sock.links[0].from_socket if sock.is_linked else ensure_vector3(sock.default_value)
     return (0, 0, 0)
 
-# Color Helpers
 def get_color_input_socket(shader_node):
     if not shader_node:
         return None
@@ -306,13 +253,11 @@ def get_color_link(shader_node):
 def is_color_linked(shader_node):
     return (get_color_link(shader_node) is not None)
 
-# Roughness Helper
 def get_roughness(shader_node):
     if shader_node and "Roughness" in shader_node.inputs:
         return shader_node.inputs["Roughness"].default_value
     return 1.0
 
-# Metallic Helpers
 def get_metallic_input_socket(shader_node):
     if not shader_node:
         return None
@@ -346,7 +291,6 @@ def get_metallic_link(shader_node):
 def is_metallic_linked(shader_node):
     return (get_metallic_link(shader_node) is not None)
 
-# Alpha Helpers (for Principled)
 def get_alpha_input_socket(shader_node):
     if shader_node and shader_node.bl_idname == 'ShaderNodeBsdfPrincipled':
         return shader_node.inputs.get("Alpha")
@@ -386,44 +330,64 @@ def create_mix_chains_and_principled():
     for node in nodes:
         node.select = False
 
-    # 1) Gather all Mix and Add Shader nodes and their connected shader nodes,
-    #    dissolving any mix/add nodes that are muted so the chain remains intact.
+    # 1) Gather all Mix and Add Shader nodes
     mix_shader_info = []
     for node in nodes:
         if node.type in ('MIX_SHADER', 'ADD_SHADER'):
             if node.mute:
-                # Dissolve the muted mix or add shader node
                 dissolve_node(node, node_tree)
                 continue
-            fac_input = node.inputs[0]
-            shader1_input = node.inputs[1]
-            shader2_input = node.inputs[2]
-            # Get the connected nodes for top and bottom (no dissolution for these even if muted)
+            
+            if node.type == 'ADD_SHADER':
+                if len(node.inputs) < 2: continue
+                fac_default = 0.0
+                fac_linked = False
+                shader1_input = node.inputs[0]
+                shader2_input = node.inputs[1]
+            else: 
+                if len(node.inputs) < 3: continue
+                fac_input = node.inputs[0]
+                fac_default = fac_input.default_value
+                fac_linked = fac_input.is_linked
+                shader1_input = node.inputs[1]
+                shader2_input = node.inputs[2]
+
             top_shader = shader1_input.links[0].from_node if shader1_input.is_linked else None
             bot_shader = shader2_input.links[0].from_node if shader2_input.is_linked else None
+            
             info = {
                 'node': node,
-                'factor': fac_input.default_value if not fac_input.is_linked else None,
+                'factor': fac_default if not fac_linked else None, 
                 'shader1': top_shader,
                 'shader2': bot_shader,
             }
             mix_shader_info.append(info)
             
-    # If there are no active (non-muted) mix shaders, skip the baking setup.
     if not mix_shader_info:
         print("No active Mix Shader nodes found. Skipping non-principled BSDF baking setup.")
         return
 
-    # 2) Build chain mapping (which mix feeds into which).
+    # 2) Build chain mapping
     chain_map = {}
     for info in mix_shader_info:
         current_node = info['node']
-        for link in current_node.outputs[0].links:
-            if link.to_node.type == 'MIX_SHADER' and link.to_socket == link.to_node.inputs[1]:
-                chain_map[current_node] = link.to_node
-                break
+        out_links = current_node.outputs[0].links
+        
+        for link in out_links:
+            if link.to_node.type in ('MIX_SHADER', 'ADD_SHADER'):
+                target_node = link.to_node
+                is_input_slot = False
+                if target_node.type == 'MIX_SHADER':
+                    if link.to_socket == target_node.inputs[1] or link.to_socket == target_node.inputs[2]:
+                        is_input_slot = True
+                elif target_node.type == 'ADD_SHADER':
+                    if link.to_socket == target_node.inputs[0] or link.to_socket == target_node.inputs[1]:
+                        is_input_slot = True     
+                if is_input_slot:
+                    chain_map[current_node] = target_node
+                    break
 
-    # 3) Find starting node (one that is not an input to another mix).
+    # 3) Find starting node
     starting_node = None
     for info in mix_shader_info:
         if info['node'] not in chain_map.values():
@@ -455,22 +419,23 @@ def create_mix_chains_and_principled():
     start_x = -1000
     x_spacing = 300
 
-    # Track previous mix nodes.
-    prev_color_mix = None
-    prev_roughness_mix = None
-    prev_transmission_mix = None
-    prev_alpha_mix = None
-    prev_metallic_mix = None
-    prev_normal_mix = None
-    prev_emission_color_mix = None
-    prev_emission_strength_mix = None
+    # Dictionaries to track the created mix nodes for each shader node
+    # Key: shader_node (Mix/Add), Value: generated_color_mix_node
+    mix_node_lookup_color = {}
+    mix_node_lookup_roughness = {}
+    mix_node_lookup_transmission = {}
+    mix_node_lookup_alpha = {}
+    mix_node_lookup_metallic = {}
+    mix_node_lookup_normal = {}
+    mix_node_lookup_emission_col = {}
+    mix_node_lookup_emission_str = {}
+    
     max_emission_strength = 0.0
 
     # 5) Loop over each Mix Shader in the chain.
     for idx, mix_node in enumerate(chain_order):
-        # If the mix node's first output is not connected, skip it.
         if len(mix_node.outputs[0].links) == 0:
-            continue
+            pass # We process it anyway, but normally it should be linked
 
         info = info_dict[mix_node]
         top_shader = info['shader1']
@@ -484,62 +449,100 @@ def create_mix_chains_and_principled():
         color_mix.blend_type = 'MIX'
         color_mix.location = (col_x, row_y['color'])
 
-        # Set the mix factor from the mix shader node.
-        if mix_node.inputs[0].is_linked:
+        # --- Set Factor ---
+        if mix_node.type == 'ADD_SHADER':
+            color_mix.blend_type = 'MIX'
+            color_mix.inputs["Fac"].default_value = 0.0 
+        elif mix_node.inputs[0].is_linked:
             fac_src = mix_node.inputs[0].links[0].from_socket
             node_tree.links.new(fac_src, color_mix.inputs["Fac"])
         else:
             color_mix.inputs["Fac"].default_value = mix_node.inputs[0].default_value
 
-        if prev_color_mix:
-            node_tree.links.new(get_output_socket(prev_color_mix, "Color"), color_mix.inputs["Color1"])
+        # --- Detect Transparent BSDFs ---
+        top_is_transparent = top_shader and top_shader.bl_idname == 'ShaderNodeBsdfTransparent'
+        bot_is_transparent = bot_shader and bot_shader.bl_idname == 'ShaderNodeBsdfTransparent'
+
+        print(f"[DEBUG] Mix Node: {mix_node.name} | Top Trans: {top_is_transparent} | Bot Trans: {bot_is_transparent}")
+
+        # --- Standard Assignment using Lookup Table ---
+        # Input 1 (Top)
+        if top_shader in mix_node_lookup_color:
+            # If top is a previously processed Mix Node
+            node_tree.links.new(get_output_socket(mix_node_lookup_color[top_shader], "Color"), color_mix.inputs["Color1"])
         else:
+            # If top is a standard shader node
             if top_shader and is_color_linked(top_shader):
                 node_tree.links.new(get_color_link(top_shader), color_mix.inputs["Color1"])
             else:
                 color_mix.inputs["Color1"].default_value = get_color_default(top_shader)
 
-        # Set Color2 from the bottom shader.
-        if bot_shader and is_color_linked(bot_shader):
-            node_tree.links.new(get_color_link(bot_shader), color_mix.inputs["Color2"])
+        # Input 2 (Bottom)
+        if bot_shader in mix_node_lookup_color:
+            # If bottom is a previously processed Mix Node
+            node_tree.links.new(get_output_socket(mix_node_lookup_color[bot_shader], "Color"), color_mix.inputs["Color2"])
         else:
-            color_mix.inputs["Color2"].default_value = get_color_default(bot_shader)
-            
-        force_transparent_black = bpy.context.scene.assetify_bake_settings.force_transparent_black
+            # If bottom is a standard shader node
+            if bot_shader and is_color_linked(bot_shader):
+                node_tree.links.new(get_color_link(bot_shader), color_mix.inputs["Color2"])
+            else:
+                color_mix.inputs["Color2"].default_value = get_color_default(bot_shader)
 
-        # If the force checkbox is enabled, force any Transparent BSDF color to black.
+        # --- Transparency Override Logic (The Fix) ---
+        # If TOP is transparent, make Color1 match Color2
+        if top_is_transparent:
+            print(f"[DEBUG] >> Overriding TOP input with BOTTOM source for {mix_node.name}")
+            if color_mix.inputs["Color2"].is_linked:
+                source_link = color_mix.inputs["Color2"].links[0]
+                node_tree.links.new(source_link.from_socket, color_mix.inputs["Color1"])
+                print(f"[DEBUG]    Linked TOP to {source_link.from_socket.node.name}")
+            else:
+                color_mix.inputs["Color1"].default_value = color_mix.inputs["Color2"].default_value
+                print(f"[DEBUG]    Copied value: {color_mix.inputs['Color2'].default_value}")
+
+        # If BOTTOM is transparent, make Color2 match Color1
+        if bot_is_transparent:
+            print(f"[DEBUG] >> Overriding BOTTOM input with TOP source for {mix_node.name}")
+            if color_mix.inputs["Color1"].is_linked:
+                source_link = color_mix.inputs["Color1"].links[0]
+                node_tree.links.new(source_link.from_socket, color_mix.inputs["Color2"])
+                print(f"[DEBUG]    Linked BOTTOM to {source_link.from_socket.node.name}")
+            else:
+                color_mix.inputs["Color2"].default_value = color_mix.inputs["Color1"].default_value
+                print(f"[DEBUG]    Copied value: {color_mix.inputs['Color1'].default_value}")
+                
+        # --- Force Black (Optional User Override) ---
+        force_transparent_black = bpy.context.scene.assetify_bake_settings.force_transparent_black
         if force_transparent_black:
-            # If the top shader is Transparent, force its color to black.
-            if top_shader and top_shader.bl_idname == 'ShaderNodeBsdfTransparent':
-                while color_mix.inputs["Color1"].links:
-                    node_tree.links.remove(color_mix.inputs["Color1"].links[0])
+            if top_is_transparent:
+                if color_mix.inputs["Color1"].links: node_tree.links.remove(color_mix.inputs["Color1"].links[0])
                 color_mix.inputs["Color1"].default_value = (0.0, 0.0, 0.0, 1.0)
-            # If the bottom shader is Transparent, force its color to black.
-            if bot_shader and bot_shader.bl_idname == 'ShaderNodeBsdfTransparent':
-                while color_mix.inputs["Color2"].links:
-                    node_tree.links.remove(color_mix.inputs["Color2"].links[0])
+            if bot_is_transparent:
+                if color_mix.inputs["Color2"].links: node_tree.links.remove(color_mix.inputs["Color2"].links[0])
                 color_mix.inputs["Color2"].default_value = (0.0, 0.0, 0.0, 1.0)
 
-        prev_color_mix = color_mix
+        mix_node_lookup_color[mix_node] = color_mix
 
         # -----------------------------------------------------
-        # ROUGHNESS Mix with Diffuse override
+        # ROUGHNESS Mix 
         roughness_mix = nodes.new(type='ShaderNodeMixRGB')
         roughness_mix.label = f"RoughnessMix_for_{mix_node.name}"
         roughness_mix.blend_type = 'MIX'
         roughness_mix.location = (col_x, row_y['roughness'])
 
-        if mix_node.inputs[0].is_linked:
+        if mix_node.type == 'ADD_SHADER':
+            roughness_mix.inputs["Fac"].default_value = 0.0
+        elif mix_node.inputs[0].is_linked:
             fac_src = mix_node.inputs[0].links[0].from_socket
             node_tree.links.new(fac_src, roughness_mix.inputs["Fac"])
         else:
             roughness_mix.inputs["Fac"].default_value = mix_node.inputs[0].default_value
 
-        if prev_roughness_mix:
-            node_tree.links.new(get_output_socket(prev_roughness_mix, "Color"), roughness_mix.inputs["Color1"])
+        # Top Input
+        if top_shader in mix_node_lookup_roughness:
+            node_tree.links.new(get_output_socket(mix_node_lookup_roughness[top_shader], "Color"), roughness_mix.inputs["Color1"])
         else:
             if top_shader:
-                # If the top shader is Diffuse, force roughness to 1.
                 if top_shader.bl_idname == 'ShaderNodeBsdfDiffuse':
                     roughness_mix.inputs["Color1"].default_value = (1.0, 1.0, 1.0, 1)
                 elif "Roughness" in top_shader.inputs and top_shader.inputs["Roughness"].is_linked:
@@ -550,117 +553,139 @@ def create_mix_chains_and_principled():
             else:
                 roughness_mix.inputs["Color1"].default_value = (1.0, 1.0, 1.0, 1)
 
-        if bot_shader and "Roughness" in bot_shader.inputs and bot_shader.inputs["Roughness"].is_linked:
-            node_tree.links.new(bot_shader.inputs["Roughness"].links[0].from_socket, roughness_mix.inputs["Color2"])
+        # Bot Input
+        if bot_shader in mix_node_lookup_roughness:
+            node_tree.links.new(get_output_socket(mix_node_lookup_roughness[bot_shader], "Color"), roughness_mix.inputs["Color2"])
         else:
-            # If bot shader is Diffuse, force roughness to 1.
-            if bot_shader and bot_shader.bl_idname == 'ShaderNodeBsdfDiffuse':
-                roughness_mix.inputs["Color2"].default_value = (1.0, 1.0, 1.0, 1)
+            if bot_shader and "Roughness" in bot_shader.inputs and bot_shader.inputs["Roughness"].is_linked:
+                node_tree.links.new(bot_shader.inputs["Roughness"].links[0].from_socket, roughness_mix.inputs["Color2"])
             else:
-                bot_rough = get_roughness(bot_shader)
-                roughness_mix.inputs["Color2"].default_value = (bot_rough, bot_rough, bot_rough, 1)
+                if bot_shader and bot_shader.bl_idname == 'ShaderNodeBsdfDiffuse':
+                    roughness_mix.inputs["Color2"].default_value = (1.0, 1.0, 1.0, 1)
+                else:
+                    bot_rough = get_roughness(bot_shader)
+                    roughness_mix.inputs["Color2"].default_value = (bot_rough, bot_rough, bot_rough, 1)
 
-        prev_roughness_mix = roughness_mix
+        mix_node_lookup_roughness[mix_node] = roughness_mix
 
         # -----------------------------------------------------
-        # TRANSMISSION Mix (optional)
+        # TRANSMISSION Mix
         top_has_trans = top_shader and ((top_shader.bl_idname == 'ShaderNodeBsdfGlass') or
-                                         (top_shader.bl_idname == 'ShaderNodeBsdfPrincipled' and has_node_input(top_shader, "Transmission Weight")))
+                                        (top_shader.bl_idname == 'ShaderNodeBsdfPrincipled' and has_node_input(top_shader, "Transmission Weight")))
         bot_has_trans = bot_shader and ((bot_shader.bl_idname == 'ShaderNodeBsdfGlass') or
-                                         (bot_shader.bl_idname == 'ShaderNodeBsdfPrincipled' and has_node_input(bot_shader, "Transmission Weight")))
-        if top_has_trans or bot_has_trans:
+                                        (bot_shader.bl_idname == 'ShaderNodeBsdfPrincipled' and has_node_input(bot_shader, "Transmission Weight")))
+        
+        # Check if previous mixes exist (even if current shader nodes don't have trans, previous mix might)
+        top_is_mix = top_shader in mix_node_lookup_transmission
+        bot_is_mix = bot_shader in mix_node_lookup_transmission
+
+        if top_has_trans or bot_has_trans or top_is_mix or bot_is_mix:
             transmission_mix = nodes.new(type='ShaderNodeMixRGB')
             transmission_mix.label = f"TransmissionMix_for_{mix_node.name}"
             transmission_mix.blend_type = 'MIX'
             transmission_mix.location = (col_x, row_y['transmission'])
 
-            if mix_node.inputs[0].is_linked:
+            if mix_node.type == 'ADD_SHADER':
+                transmission_mix.inputs["Fac"].default_value = 0.0
+            elif mix_node.inputs[0].is_linked:
                 fac_src = mix_node.inputs[0].links[0].from_socket
                 node_tree.links.new(fac_src, transmission_mix.inputs["Fac"])
             else:
                 transmission_mix.inputs["Fac"].default_value = mix_node.inputs[0].default_value
 
-            if prev_transmission_mix:
-                node_tree.links.new(get_output_socket(prev_transmission_mix, "Color"),
-                                    transmission_mix.inputs["Color1"])
+            # Top
+            if top_is_mix:
+                node_tree.links.new(get_output_socket(mix_node_lookup_transmission[top_shader], "Color"), transmission_mix.inputs["Color1"])
             else:
                 transmission_mix.inputs["Color1"].default_value = (0, 0, 0, 1)
-
-            if (top_shader and top_shader.bl_idname == 'ShaderNodeBsdfGlass') or (bot_shader and bot_shader.bl_idname == 'ShaderNodeBsdfGlass'):
-                transmission_mix.inputs["Color2"].default_value = (1, 1, 1, 1)
-            else:
-                if top_shader and top_shader.bl_idname == 'ShaderNodeBsdfPrincipled' and has_node_input(top_shader, "Transmission Weight"):
+                if (top_shader and top_shader.bl_idname == 'ShaderNodeBsdfGlass'):
+                    transmission_mix.inputs["Color1"].default_value = (1, 1, 1, 1)
+                elif top_shader and top_shader.bl_idname == 'ShaderNodeBsdfPrincipled' and has_node_input(top_shader, "Transmission Weight"):
                     sock = get_node_input_by_name(top_shader, "Transmission Weight")
                     if sock and sock.is_linked:
-                        node_tree.links.new(sock.links[0].from_socket, transmission_mix.inputs["Color2"])
+                        node_tree.links.new(sock.links[0].from_socket, transmission_mix.inputs["Color1"])
                     elif sock:
-                        transmission_mix.inputs["Color2"].default_value = ensure_color4(sock.default_value)
+                        transmission_mix.inputs["Color1"].default_value = ensure_color4(sock.default_value)
+
+            # Bot
+            if bot_is_mix:
+                node_tree.links.new(get_output_socket(mix_node_lookup_transmission[bot_shader], "Color"), transmission_mix.inputs["Color2"])
+            else:
+                transmission_mix.inputs["Color2"].default_value = (0, 0, 0, 1) # Default to 0
+                if (bot_shader and bot_shader.bl_idname == 'ShaderNodeBsdfGlass'):
+                    transmission_mix.inputs["Color2"].default_value = (1, 1, 1, 1)
                 elif bot_shader and bot_shader.bl_idname == 'ShaderNodeBsdfPrincipled' and has_node_input(bot_shader, "Transmission Weight"):
                     sock = get_node_input_by_name(bot_shader, "Transmission Weight")
                     if sock and sock.is_linked:
                         node_tree.links.new(sock.links[0].from_socket, transmission_mix.inputs["Color2"])
                     elif sock:
                         transmission_mix.inputs["Color2"].default_value = ensure_color4(sock.default_value)
-            prev_transmission_mix = transmission_mix
+            
+            mix_node_lookup_transmission[mix_node] = transmission_mix
 
         # -----------------------------------------------------
-        # ALWAYS create an Emission Color Mix node for every mix shader.
+        # EMISSION COLOR Mix
         emission_color_mix = nodes.new(type='ShaderNodeMixRGB')
         emission_color_mix.label = f"EmissionColorMix_for_{mix_node.name}"
         emission_color_mix.blend_type = 'MIX'
         emission_color_mix.location = (col_x, row_y['emission_color'])
 
-        # Set the mix factor from the mix shader node.
-        if mix_node.inputs[0].is_linked:
+        if mix_node.type == 'ADD_SHADER':
+            emission_color_mix.blend_type = 'ADD'
+            emission_color_mix.inputs["Fac"].default_value = 1.0
+        elif mix_node.inputs[0].is_linked:
             fac_src = mix_node.inputs[0].links[0].from_socket
             node_tree.links.new(fac_src, emission_color_mix.inputs["Fac"])
         else:
             emission_color_mix.inputs["Fac"].default_value = mix_node.inputs[0].default_value
 
-        # Input Color1: Use previous chain if available; otherwise, try the top shader or default to black.
-        if prev_emission_color_mix:
-            node_tree.links.new(get_output_socket(prev_emission_color_mix, "Color"),
-                                emission_color_mix.inputs["Color1"])
+        # Top
+        if top_shader in mix_node_lookup_emission_col:
+            node_tree.links.new(get_output_socket(mix_node_lookup_emission_col[top_shader], "Color"), emission_color_mix.inputs["Color1"])
         else:
             if top_shader and has_emission(top_shader):
                 em_color = get_emission_color_default(top_shader)
             else:
-                em_color = (0, 0, 0, 1)  # Default to no emission (black)
+                em_color = (0, 0, 0, 1)
             if hasattr(em_color, "is_linked") and em_color.is_linked:
                 node_tree.links.new(em_color, emission_color_mix.inputs["Color1"])
             else:
                 emission_color_mix.inputs["Color1"].default_value = em_color
 
-        # Input Color2: Use the bottom shader's emission if available; otherwise, default to black.
-        if bot_shader and has_emission(bot_shader):
-            em_color = get_emission_color_default(bot_shader)
+        # Bot
+        if bot_shader in mix_node_lookup_emission_col:
+             node_tree.links.new(get_output_socket(mix_node_lookup_emission_col[bot_shader], "Color"), emission_color_mix.inputs["Color2"])
+        else:
+            if bot_shader and has_emission(bot_shader):
+                em_color = get_emission_color_default(bot_shader)
+            else:
+                em_color = (0, 0, 0, 1) 
             if hasattr(em_color, "is_linked") and em_color.is_linked:
                 node_tree.links.new(em_color, emission_color_mix.inputs["Color2"])
             else:
                 emission_color_mix.inputs["Color2"].default_value = em_color
-        else:
-            emission_color_mix.inputs["Color2"].default_value = (0, 0, 0, 1)
-
-        prev_emission_color_mix = emission_color_mix
+        
+        mix_node_lookup_emission_col[mix_node] = emission_color_mix
 
         # -----------------------------------------------------
-        # ALWAYS create an Emission Strength Mix node for every mix shader.
+        # EMISSION STRENGTH Mix
         emission_strength_mix = nodes.new(type='ShaderNodeMix')
         emission_strength_mix.label = f"EmissionStrengthMix_for_{mix_node.name}"
         emission_strength_mix.data_type = 'FLOAT'
         emission_strength_mix.location = (col_x, row_y['emission_strength'])
 
-        # Set the mix factor from the mix shader node.
-        if mix_node.inputs[0].is_linked:
+        if mix_node.type == 'ADD_SHADER':
+            emission_strength_mix.blend_type = 'ADD'
+            emission_strength_mix.inputs["Factor"].default_value = 1.0
+        elif mix_node.inputs[0].is_linked:
             fac_src = mix_node.inputs[0].links[0].from_socket
             node_tree.links.new(fac_src, emission_strength_mix.inputs["Factor"])
         else:
             emission_strength_mix.inputs["Factor"].default_value = mix_node.inputs[0].default_value
 
-        # Input A: Use the previous emission chain if available; otherwise, try the top shader.
-        if prev_emission_strength_mix:
-            node_tree.links.new(get_output_socket(prev_emission_strength_mix, "Result"),
-                                emission_strength_mix.inputs["A"])
+        # Top
+        if top_shader in mix_node_lookup_emission_str:
+            node_tree.links.new(get_output_socket(mix_node_lookup_emission_str[top_shader], "Result"), emission_strength_mix.inputs["A"])
         else:
             if top_shader and has_emission_strength(top_shader):
                 es_val = get_emission_strength_default(top_shader)
@@ -670,163 +695,180 @@ def create_mix_chains_and_principled():
                     es_val = ensure_color4(es_val)
                     emission_strength_mix.inputs["A"].default_value = es_val[0]
             else:
-                # If top shader does not provide emission strength, default to 0.
                 emission_strength_mix.inputs["A"].default_value = 0.0
 
-        # Input B: Use bottom shader emission strength if available; otherwise, default to 0.
-        if bot_shader and has_emission_strength(bot_shader):
-            es_val = get_emission_strength_default(bot_shader)
-            if hasattr(es_val, "is_linked") and es_val.is_linked:
-                node_tree.links.new(es_val, emission_strength_mix.inputs["B"])
-            else:
-                es_val = ensure_color4(es_val)
-                emission_strength_mix.inputs["B"].default_value = es_val[0]
+        # Bot
+        if bot_shader in mix_node_lookup_emission_str:
+             node_tree.links.new(get_output_socket(mix_node_lookup_emission_str[bot_shader], "Result"), emission_strength_mix.inputs["B"])
         else:
-            emission_strength_mix.inputs["B"].default_value = 0.0
+            if bot_shader and has_emission_strength(bot_shader):
+                es_val = get_emission_strength_default(bot_shader)
+                if hasattr(es_val, "is_linked") and es_val.is_linked:
+                    node_tree.links.new(es_val, emission_strength_mix.inputs["B"])
+                else:
+                    es_val = ensure_color4(es_val)
+                    emission_strength_mix.inputs["B"].default_value = es_val[0]
+            else:
+                emission_strength_mix.inputs["B"].default_value = 0.0
+        
+        mix_node_lookup_emission_str[mix_node] = emission_strength_mix
 
-        prev_emission_strength_mix = emission_strength_mix
-
-        # Extract a candidate maximum from the current emission strength mix node.
         local_A = extract_max_from_socket(emission_strength_mix.inputs["A"])
         local_B = extract_max_from_socket(emission_strength_mix.inputs["B"])
         local_max = max(local_A, local_B)
         max_emission_strength = max(max_emission_strength, local_max)
 
         # -----------------------------------------------------
-        # ALPHA Mix (Principled)
+        # ALPHA Mix
         is_top_principled = top_shader and top_shader.bl_idname == 'ShaderNodeBsdfPrincipled'
         is_bot_principled = bot_shader and bot_shader.bl_idname == 'ShaderNodeBsdfPrincipled'
-        if is_top_principled or is_bot_principled:
+        top_is_mix_alpha = top_shader in mix_node_lookup_alpha
+        bot_is_mix_alpha = bot_shader in mix_node_lookup_alpha
+
+        if is_top_principled or is_bot_principled or top_is_mix_alpha or bot_is_mix_alpha or is_top_transparent or is_bot_transparent:
             alpha_mix = nodes.new(type='ShaderNodeMixRGB')
             alpha_mix.label = f"AlphaMix_Principled_for_{mix_node.name}"
             alpha_mix.blend_type = 'MIX'
             alpha_mix.location = (col_x, row_y['principled_alpha'])
-
-            if mix_node.inputs[0].is_linked:
+            
+            if mix_node.type == 'ADD_SHADER':
+                alpha_mix.blend_type = 'MIX'
+                alpha_mix.inputs["Fac"].default_value = 0.0 
+            elif mix_node.inputs[0].is_linked:
                 fac_src = mix_node.inputs[0].links[0].from_socket
                 node_tree.links.new(fac_src, alpha_mix.inputs["Fac"])
             else:
                 alpha_mix.inputs["Fac"].default_value = mix_node.inputs[0].default_value
-
-            if prev_alpha_mix:
-                node_tree.links.new(get_output_socket(prev_alpha_mix, "Color"), alpha_mix.inputs["Color1"])
-            else:
-                alpha_mix.inputs["Color1"].default_value = (1, 1, 1, 1)
-
-            if is_top_principled:
+            
+            # Top
+            if top_is_mix_alpha:
+                 node_tree.links.new(get_output_socket(mix_node_lookup_alpha[top_shader], "Color"), alpha_mix.inputs["Color1"])
+            elif top_is_transparent:  # <--- CORRECTED NAME
+                alpha_mix.inputs["Color1"].default_value = (0.0, 0.0, 0.0, 0.0)
+            elif is_top_principled:
                 alpha_source = get_alpha_link(top_shader)
                 if alpha_source:
-                    node_tree.links.new(alpha_source, alpha_mix.inputs["Color2"])
+                    node_tree.links.new(alpha_source, alpha_mix.inputs["Color1"])
                 else:
-                    alpha_mix.inputs["Color2"].default_value = get_alpha_default(top_shader)
+                    alpha_mix.inputs["Color1"].default_value = get_alpha_default(top_shader)
             else:
+                 alpha_mix.inputs["Color1"].default_value = (1, 1, 1, 1)
+
+            # Bot
+            if bot_is_mix_alpha:
+                 node_tree.links.new(get_output_socket(mix_node_lookup_alpha[bot_shader], "Color"), alpha_mix.inputs["Color2"])
+            elif bot_is_transparent:  # <--- CORRECTED NAME (was is_bot_transparent)
+                 alpha_mix.inputs["Color2"].default_value = (0.0, 0.0, 0.0, 0.0)
+            elif is_bot_principled:
                 alpha_source = get_alpha_link(bot_shader)
                 if alpha_source:
                     node_tree.links.new(alpha_source, alpha_mix.inputs["Color2"])
                 else:
                     alpha_mix.inputs["Color2"].default_value = get_alpha_default(bot_shader)
-
-            prev_alpha_mix = alpha_mix
+            else:
+                 alpha_mix.inputs["Color2"].default_value = (1, 1, 1, 1)
+            
+            mix_node_lookup_alpha[mix_node] = alpha_mix
 
         # -----------------------------------------------------
-        # -----------------------------------------------------
-        # METALLIC Mix with Glossy BSDF Handling
+        # METALLIC Mix
         is_top_glossy = top_shader and (top_shader.bl_idname in {'ShaderNodeBsdfGlossy', 'ShaderNodeBsdfAnisotropic'})
         is_bot_glossy = bot_shader and (bot_shader.bl_idname in {'ShaderNodeBsdfGlossy', 'ShaderNodeBsdfAnisotropic'} )
-        # Consider a shader metallic if it is Principled, Metallic, or Glossy
         is_top_metal = top_shader and (top_shader.bl_idname in {'ShaderNodeBsdfMetallic', 'ShaderNodeBsdfPrincipled'} or is_top_glossy)
         is_bot_metal = bot_shader and (bot_shader.bl_idname in {'ShaderNodeBsdfMetallic', 'ShaderNodeBsdfPrincipled'} or is_bot_glossy)
+        
+        top_is_mix_metal = top_shader in mix_node_lookup_metallic
+        bot_is_mix_metal = bot_shader in mix_node_lookup_metallic
 
-        if is_top_metal or is_bot_metal:
+        if is_top_metal or is_bot_metal or top_is_mix_metal or bot_is_mix_metal:
             metallic_mix = nodes.new(type='ShaderNodeMixRGB')
             metallic_mix.label = f"MetallicMix_for_{mix_node.name}"
             metallic_mix.blend_type = 'MIX'
             metallic_mix.location = (col_x, row_y['metallic'])
 
-            # Factor from the Mix Shader
-            if mix_node.inputs[0].is_linked:
+            if mix_node.type == 'ADD_SHADER':
+                metallic_mix.inputs["Fac"].default_value = 0.0 
+            elif mix_node.inputs[0].is_linked:
                 fac_src = mix_node.inputs[0].links[0].from_socket
                 node_tree.links.new(fac_src, metallic_mix.inputs["Fac"])
             else:
                 metallic_mix.inputs["Fac"].default_value = mix_node.inputs[0].default_value
 
-            # -------------------------------
-            # COLOR1 comes from the PREVIOUS Metallic Mix (if it exists)
-            # Otherwise, fall back to the "top" shader's metallic or 0/1.
-
-            if prev_metallic_mix:
-                # Chain from the previous metallic mix node
-                node_tree.links.new(
-                    prev_metallic_mix.outputs["Color"],  # or "Result" if using ShaderNodeMix, etc.
-                    metallic_mix.inputs["Color1"]
-                )
+            # Top
+            if top_is_mix_metal:
+                node_tree.links.new(mix_node_lookup_metallic[top_shader].outputs["Color"], metallic_mix.inputs["Color1"])
             else:
-                # This is the first Metallic Mix in the chain:
-                # Decide if top_shader is glossy => 1, metallic => link, or else => 0
                 if top_shader:
                     if is_top_glossy:
                         metallic_mix.inputs["Color1"].default_value = (1.0, 1.0, 1.0, 1.0)
                     elif top_shader.bl_idname in {'ShaderNodeBsdfMetallic','ShaderNodeBsdfPrincipled'}:
                         if is_metallic_linked(top_shader):
-                            node_tree.links.new(get_metallic_link(top_shader),
-                                                metallic_mix.inputs["Color1"])
+                            node_tree.links.new(get_metallic_link(top_shader), metallic_mix.inputs["Color1"])
                         else:
                             metallic_mix.inputs["Color1"].default_value = get_metallic_default(top_shader)
                     else:
                         metallic_mix.inputs["Color1"].default_value = (0.0, 0.0, 0.0, 1.0)
                 else:
-                    # No top shader => 0
                     metallic_mix.inputs["Color1"].default_value = (0.0, 0.0, 0.0, 1.0)
 
-            # -------------------------------
-            # COLOR2 always comes from the "bottom" shader’s metallic or 0/1
-            # (or you can invert this logic if you prefer the bottom to chain.)
-
-            if bot_shader:
-                if is_bot_glossy:
-                    metallic_mix.inputs["Color2"].default_value = (1.0, 1.0, 1.0, 1.0)
-                elif bot_shader.bl_idname in {'ShaderNodeBsdfMetallic','ShaderNodeBsdfPrincipled'}:
-                    if is_metallic_linked(bot_shader):
-                        node_tree.links.new(get_metallic_link(bot_shader),
-                                            metallic_mix.inputs["Color2"])
+            # Bot
+            if bot_is_mix_metal:
+                node_tree.links.new(mix_node_lookup_metallic[bot_shader].outputs["Color"], metallic_mix.inputs["Color2"])
+            else:
+                if bot_shader:
+                    if is_bot_glossy:
+                        metallic_mix.inputs["Color2"].default_value = (1.0, 1.0, 1.0, 1.0)
+                    elif bot_shader.bl_idname in {'ShaderNodeBsdfMetallic','ShaderNodeBsdfPrincipled'}:
+                        if is_metallic_linked(bot_shader):
+                            node_tree.links.new(get_metallic_link(bot_shader), metallic_mix.inputs["Color2"])
+                        else:
+                            metallic_mix.inputs["Color2"].default_value = get_metallic_default(bot_shader)
                     else:
-                        metallic_mix.inputs["Color2"].default_value = get_metallic_default(bot_shader)
+                        metallic_mix.inputs["Color2"].default_value = (0.0, 0.0, 0.0, 1.0)
                 else:
                     metallic_mix.inputs["Color2"].default_value = (0.0, 0.0, 0.0, 1.0)
-            else:
-                metallic_mix.inputs["Color2"].default_value = (0.0, 0.0, 0.0, 1.0)
 
-            # --------------------------------
-            # Update the chain reference:
-            prev_metallic_mix = metallic_mix
+            mix_node_lookup_metallic[mix_node] = metallic_mix
             
-            # -----------------------------------------------------
-        # NORMAL Mix (using ShaderNodeMix in VECTOR mode)
-        if top_shader and bot_shader:
-            top_has_normal = ("Normal" in top_shader.inputs)
-            bot_has_normal = ("Normal" in bot_shader.inputs)
-            if top_has_normal or bot_has_normal:
-                normal_mix = nodes.new(type='ShaderNodeMix')
-                normal_mix.label = f"NormalMix_for_{mix_node.name}"
-                normal_mix.data_type = 'VECTOR'
-                normal_mix.location = (col_x, row_y['normal'])
-                if mix_node.inputs[0].is_linked:
-                    fac_src = mix_node.inputs[0].links[0].from_socket
-                    node_tree.links.new(fac_src, normal_mix.inputs["Factor"])
-                else:
-                    normal_mix.inputs["Factor"].default_value = mix_node.inputs[0].default_value
-                if prev_normal_mix:
-                    node_tree.links.new(prev_normal_mix.outputs["Result"], normal_mix.inputs["A"])
-                else:
-                    top_sock = top_shader.inputs.get("Normal")
-                    if top_sock:
-                        if top_sock.is_linked:
-                            node_tree.links.new(top_sock.links[0].from_socket, normal_mix.inputs["A"])
-                        else:
-                            normal_mix.inputs["A"].default_value = ensure_vector3(top_sock.default_value)
+        # -----------------------------------------------------
+        # NORMAL Mix
+        top_has_normal = top_shader and ("Normal" in top_shader.inputs)
+        bot_has_normal = bot_shader and ("Normal" in bot_shader.inputs)
+        top_is_mix_normal = top_shader in mix_node_lookup_normal
+        bot_is_mix_normal = bot_shader in mix_node_lookup_normal
+
+        if top_has_normal or bot_has_normal or top_is_mix_normal or bot_is_mix_normal:
+            normal_mix = nodes.new(type='ShaderNodeMix')
+            normal_mix.label = f"NormalMix_for_{mix_node.name}"
+            normal_mix.data_type = 'VECTOR'
+            normal_mix.location = (col_x, row_y['normal'])
+            
+            if mix_node.type == 'ADD_SHADER':
+                normal_mix.inputs["Factor"].default_value = 0.0 
+            elif mix_node.inputs[0].is_linked:
+                fac_src = mix_node.inputs[0].links[0].from_socket
+                node_tree.links.new(fac_src, normal_mix.inputs["Factor"])
+            else:
+                normal_mix.inputs["Factor"].default_value = mix_node.inputs[0].default_value
+            
+            # Top
+            if top_is_mix_normal:
+                 node_tree.links.new(mix_node_lookup_normal[top_shader].outputs["Result"], normal_mix.inputs["A"])
+            else:
+                top_sock = top_shader.inputs.get("Normal") if top_shader else None
+                if top_sock:
+                    if top_sock.is_linked:
+                        node_tree.links.new(top_sock.links[0].from_socket, normal_mix.inputs["A"])
                     else:
-                        normal_mix.inputs["A"].default_value = (0.0, 0.0, 0.0)
-                bot_sock = bot_shader.inputs.get("Normal")
+                        normal_mix.inputs["A"].default_value = ensure_vector3(top_sock.default_value)
+                else:
+                    normal_mix.inputs["A"].default_value = (0.0, 0.0, 0.0)
+            
+            # Bot
+            if bot_is_mix_normal:
+                 node_tree.links.new(mix_node_lookup_normal[bot_shader].outputs["Result"], normal_mix.inputs["B"])
+            else:
+                bot_sock = bot_shader.inputs.get("Normal") if bot_shader else None
                 if bot_sock:
                     if bot_sock.is_linked:
                         node_tree.links.new(bot_sock.links[0].from_socket, normal_mix.inputs["B"])
@@ -834,47 +876,8 @@ def create_mix_chains_and_principled():
                         normal_mix.inputs["B"].default_value = ensure_vector3(bot_sock.default_value)
                 else:
                     normal_mix.inputs["B"].default_value = (0.0, 0.0, 0.0)
-                prev_normal_mix = normal_mix
-
-        prev_color_mix = color_mix
-        prev_roughness_mix = roughness_mix
-
-        # ALPHA Mix for Transparent BSDF Handling
-        is_top_transparent = top_shader and (top_shader.bl_idname == 'ShaderNodeBsdfTransparent')
-        is_bot_transparent = bot_shader and (bot_shader.bl_idname == 'ShaderNodeBsdfTransparent')
-        if is_top_transparent or is_bot_transparent:
-            alpha_mix = nodes.new(type='ShaderNodeMixRGB')
-            alpha_mix.label = f"AlphaMix_Transparent_for_{mix_node.name}"
-            alpha_mix.blend_type = 'MIX'
-            alpha_mix.location = (col_x, row_y['principled_alpha'])
             
-            # Set the mix factor from the mix shader node
-            if mix_node.inputs[0].is_linked:
-                fac_src = mix_node.inputs[0].links[0].from_socket
-                node_tree.links.new(fac_src, alpha_mix.inputs["Fac"])
-            else:
-                alpha_mix.inputs["Fac"].default_value = mix_node.inputs[0].default_value
-            
-            # For the transparent branch, always force black (0,0,0,0)
-            # For the non-transparent branch, chain the previous alpha mix if available, else default to white (1,1,1,1)
-            if is_top_transparent:
-                # For the top shader input, force black
-                alpha_mix.inputs["Color1"].default_value = (0.0, 0.0, 0.0, 0.0)
-                # For the other branch (bottom), use previous alpha chain or white
-                if prev_alpha_mix:
-                    node_tree.links.new(get_output_socket(prev_alpha_mix, "Color"), alpha_mix.inputs["Color2"])
-                else:
-                    alpha_mix.inputs["Color2"].default_value = (1.0, 1.0, 1.0, 1.0)
-            elif is_bot_transparent:
-                # For the bottom shader input, force black
-                alpha_mix.inputs["Color2"].default_value = (0.0, 0.0, 0.0, 0.0)
-                # For the other branch (top), use previous alpha chain or white
-                if prev_alpha_mix:
-                    node_tree.links.new(get_output_socket(prev_alpha_mix, "Color"), alpha_mix.inputs["Color1"])
-                else:
-                    alpha_mix.inputs["Color1"].default_value = (1.0, 1.0, 1.0, 1.0)
-            
-            prev_alpha_mix = alpha_mix
+            mix_node_lookup_normal[mix_node] = normal_mix
 
     # ---------------------------------------------------------
     # 6) Create Principled BSDF and final connections.
@@ -883,46 +886,50 @@ def create_mix_chains_and_principled():
     principled_bsdf.label = "Principled BSDF"
     principled_bsdf.location = (final_col_x, -150)
 
-    print("Principled BSDF inputs:", [socket.name for socket in principled_bsdf.inputs])
+    # Use the last processed mix node (or starting node if it was a Mix) to connect to Principled
+    last_mix_node = chain_order[-1] if chain_order else None
 
     # Base Color
-    if prev_color_mix:
-        node_tree.links.new(get_output_socket(prev_color_mix), principled_bsdf.inputs["Base Color"])
+    if last_mix_node in mix_node_lookup_color:
+        node_tree.links.new(get_output_socket(mix_node_lookup_color[last_mix_node]), principled_bsdf.inputs["Base Color"])
+    
     # Roughness
-    if prev_roughness_mix:
-        node_tree.links.new(get_output_socket(prev_roughness_mix), principled_bsdf.inputs["Roughness"])
-    # Transmission Weight (if exists)
-    if prev_transmission_mix and "Transmission Weight" in principled_bsdf.inputs:
-        node_tree.links.new(get_output_socket(prev_transmission_mix), principled_bsdf.inputs["Transmission Weight"])
+    if last_mix_node in mix_node_lookup_roughness:
+        node_tree.links.new(get_output_socket(mix_node_lookup_roughness[last_mix_node]), principled_bsdf.inputs["Roughness"])
+    
+    # Transmission
+    if last_mix_node in mix_node_lookup_transmission and "Transmission Weight" in principled_bsdf.inputs:
+        node_tree.links.new(get_output_socket(mix_node_lookup_transmission[last_mix_node]), principled_bsdf.inputs["Transmission Weight"])
+    
     # Alpha
-    if prev_alpha_mix:
-        node_tree.links.new(get_output_socket(prev_alpha_mix), principled_bsdf.inputs["Alpha"])
+    if last_mix_node in mix_node_lookup_alpha:
+        node_tree.links.new(get_output_socket(mix_node_lookup_alpha[last_mix_node]), principled_bsdf.inputs["Alpha"])
+    
     # Metallic
-    if prev_metallic_mix:
-        node_tree.links.new(get_output_socket(prev_metallic_mix), principled_bsdf.inputs["Metallic"])
+    if last_mix_node in mix_node_lookup_metallic:
+        node_tree.links.new(get_output_socket(mix_node_lookup_metallic[last_mix_node]), principled_bsdf.inputs["Metallic"])
+    
     # Normal
-    if prev_normal_mix:
-        node_tree.links.new(prev_normal_mix.outputs["Result"], principled_bsdf.inputs["Normal"])
-    # Emission Color (if exists)
-    if prev_emission_color_mix and "Emission Color" in principled_bsdf.inputs:
-        node_tree.links.new(get_output_socket(prev_emission_color_mix), principled_bsdf.inputs["Emission Color"])
-    # Emission Strength (if exists)
-    if prev_emission_strength_mix and "Emission Strength" in principled_bsdf.inputs:
-        # Create Map Range node to remap the emission strength from 0-max_emission_strength to 0-1.
+    if last_mix_node in mix_node_lookup_normal:
+        node_tree.links.new(mix_node_lookup_normal[last_mix_node].outputs["Result"], principled_bsdf.inputs["Normal"])
+    
+    # Emission Color
+    if last_mix_node in mix_node_lookup_emission_col and "Emission Color" in principled_bsdf.inputs:
+        node_tree.links.new(get_output_socket(mix_node_lookup_emission_col[last_mix_node]), principled_bsdf.inputs["Emission Color"])
+    
+    # Emission Strength
+    if last_mix_node in mix_node_lookup_emission_str and "Emission Strength" in principled_bsdf.inputs:
         map_range = nodes.new(type='ShaderNodeMapRange')
         map_range.label = "EmissionStrength_MapRange"
-        map_range.location = (final_col_x - 200, row_y['emission_strength'])  # adjust as needed
+        map_range.location = (final_col_x - 200, row_y['emission_strength'])
         
-        # Connect final emission mix to Map Range node.
-        node_tree.links.new(get_output_socket(prev_emission_strength_mix), map_range.inputs["Value"])
+        node_tree.links.new(get_output_socket(mix_node_lookup_emission_str[last_mix_node]), map_range.inputs["Value"])
         
-        # Set the map range parameters:
         map_range.inputs["From Min"].default_value = 0.0
         map_range.inputs["From Max"].default_value = max_emission_strength if max_emission_strength > 0.0 else 1.0
         map_range.inputs["To Min"].default_value = 0.0
         map_range.inputs["To Max"].default_value = 1.0
         
-        # Finally, connect the Map Range output to the Principled BSDF’s Emission Strength.
         node_tree.links.new(get_output_socket(map_range), principled_bsdf.inputs["Emission Strength"])
         
     # ---------------------------------------------------------
@@ -938,33 +945,25 @@ def create_mix_chains_and_principled():
     node_tree.links.new(principled_bsdf.outputs["BSDF"], material_output.inputs["Surface"])
 
 def extract_max_from_socket(socket, visited=None):
-    """Recursively traverse a socket’s input chain and return a candidate maximum value.
-    If a multiply node is found, it extracts the constant values if present.
-    """
     if visited is None:
         visited = set()
     if socket is None or socket in visited:
         return 0.0
     visited.add(socket)
     
-    # If not linked, try to return the socket’s default (if it’s a number).
     try:
         if not socket.is_linked:
             return float(socket.default_value)
     except Exception:
         return 0.0
     
-    # Otherwise, follow the link.
     link = socket.links[0]
     from_socket = link.from_socket
     from_node = link.from_node
     
-    # If this is a multiply node, check its inputs.
     if from_node.bl_idname == 'ShaderNodeMath' and from_node.operation == 'MULTIPLY':
         candidate_A = 0.0
         candidate_B = 0.0
-        # For each input, if it isn’t linked, use its default value,
-        # otherwise recurse.
         if not from_node.inputs[0].is_linked:
             candidate_A = float(from_node.inputs[0].default_value)
         else:
@@ -974,11 +973,9 @@ def extract_max_from_socket(socket, visited=None):
         else:
             candidate_B = extract_max_from_socket(from_node.inputs[1], visited)
         candidate = max(candidate_A, candidate_B)
-        # Also check further upstream from the multiply node’s output.
         upstream_candidate = extract_max_from_socket(from_socket, visited)
         return max(candidate, upstream_candidate)
     else:
-        # For any other node, just continue traversing.
         return extract_max_from_socket(from_socket, visited)
 
 def create_node_group(custom_name="Custom_NodeGroup"):
@@ -992,14 +989,12 @@ def create_node_group(custom_name="Custom_NodeGroup"):
     node_tree = obj.active_material.node_tree
     nodes = node_tree.nodes
 
-    # Find the Material Output node
     material_output = None
     for node in nodes:
         if node.type == 'OUTPUT_MATERIAL':
             material_output = node
             break
 
-    # Find an open Node Editor area
     override = None
     for area in context.screen.areas:
         if area.type == 'NODE_EDITOR':
@@ -1010,38 +1005,28 @@ def create_node_group(custom_name="Custom_NodeGroup"):
             if override:
                 break
 
-    # If no Node Editor is open, print a warning
     if not override:
         print("Please open a Node Editor before running this script.")
         return
 
-    # Execute the node grouping operation in the correct context
     with context.temp_override(**override):
         bpy.ops.node.group_make()
 
-    # Get the active node (which should now be the new node group)
     new_group_node = node_tree.nodes.active
     if new_group_node and new_group_node.type == 'GROUP':
-        new_group_node.node_tree.name = custom_name  # Rename the internal node group
-        new_group_node.label = custom_name  # Change label for clarity
+        new_group_node.node_tree.name = custom_name
+        new_group_node.label = custom_name
 
-        # ---- MOVE NODE GROUP UNDER MATERIAL OUTPUT ----
         if material_output:
             new_group_node.location = (
-                material_output.location.x,  # Same X position
-                material_output.location.y - 200  # Move it below (adjust the Y offset as needed)
+                material_output.location.x,
+                material_output.location.y - 200
             )
 
     print(f"Node group created: {custom_name}")
 
-    # ---- EXIT NODE GROUP ----
     with context.temp_override(**override):
-        if bpy.ops.node.tree_path_parent.poll():  # Check if we are inside a node group
-            bpy.ops.node.tree_path_parent()  # Exit the node group
+        if bpy.ops.node.tree_path_parent.poll():
+            bpy.ops.node.tree_path_parent()
 
     print("Exited node group.")
-
-# Run the function to create a node group with a custom name
-
-#create_mix_chains_and_principled()
-#create_node_group("PrincipledBSDF Setup")
