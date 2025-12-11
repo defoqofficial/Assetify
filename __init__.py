@@ -2,7 +2,7 @@ bl_info = {
     "name": "Assetify",
     "description": "Convert ANYTHING into game-ready assets with baked textures.",
     "author": "Nino Defoq",
-    "version": (2, 1, 7),
+    "version": (3, 0, 0),
     "blender": (4, 0, 0),
     "location": "3D View > Tool Shelf > Assetify",
     "warning": "",
@@ -22,13 +22,17 @@ import shutil
 import json
 import struct
 import re
+import bmesh
 import subprocess
 import math as m
 from gpu_extras.batch import batch_for_shader
+from . import pivot_tool
 from . import addon_updater_ops
 from . import anim_geonode
 from . import animation_processor
 from . import anim_cloth
+from . import lod_manager
+from . import collision
 import bpy.utils.previews
 import numpy
 import uuid
@@ -1804,6 +1808,15 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
             self.report({'WARNING'}, "No assets to process.")
             return {'CANCELLED'}
 
+        # --- VISUAL FEEDBACK: Hide Originals Immediately ---
+        # We hide the original collections NOW so the user sees the new assets "pop in"
+        if assetify_settings.disable_original_collections:
+            for view_layer in bpy.context.scene.view_layers:
+                for original_collection in self.main_collections:
+                    layer_coll = find_layer_collection(view_layer.layer_collection, original_collection)
+                    if layer_coll:
+                        layer_coll.exclude = True
+
         # Start progress bar
         start_progress_bar(self, initial_message="Processing Selected Assets")
 
@@ -1834,22 +1847,6 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
                 self.current_operation = "Processing Complete."
                 remove_progress_bar(self)
                 context.window_manager.event_timer_remove(self._timer)
-
-                assetify_settings = context.scene.assetify_bake_settings
-
-                if assetify_settings.disable_original_collections:
-                    # Exclude original collections from all view layers
-                    for view_layer in bpy.context.scene.view_layers:
-                        # Exclude original collections
-                        for original_collection in self.main_collections:
-                            layer_coll = find_layer_collection(view_layer.layer_collection, original_collection)
-                            if layer_coll:
-                                layer_coll.exclude = True
-                                print(f"Excluded collection from {view_layer.name}: {original_collection.name}")
-                            else:
-                                print(f"Could not find LayerCollection for {original_collection.name} in {view_layer.name}")
-                else:
-                    print("Original collections will remain visible.")
 
                 # Update statuses
                 assetify_settings = context.scene.assetify_bake_settings
@@ -2120,6 +2117,16 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
     def cancel(self, context):
         context.window_manager.event_timer_remove(self._timer)
         remove_progress_bar(self)
+        
+        # Restore visibility if user cancelled
+        assetify_settings = context.scene.assetify_bake_settings
+        if assetify_settings.disable_original_collections:
+            for view_layer in bpy.context.scene.view_layers:
+                for original_collection in self.main_collections:
+                    layer_coll = find_layer_collection(view_layer.layer_collection, original_collection)
+                    if layer_coll:
+                        layer_coll.exclude = False
+                        
         self.report({'INFO'}, "Set Game Assets operation canceled.")
 
     def count_total_assets(self, collections):
@@ -3335,9 +3342,26 @@ def apply_global_animation_setting(assetify_settings):
     for asset in assetify_settings.baked_assets:
         if asset.include_in_send:  # Only apply to selected assets
             asset.process_animations = assetify_settings.process_animations_global
-            print(f"[DEBUG] Set animation processing for '{asset.name}' to {assetify_settings.process_animations_global}.")        
+            print(f"[DEBUG] Set animation processing for '{asset.name}' to {assetify_settings.process_animations_global}.")    
 
 class AssetifyBakeSettings(bpy.types.PropertyGroup):
+    clear_proxy_normals: bpy.props.BoolProperty(
+        name="Clear Proxy Normals",
+        description="Removes custom split normals and Weighted Normal modifiers from the baking proxy. Enable if shading looks incorrect.",
+        default=False
+    )
+    
+    
+    bake_format: bpy.props.EnumProperty(
+        name="File Format",
+        description="Choose the file format for baked textures",
+        items=[
+            ('PNG', "PNG", "Standard (8/16-bit)"),
+            ('OPEN_EXR', "OpenEXR", "High Dynamic Range (32-bit Float) - Recommended for Normal Maps")
+        ],
+        default='PNG'
+    )
+    
     bake_direct_light: bpy.props.BoolProperty(
         name="Direct Light",
         default=False,
@@ -3387,7 +3411,7 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
     bake_metallic: bpy.props.BoolProperty(
         name="Metallic", default=True, description="Bake Metallic map")
     bake_alpha: bpy.props.BoolProperty(
-        name="Alpha", default=True, description="Bake Alpha map")
+        name="Alpha", default=False, description="Bake Alpha map")
     bake_emission: bpy.props.BoolProperty(
         name="Emission", default=False, description="Bake Emission map")
     bake_transmission: bpy.props.BoolProperty(
@@ -3413,7 +3437,7 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
     show_bake_mode_menu: bpy.props.BoolProperty(
         name="Show Bake Mode Menu",
         description="Toggle visibility of the bake mode settings menu",
-        default=True
+        default=False
     )
     
     texturebake_mode: bpy.props.EnumProperty(
@@ -3521,6 +3545,8 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
         description="Toggle the visibility of Bake Settings",
         default=False  # Expanded by default
     )
+    
+    lod_menu_expanded: bpy.props.BoolProperty(name="Expand LOD Menu", default=False)
 
     export_menu_expanded: bpy.props.BoolProperty(
         name="Export Settings Expanded",
@@ -3677,9 +3703,49 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
         description="Name of the main collection to track game-ready assets",
         default=""
     )    
+    
+    export_menu_expanded: bpy.props.BoolProperty(
+        name="Export Settings Expanded",
+        description="Toggle the visibility of Export Settings",
+        default=False
+    )
+    
+    # ADD THIS NEW PROPERTY:
+    utilities_menu_expanded: bpy.props.BoolProperty(
+        name="Utilities Menu Expanded",
+        default=False
+    )
 
     # Use a Python list to store the main collection assets
     main_collection_assets = []
+    
+    bake_ao: bpy.props.BoolProperty(
+        name="Ambient Occlusion", 
+        default=True, 
+        description="Bake Ambient Occlusion (AO) map"
+    )
+    
+    pack_orm: bpy.props.BoolProperty(
+        name="Pack ORM (UE5/glTF)", 
+        default=False, 
+        description="Combine AO (Red), Roughness (Green), and Metallic (Blue) into a single image."
+    )
+    
+    use_udim: bpy.props.BoolProperty(
+        name="Use UDIMs",
+        description="Enable UDIM (Multi-Tile) UVs and Baking",
+        default=False
+    )
+    
+    udim_tiles: bpy.props.IntProperty(
+        name="UDIM Tiles",
+        description="Number of UDIM tiles to use (Automatic grid packing)",
+        default=2,
+        min=1, max=10
+    )
+    
+    extra_maps_expanded: bpy.props.BoolProperty(name="Extra Maps", default=False)
+    settings_submenu_expanded: bpy.props.BoolProperty(name="General Settings", default=False)
 
     def get_asset_by_name(self, name):
         """Retrieve an asset by its name."""
@@ -4023,7 +4089,179 @@ def remove_temporary_nodes(obj, node_types=("TEX_IMAGE", "EMISSION", "COMBRGB"))
         ]
         for node in nodes_to_remove:
             node_tree.nodes.remove(node)
+            
+def perform_orm_packing(obj, context):
+    """
+    Pack AO, Roughness, and Metallic into a single ORM image.
+    FIX: Respects the PNG/OpenEXR setting and file extension.
+    """
+    import os
+    settings = context.scene.assetify_bake_settings
+    save_dir = bpy.path.abspath(settings.bake_folder)
+    
+    is_anim = settings.texturebake_mode == 'ANIMATION'
+    use_udim = settings.use_udim
+    
+    # --- FIX: Check Format Settings ---
+    is_exr = settings.bake_format == 'OPEN_EXR'
+    ext = ".exr" if is_exr else ".png"
+    file_format = 'OPEN_EXR' if is_exr else 'PNG'
+    # ----------------------------------
 
+    if is_anim:
+        frame_number = bpy.context.scene.frame_current
+        base_name = f"Frame{frame_number:04d}"
+        base_path_ao = os.path.join(save_dir, f"{obj.name}_textures", "Occlusion")
+        base_path_rgh = os.path.join(save_dir, f"{obj.name}_textures", "Roughness")
+        base_path_met = os.path.join(save_dir, f"{obj.name}_textures", "Metallic")
+        target_dir = os.path.join(save_dir, f"{obj.name}_textures", "ORM")
+        os.makedirs(target_dir, exist_ok=True)
+    else:
+        base_name = f"{obj.name}"
+        tex_dir = os.path.join(save_dir, "textures")
+        base_path_ao = tex_dir
+        base_path_rgh = tex_dir
+        base_path_met = tex_dir
+        target_dir = tex_dir
+
+    # Helper to find source files (checking both .png and .exr to be safe)
+    def get_source_path(path_dir, b_name, map_suffix, tile_id=None):
+        # We try to find the source file. It should match the current extension settings.
+        # But if the user switched formats halfway, we might need to check both?
+        # For now, assumes source matches current settings.
+        if is_anim:
+            filename = f"{b_name}.{tile_id}{ext}" if tile_id else f"{b_name}{ext}"
+        else:
+            filename = f"{b_name}_{map_suffix}.{tile_id}{ext}" if tile_id else f"{b_name}_{map_suffix}{ext}"
+            
+        return os.path.join(path_dir, filename)
+
+    tiles_to_process = []
+    if use_udim:
+        for i in range(settings.udim_tiles):
+            tiles_to_process.append(str(1001 + i))
+    else:
+        tiles_to_process.append(None)
+
+    for tile_id in tiles_to_process:
+        path_ao = get_source_path(base_path_ao, base_name, "Occlusion", tile_id)
+        path_rgh = get_source_path(base_path_rgh, base_name, "Roughness", tile_id)
+        path_met = get_source_path(base_path_met, base_name, "Metallic", tile_id)
+
+        def load_temp(path):
+            if os.path.exists(path):
+                try: return bpy.data.images.load(path)
+                except: return None
+            return None
+
+        img_ao = load_temp(path_ao)
+        img_rgh = load_temp(path_rgh)
+        img_met = load_temp(path_met)
+
+        if img_ao or img_rgh or img_met:
+            # Determine output name
+            if is_anim: 
+                save_name = f"{base_name}.{tile_id}{ext}" if tile_id else f"{base_name}{ext}"
+            else: 
+                save_name = f"{obj.name}_ORM.{tile_id}{ext}" if tile_id else f"{obj.name}_ORM{ext}"
+            
+            full_save_path = os.path.join(target_dir, save_name)
+
+            # Pack textures (Pass use_float=is_exr)
+            pack_orm_textures(obj, img_ao, img_rgh, img_met, "Temp_ORM_Packer", use_float=is_exr, filepath=full_save_path, file_format=file_format)
+        
+        # Cleanup loaded source images from memory
+        for img in [img_ao, img_rgh, img_met]:
+            if img: bpy.data.images.remove(img)
+
+def create_clean_proxy(context, obj):
+    """
+    Creates a temporary duplicate of the object for baking.
+    FIXED: Makes Materials UNIQUE to prevent baking conflicts with the original.
+    """
+    assetify_settings = context.scene.assetify_bake_settings
+
+    # 1. Create Duplicate (Deep copy of mesh data)
+    proxy = obj.copy()
+    proxy.data = obj.data.copy() 
+    context.scene.collection.objects.link(proxy)
+    
+    # 2. Swap Names
+    original_name = obj.name
+    obj.name = f"{original_name}_ORIGINAL_HIDDEN"
+    proxy.name = original_name
+    
+    # 3. Hide Original
+    obj.hide_viewport = True
+    obj.hide_render = True
+    
+    # --- FIX: MAKE MATERIALS UNIQUE ---
+    # This prevents the Bake Node added to the Proxy from appearing on the Original.
+    # If they share the material, the baker gets confused.
+    for i, slot in enumerate(proxy.material_slots):
+        if slot.material:
+            proxy.material_slots[i].material = slot.material.copy()
+    # ----------------------------------
+
+    # 4. Setup Proxy
+    context.view_layer.objects.active = proxy
+    proxy.select_set(True)
+    
+    # 5. Conditionally Clear Normals
+    if assetify_settings.clear_proxy_normals:
+        print(f"[Assetify] Clearing custom normals for proxy: {proxy.name}")
+        
+        # Remove WeightedNormal modifiers
+        for mod in proxy.modifiers:
+            if mod.type == 'WEIGHTED_NORMAL':
+                proxy.modifiers.remove(mod)
+        
+        # Clear Custom Split Normals
+        try:
+            bpy.ops.mesh.customdata_custom_splitnormals_clear()
+        except: 
+            pass
+    
+    # Ensure Smooth Shading is active (as a base state)
+    bpy.ops.object.shade_smooth()
+    
+    return proxy, original_name
+
+def restore_original_object(context, original_obj, proxy_obj, original_name):
+    """
+    Deletes the proxy and restores the original object's state.
+    Safely handles mesh data deletion.
+    """
+    if not original_obj: return
+
+    # 1. Swap Names Back
+    if proxy_obj:
+        try:
+            proxy_obj.name = f"{original_name}_PROXY_TRASH"
+        except: pass 
+        
+    original_obj.name = original_name
+    
+    # 2. Unhide Original
+    original_obj.hide_viewport = False
+    original_obj.hide_render = False
+    
+    # 3. Delete Proxy and Clean Mesh Data
+    if proxy_obj:
+        mesh_data = proxy_obj.data 
+        
+        for col in list(proxy_obj.users_collection):
+            col.objects.unlink(proxy_obj)
+        
+        try:
+            bpy.data.objects.remove(proxy_obj, do_unlink=True)
+        except: pass
+
+        if mesh_data and mesh_data.users == 0:
+            try:
+                bpy.data.meshes.remove(mesh_data)
+            except: pass
+        
 class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
     """Bake Textures for Unreal Engine with Progress Bar (Modal)"""
     bl_idname = "object.bake_textures_modal"
@@ -4034,9 +4272,8 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
     _bake_index = 0
     _step_index = 0
     _objects_to_bake = []
-    _steps_per_object = 8  # Number of baking steps per object (updated to match baking steps)
+    _steps_per_object = 8 
 
-    # Progress tracking
     progress_value = 0.0
     total_bake_steps = 0
     bake_progress = 0
@@ -4044,11 +4281,11 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
     current_operation = ""
     current_sub_operation = ""
 
-    draw_handler = None
-    space_reference = None
-    
-    skip_save_check: bpy.props.BoolProperty(default=False)
-    
+    # Track Active Proxy
+    _active_proxy = None
+    _active_original = None
+    _active_original_name = ""
+
     def invoke(self, context, event):
         assetify_settings = context.scene.assetify_bake_settings
         if not assetify_settings.skip_save_check:
@@ -4057,55 +4294,33 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
         return self.execute(context)
 
     def execute(self, context):
-        # Reset UV unwrapped objects tracker
-        self._uv_unwrapped_objects = set()
+        self._active_proxy = None
+        self._active_original = None
         
         assetify_settings = context.scene.assetify_bake_settings
-        texture_path = bpy.path.abspath(assetify_settings.bake_folder)
-
-        # Ensure viewport shading is set to solid
         set_viewport_shading_to_solid(context)
-        
-        self.original_material_links = {}
 
-        # Check if we are in 'ASSET' or 'COLLECTION' mode
+        # Collect objects
+        self._objects_to_bake = []
         if assetify_settings.asset_mode == 'ASSET':
-            # Asset Mode: Collect individual assets marked for baking
             self._objects_to_bake = [
-                bpy.data.objects.get(asset.name)
-                for asset in assetify_settings.baked_assets
-                if asset.include_in_send and bpy.data.objects.get(asset.name) is not None
+                bpy.data.objects.get(asset.name) for asset in assetify_settings.baked_assets
+                if asset.include_in_send and bpy.data.objects.get(asset.name)
             ]
         elif assetify_settings.asset_mode == 'COLLECTION':
-            # Collection Mode: Collect all assets within selected collections
-            self._objects_to_bake = []
             for baked_collection in assetify_settings.baked_collections:
                 if baked_collection.include_in_send:
                     collection = bpy.data.collections.get(baked_collection.name)
                     if collection:
                         self._objects_to_bake.extend(self.collect_objects_from_collection(collection))
 
-        # Debug output to verify selected objects
         if not self._objects_to_bake:
-            mode_type = 'asset' if assetify_settings.asset_mode == 'ASSET' else 'collection'
-            self.report({'ERROR'}, f"No objects to bake in {mode_type} mode.")
+            self.report({'ERROR'}, "No objects to bake.")
             return {'CANCELLED'}
-        
-        # Prepare for animation mode
-        if assetify_settings.texturebake_mode == 'ANIMATION':
-            self._frame_index = context.scene.frame_start
-            self._current_frame = context.scene.frame_current
-            self.total_bake_steps = len(self._objects_to_bake) * self._steps_per_object * (context.scene.frame_end - context.scene.frame_start + 1)
-        else:
-            self.total_bake_steps = len(self._objects_to_bake) * self._steps_per_object
 
-        for obj in self._objects_to_bake:
-            if obj and obj.data.materials:
-                self.original_material_links[obj.name] = store_material_links(obj)
-
-        # Run cleanup for images before baking
-        self.cleanup_images_for_baking()
-        
+        # --- NON-PRINCIPLED LOGIC SETUP ---
+        # FIX: We run the logic conversion but DO NOT GROUP IT.
+        # This leaves the generated Principled BSDF exposed for the baker to find.
         if assetify_settings.non_principled_baking:
             for obj in self._objects_to_bake:
                 bpy.context.view_layer.objects.active = obj
@@ -4113,350 +4328,202 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                     if mat:
                         obj.active_material_index = i
                         non_principled_baking.create_mix_chains_and_principled()
-                        non_principled_baking.create_node_group("NonPrincipled Setup")
-
-        # Initialize frame tracking for ANIMATION mode
-        if assetify_settings.texturebake_mode == 'ANIMATION':
-            self._total_frames = context.scene.frame_end - context.scene.frame_start + 1
-        else:
-            self._total_frames = 1
-
-        # Initialize progress tracking and start modal baking process
-        self.bake_progress = 0
+                        # REMOVED: non_principled_baking.create_node_group("NonPrincipled Setup")
+        
+        # Calculate total steps for progress bar
+        steps = 0
+        if assetify_settings.bake_basecolor: steps += 1
+        if assetify_settings.bake_roughness: steps += 1
+        if assetify_settings.bake_metallic: steps += 1
+        if assetify_settings.bake_normal: steps += 1
+        if assetify_settings.bake_ao: steps += 1
+        if assetify_settings.bake_emission: steps += 2
+        if assetify_settings.bake_transmission: steps += 1
+        if assetify_settings.pack_orm: steps += 1 
+        
+        # Post-Processing Actions
+        if assetify_settings.texturebake_mode == 'STILL':
+            steps += 3
+        
+        self._steps_per_object = max(1, steps)
         self.total_bake_steps = len(self._objects_to_bake) * self._steps_per_object
 
+        self.bake_progress = 0
         start_progress_bar(self, initial_message="Baking Selected Assets")
         wm = context.window_manager
         self._timer = wm.event_timer_add(0.1, window=context.window)
         wm.modal_handler_add(self)
 
-        # Update collection statuses before starting bake
-        update_collection_statuses(assetify_settings)
-        
-        if not hasattr(self, '_original_materials'):
-            self._original_materials = {}
-        
-        # Check if ungrouping is enabled
-        if not assetify_settings.ungroup_node_groups:
-            for slot in obj.material_slots:
-                if slot.material:
-                    #if assetify_settings.texturebake_mode == 'STILL' and obj.name not in self._original_materials:
-                    self._original_materials[obj.name] = store_original_materials(obj)  # ✅ Store before ungrouping (only once)
-
-                    ungroup_nodes(slot.material)  # Apply ungrouping
-
-                    #if assetify_settings.texturebake_mode == 'ANIMATION' and obj.name not in self._original_materials:
-                    #self._original_materials[obj.name] = store_original_materials(obj)  # ✅ Store after ungrouping (only once)
-
         return {'RUNNING_MODAL'}
 
-    def cleanup_images_for_baking(self):
-        """Remove all images associated with the objects in self._objects_to_bake."""
-        # Ensure self._objects_to_bake is populated
-        if not self._objects_to_bake:
-            print("No objects to bake, skipping image cleanup.")
-            return
-
-        # Iterate through all images and remove those associated with objects in _objects_to_bake
-        for image in bpy.data.images:
-            # Check if any object name in _objects_to_bake matches part of the image name
-            if any(obj.name in image.name for obj in self._objects_to_bake):
-                image_name = image.name  # Store the name before deleting
-                image.user_clear()       # Clear users of the image
-                bpy.data.images.remove(image)  # Remove the image from Blender
-                print(f"Removed image: {image_name}")
-
     def collect_objects_from_collection(self, collection):
-        """Recursively collect all mesh objects from the collection and its subcollections."""
         objects = []
-        
-        def collect_from_collection(col):
+        def collect(col):
             for obj in col.objects:
-                if obj.type == 'MESH':
-                    objects.append(obj)
-            for subcol in col.children:
-                collect_from_collection(subcol)
-        
-        collect_from_collection(collection)
+                if obj.type == 'MESH': objects.append(obj)
+            for sub in col.children: collect(sub)
+        collect(collection)
         return objects
 
     def modal(self, context, event):
         if event.type == 'ESC':
-            # User pressed ESC to cancel
-            self.report({'WARNING'}, "Baking process canceled by user.")
             self.cancel(context)
             return {'CANCELLED'}
         
         if event.type == 'TIMER':
-            if context.scene.assetify_bake_settings.texturebake_mode == 'ANIMATION':
-                total_frames = context.scene.frame_end - context.scene.frame_start + 1
-                total_steps = total_frames * len(self._objects_to_bake) * self._steps_per_object
+            assetify_settings = context.scene.assetify_bake_settings
+            platform = assetify_settings.platform_target
+            save_dir = bpy.path.abspath(assetify_settings.bake_folder)
 
-                if self._frame_index > context.scene.frame_end:
-                    # Restore original frame
-                    context.scene.frame_set(self._current_frame)
-                    platform = context.scene.assetify_bake_settings.platform_target
-                    
-                    # FINALIZATION FOR ANIMATION MODE:
-                    # For each object, perform UV/Material finalization and apply baked textures.
-                    for obj in self._objects_to_bake:
-                        # Simplify the materials and UV maps
-                        simplify_materials_and_uv_maps(obj)
-                        # Finalize the UV map naming
-                        finalize_uv_maps(obj)
-                        # Apply the baked textures (this will now handle sequences if needed)
-                        apply_baked_textures(obj, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)
-                    
-                    # Finalize baking process
-                    self.current_operation = "Baking Complete."
-                    self.current_sub_operation = ""
-                    print(f"Baking complete for all frames. Removing timer.")
-                    remove_progress_bar(self)
-                    switch_to_solid_shading_and_back()
-                    bpy.context.window_manager.event_timer_remove(self._timer)
+            # --- Define Pipeline Dynamically ---
+            baking_steps = []
+            
+            # 1. Standard Maps
+            if assetify_settings.bake_basecolor:
+                baking_steps.append({"name": "Baking BaseColor", "map": "BaseColor", "type": "DIFFUSE"})
+            if assetify_settings.bake_metallic:
+                baking_steps.append({"name": "Baking Metallic", "map": "Metallic", "type": "COMBINED"})
+            if assetify_settings.bake_roughness:
+                baking_steps.append({"name": "Baking Roughness", "map": "Roughness", "type": "ROUGHNESS"})
+            if assetify_settings.bake_normal:
+                baking_steps.append({"name": "Baking Normal", "map": "Normal", "type": "NORMAL"})
+            if assetify_settings.bake_ao:
+                baking_steps.append({"name": "Baking AO", "map": "Occlusion", "type": "AO"})
+            if assetify_settings.bake_emission:
+                baking_steps.append({"name": "Baking Emission Color", "map": "EmissionColor", "type": "EMIT"})
+                baking_steps.append({"name": "Baking Emission Strength", "map": "EmissionStrength", "type": "EMIT"})
+            if assetify_settings.bake_transmission:
+                baking_steps.append({"name": "Baking Transmission", "map": "Transmission", "type": "EMIT"})
 
-                    # Update baked asset list and statuses
-                    update_baked_asset_list(context)
-                    update_baked_collections_status(context)
-                    context.scene.assetify_bake_settings.assets_baked = True
+            # 2. ORM Packing
+            if assetify_settings.pack_orm:
+                baking_steps.append({"name": "Packing ORM", "type": "ACTION_PACK_ORM", "map": "ORM"})
 
-                    if hasattr(self, 'original_materials'):
-                        del self.original_materials  # Clean up memory
+            # 3. Post-Processing
+            if assetify_settings.texturebake_mode == 'STILL':
+                baking_steps.append({"name": "Simplifying Materials", "type": "ACTION_SIMPLIFY", "map": ""})
+                baking_steps.append({"name": "Finalizing UVs", "type": "ACTION_FINALIZE", "map": ""})
+                baking_steps.append({"name": "Applying Textures", "type": "ACTION_APPLY", "map": ""})
 
-                    self.report({'INFO'}, "Baking operation completed successfully.")
-                    return {'FINISHED'}
-
-                # Update progress based on current frame, object, and step
-                current_step = (
-                    (self._frame_index - context.scene.frame_start) * len(self._objects_to_bake) * self._steps_per_object
-                ) + (self._bake_index * self._steps_per_object) + self._step_index + 1
-                self.progress_value = current_step / total_steps
-                self.progress_value = min(self.progress_value, 1.0)  # Clamp to 1.0
-
-                # Request a redraw for progress bar updates
-                bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
-
-                # Set current frame
-                context.scene.frame_set(self._frame_index)
-                print(f"Baking frame {self._frame_index} - Progress: {self.progress_value * 100:.2f}%")
-                
+            # --- Execution Loop ---
             if self._bake_index < len(self._objects_to_bake):
-                assetify_settings = context.scene.assetify_bake_settings
-                obj = self._objects_to_bake[self._bake_index]
-
-                # Deselect all objects without using bpy.ops
-                for obj_to_deselect in bpy.context.selected_objects:
-                    obj_to_deselect.select_set(False)
-
-                # Select and set the current object as active
-                context.view_layer.objects.active = obj
-                obj.select_set(True)
-                          # Select the object
-
-                platform = context.scene.assetify_bake_settings.platform_target
-
-                if self._step_index == 0:
-                    assetify_settings = context.scene.assetify_bake_settings
-                    # Store original materials before ungrouping
-                    # Ensure we only store original materials once
-                        
-                    #if obj.name not in self._original_materials:  # ✅ Store materials only once per object
-                    #    self._original_materials[obj.name] = store_original_materials(obj)  
-
-                    if not hasattr(self, '_uv_unwrapped_objects'):
-                        self._uv_unwrapped_objects = set()
-
-                    # Perform UV unwrapping only if the object hasn't been unwrapped yet
-                    if obj.name not in self._uv_unwrapped_objects:
-                        if not context.scene.assetify_bake_settings.skip_uv_unwrap:
-                            self.current_sub_operation = "Applying UV Unwrap..."
-                            smart_uv_project(obj)
-                            print(f"UV unwrapped for {obj.name}")
-                            self._uv_unwrapped_objects.add(obj.name)  # Mark as unwrapped
-                        else:
-                            print(f"Skipping UV unwrapping for {obj.name}")
-                    else:
-                        print(f"Object {obj.name} already UV unwrapped, skipping.")
-
-                if platform == 'UNITY':
-                    baking_steps = [
-                        {"name": "Baking BaseColor", "func": lambda: bake_and_save(obj, 'DIFFUSE', 'BaseColor', context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
-                        {"name": "Baking MetallicSmoothness", "func": lambda: bake_and_save(obj, 'COMBINED', 'MetallicSmoothness', context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
-                        {"name": "Baking Normal", "func": lambda: bake_and_save(obj, 'NORMAL', 'Normal', context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
-                        #{"name": "Baking Alpha", "func": lambda: bake_alpha_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder))}
-                    ]
-                    
-                    if context.scene.assetify_bake_settings.bake_alpha:
-                        baking_steps.append({
-                            "name": "Baking Alpha",
-                            "func": lambda: bake_alpha_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder))
-                        })
-                        
-                    if context.scene.assetify_bake_settings.bake_transmission:
-                        baking_steps.append({
-                            "name": "Baking Transmission",
-                            "func": lambda: bake_transmission_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)
-                        })
-                    
-                    if context.scene.assetify_bake_settings.bake_emission:
-                        baking_steps.append({
-                            "name": "Baking Emission Color",
-                            "func": lambda: bake_emission_color_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)
-                        })
-                        baking_steps.append({
-                            "name": "Baking Emission Strength",
-                            "func": lambda: bake_emission_strength_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)
-                        })
-                    
-                    if context.scene.assetify_bake_settings.texturebake_mode == 'STILL':
-                        baking_steps.extend([
-                            {"name": "Simplifying Materials and UV Maps", "func": lambda: simplify_materials_and_uv_maps(obj)},
-                            {"name": "Finalizing UV Map naming", "func": lambda: finalize_uv_maps(obj)},
-                            {"name": "Applying Baked Textures", "func": lambda: apply_baked_textures(obj, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
-                        ])
-                else:
-                    baking_steps = [
-                        {"name": "Baking BaseColor", "func": lambda: bake_and_save(obj, 'DIFFUSE', 'BaseColor', context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
-                        {"name": "Baking Roughness", "func": lambda: bake_and_save(obj, 'ROUGHNESS', 'Roughness', context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
-                        {"name": "Baking Metallic", "func": lambda: bake_and_save(obj, 'COMBINED', 'Metallic', context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
-                        {"name": "Baking Normal", "func": lambda: bake_and_save(obj, 'NORMAL', 'Normal', context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
-                        #{"name": "Baking Alpha", "func": lambda: bake_alpha_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder))}
-                    ]
-                    
-                    if context.scene.assetify_bake_settings.bake_alpha:
-                        baking_steps.append({
-                            "name": "Baking Alpha",
-                            "func": lambda: bake_alpha_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder))
-                        })
-                        
-                    if context.scene.assetify_bake_settings.bake_transmission:
-                        baking_steps.append({
-                            "name": "Baking Transmission",
-                            "func": lambda: bake_transmission_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)
-                        })
-                    
-                    if context.scene.assetify_bake_settings.bake_emission:
-                        baking_steps.append({
-                            "name": "Baking Emission Color",
-                            "func": lambda: bake_emission_color_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)
-                        })
-                        baking_steps.append({
-                            "name": "Baking Emission Strength",
-                            "func": lambda: bake_emission_strength_map(obj, context.scene.assetify_bake_settings.bake_resolution, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)
-                        })
-                    
-                    if context.scene.assetify_bake_settings.texturebake_mode == 'STILL':
-                        baking_steps.extend([
-                            {"name": "Simplifying Materials and UV Maps", "func": lambda: simplify_materials_and_uv_maps(obj)},
-                            {"name": "Finalizing UV Map naming", "func": lambda: finalize_uv_maps(obj)},
-                            {"name": "Applying Baked Textures", "func": lambda: apply_baked_textures(obj, bpy.path.abspath(context.scene.assetify_bake_settings.bake_folder), platform)},
-                        ])
-
+                real_obj = self._objects_to_bake[self._bake_index]
+                
                 if self._step_index < len(baking_steps):
                     step = baking_steps[self._step_index]
-
-                    # Debug logs to see the progress
-                    print(f"Starting step {self._step_index + 1}/{len(baking_steps)}: {step['name']} for object {obj.name}")
-                    self.current_operation = f"Baking textures for {obj.name}..."
+                    step_type = step["type"]
+                    self.current_operation = f"Processing {real_obj.name}"
                     self.current_sub_operation = step["name"]
-
-                    try:
-                        step["func"]()  # Execute the step
-                        print(f"Completed step {self._step_index + 1}/{len(baking_steps)}: {step['name']} for object {obj.name}")
-                        self.bake_progress += 1
-                        
-                        # Update progress value
-                        self.progress_value = self.bake_progress / self.total_bake_steps
-                        self.progress_value = min(self.progress_value, 1.0)
-                        
-                        # Request a redraw
-                        bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
-                    except Exception as e:
-                        self.report({'ERROR'}, f"Failed to bake textures for {obj.name}: {str(e)}")
-                        self.current_operation = "Baking Failed."
-                        self.current_sub_operation = "Error encountered."
-                        remove_progress_bar(self)
-                        bpy.context.window_manager.event_timer_remove(self._timer)
-                        return {'CANCELLED'}
-
-                    self._step_index += 1
-                                    
-                else:
-                    if context.scene.assetify_bake_settings.texturebake_mode == 'ANIMATION':
-                        # In ANIMATION mode, restore original materials
-                        if obj.name in self.original_material_links:
-                            #try:
-                            #    restore_material_links(obj, self.original_material_links[obj.name])
-                            #except Exception as e:
-                                print(f"[ERROR] Failed to restore material links for {obj.name}")
-                            #remove_temporary_nodes(obj)  # Clean up temporary nodes
-                    else:
-                        # In STILL mode, KEEP baked textures and skip restoring original materials
-                        print(f"[INFO] Skipping material restoration for {obj.name} in STILL mode.")
-
-                    # Move to the next object or frame
-                    self._bake_index += 1  # Proceed to the next object
-                    self._step_index = 0   # Reset the step index for the new object
-
-                    # Check if all objects have been baked
-                    if self._bake_index >= len(self._objects_to_bake):
-                        if context.scene.assetify_bake_settings.texturebake_mode == 'ANIMATION':
-                            # For animation mode, move to the next frame
-                            self._frame_index += 1
-                            self._bake_index = 0  # Reset the object index for the new frame
-                            return {'PASS_THROUGH'}
-                        else:
-                            # Still mode: Finalize the process
-                            self.current_operation = "Baking Complete."
-                            self.current_sub_operation = ""
-                            print(f"Baking complete for all objects. Removing timer.")
-                            remove_progress_bar(self)
-                            switch_to_solid_shading_and_back()
-                            bpy.context.window_manager.event_timer_remove(self._timer)
-
-                            # Restore original frame if necessary
-                            if hasattr(self, '_current_frame'):
-                                context.scene.frame_set(self._current_frame)
-
-                            update_baked_asset_list(context)
-                            update_baked_collections_status(context)
-                            context.scene.assetify_bake_settings.assets_baked = True
-
-                            # Cleanup
-                            if hasattr(self, 'original_materials'):
-                                del self.original_materials  # Clean up memory
-
-                            self.report({'INFO'}, "Baking operation completed successfully.")
-                            return {'FINISHED'}
                     
-            return {'PASS_THROUGH'}
+                    try:
+                        # --- CASE A: ACTIONS (Post-Process / Packing) ---
+                        if step_type.startswith("ACTION_"):
+                            # Ensure proxy is cleaned up
+                            if self._active_proxy:
+                                restore_original_object(context, self._active_original, self._active_proxy, self._active_original_name)
+                                self._active_proxy = None
+                                self._active_original = None
+
+                            if step_type == "ACTION_PACK_ORM":
+                                perform_orm_packing(real_obj, context)
+                            elif step_type == "ACTION_SIMPLIFY":
+                                simplify_materials_and_uv_maps(real_obj)
+                            elif step_type == "ACTION_FINALIZE":
+                                finalize_uv_maps(real_obj)
+                            elif step_type == "ACTION_APPLY":
+                                apply_baked_textures(real_obj, save_dir, platform)
+
+                        # --- CASE B: BAKING MAPS ---
+                        else:
+                            use_proxy = False
+                            if step["map"] == "Normal" and assetify_settings.clear_proxy_normals:
+                                use_proxy = True
+                            
+                            # Prepare Object
+                            if use_proxy:
+                                if not self._active_proxy:
+                                    self._active_original = real_obj
+                                    self._active_original_name = real_obj.name
+                                    self._active_proxy, _ = create_clean_proxy(context, real_obj)
+                                    
+                                    bpy.ops.object.select_all(action='DESELECT')
+                                    self._active_original.hide_viewport = False 
+                                    self._active_original.select_set(True)
+                                    self._active_proxy.select_set(True)
+                                    context.view_layer.objects.active = self._active_proxy
+                                    
+                                obj_to_process = self._active_proxy
+                            else:
+                                if self._active_proxy:
+                                    restore_original_object(context, self._active_original, self._active_proxy, self._active_original_name)
+                                    self._active_proxy = None
+                                    self._active_original = None
+                                
+                                bpy.ops.object.select_all(action='DESELECT')
+                                real_obj.hide_viewport = False
+                                real_obj.hide_render = False
+                                real_obj.select_set(True)
+                                context.view_layer.objects.active = real_obj
+                                obj_to_process = real_obj
+
+                            # Unwrap Once
+                            if self._step_index == 0 and not assetify_settings.skip_uv_unwrap:
+                                 if not real_obj.get("assetify_unwrapped"):
+                                     smart_uv_project(real_obj)
+                                     real_obj["assetify_unwrapped"] = True
+
+                            # Special Handling for Emission Maps
+                            if step["map"] == "EmissionColor":
+                                bake_emission_color_map(obj_to_process, assetify_settings.bake_resolution, save_dir, platform)
+                            elif step["map"] == "EmissionStrength":
+                                bake_emission_strength_map(obj_to_process, assetify_settings.bake_resolution, save_dir, platform)
+                            elif step["map"] == "Transmission":
+                                bake_transmission_map(obj_to_process, assetify_settings.bake_resolution, save_dir, platform)
+                            else:
+                                # Standard Bake
+                                bake_and_save(
+                                    obj_to_process, 
+                                    step["type"], 
+                                    step["map"], 
+                                    assetify_settings.bake_resolution, 
+                                    save_dir, 
+                                    platform
+                                )
+                        
+                        self.bake_progress += 1
+                        self.progress_value = min(self.bake_progress / self.total_bake_steps, 1.0)
+                        bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+                        
+                    except Exception as e:
+                        print(f"Error processing {step['name']}: {e}")
+                    
+                    self._step_index += 1
+                else:
+                    # Object Finished
+                    if self._active_proxy:
+                        restore_original_object(context, self._active_original, self._active_proxy, self._active_original_name)
+                        self._active_proxy = None
+                    
+                    self._bake_index += 1
+                    self._step_index = 0
+            
+            else:
+                # All Done
+                self.current_operation = "Baking Complete."
+                remove_progress_bar(self)
+                switch_to_solid_shading_and_back()
+                context.window_manager.event_timer_remove(self._timer)
+                return {'FINISHED'}
 
         return {'PASS_THROUGH'}
 
     def cancel(self, context):
-        # Cleanup in case of cancellation
-        self.current_operation = "Baking Cancelled."
-        self.current_sub_operation = ""
+        if self._active_proxy:
+             restore_original_object(context, self._active_original, self._active_proxy, self._active_original_name)
         remove_progress_bar(self)
-
-        for obj in self._objects_to_bake:
-            if obj.name in self.original_material_links and not context.scene.assetify_bake_settings.ungroup_node_groups:
-                restore_material_links(obj, self.original_material_links[obj.name])
-            remove_temporary_nodes(obj)  # Clean up temporary nodes
-
-        if self._timer:
-            bpy.context.window_manager.event_timer_remove(self._timer)
-
-        # Reset baking state
-        self._step_index = 0
-        self._bake_index = 0
-        self.bake_progress = 0.0
-        self.progress_value = 0.0
-
-        self.skip_save_check = False
-
-        self.report({'INFO'}, "Baking operation canceled.")
-            
+        if self._timer: context.window_manager.event_timer_remove(self._timer)
+        self.report({'INFO'}, "Baking cancelled.")
+        
 def debug_print(message):
     """Helper function to print debug information."""
     print(f"[DEBUG]: {message}")
@@ -4559,71 +4626,147 @@ def ensure_optix_denoiser():
         scene.cycles.use_denoising = False
         print("[DEBUG] No compatible denoiser available, disabling denoising.")
         
+def distribute_uvs_to_udims(obj, tile_count):
+    """
+    Distributes UV islands across UDIM tiles by packing bins into 0-1 
+    and then shifting the UV coordinates directly.
+    """
+    import bmesh
+    import bpy
+    
+    me = obj.data
+    bm = bmesh.from_edit_mesh(me)
+    uv_layer = bm.loops.layers.uv.verify()
+    
+    # 1. Detect UV Islands
+    islands = []
+    faces_processed = set()
+    
+    for face in bm.faces:
+        if face in faces_processed:
+            continue
+        
+        island_faces = {face}
+        stack = [face]
+        
+        while stack:
+            f = stack.pop()
+            faces_processed.add(f)
+            
+            for edge in f.edges:
+                for linked_face in edge.link_faces:
+                    if linked_face not in faces_processed and linked_face not in island_faces:
+                        island_faces.add(linked_face)
+                        stack.append(linked_face)
+        
+        islands.append(list(island_faces))
+
+    # 2. Distribute Islands into Bins (Simple Area Balancing)
+    bins = [[] for _ in range(tile_count)]
+    bin_areas = [0.0] * tile_count
+    
+    # Sort by face count (approximate size)
+    islands.sort(key=len, reverse=True)
+    
+    for island in islands:
+        min_bin_idx = bin_areas.index(min(bin_areas))
+        bins[min_bin_idx].extend(island)
+        bin_areas[min_bin_idx] += len(island)
+
+    # 3. Pack and Move Each Bin
+    for i, bin_faces in enumerate(bins):
+        if not bin_faces:
+            continue
+            
+        # Deselect everything first
+        bpy.ops.mesh.select_all(action='DESELECT')
+        
+        # Select faces in this bin
+        for face in bin_faces:
+            face.select = True
+        
+        # Force update so the operator sees the selection
+        bmesh.update_edit_mesh(me)
+            
+        # Pack these faces into the 0-1 unit square
+        bpy.ops.uv.pack_islands(
+            udim_source='CLOSEST_UDIM', 
+            rotate=False,
+            scale=True,
+            margin=0.001
+        )
+        
+        # 4. Offset UVs to the correct UDIM Tile
+        # Tile 0 (1001) = No offset
+        # Tile 1 (1002) = +1 U offset
+        u_offset = i % 10
+        v_offset = i // 10
+        
+        if u_offset > 0 or v_offset > 0:
+            # We must modify the UVs directly in the BMesh
+            # Re-acquire BMesh after operator might have touched it
+            # (Though pack_islands usually plays nice, let's be safe by iterating current selection)
+            for face in bm.faces:
+                if face.select:
+                    for loop in face.loops:
+                        loop[uv_layer].uv.x += u_offset
+                        loop[uv_layer].uv.y += v_offset
+        
+    # Final Update
+    bmesh.update_edit_mesh(me)
+        
 def smart_uv_project(obj):
     """
-    Adds a new UV map called 'GameUV', applies Smart UV Project, and packs UV islands efficiently.
-    If the object has an attribute named 'UVMap', it converts that to a real UV map first unless a 'UVMap' already exists.
+    Adds a clean 'GameUV' map, applies Smart UV Project, and handles UDIM distribution.
+    Running this on the Original Object first ensures consistency.
     """
     if obj.type != 'MESH':
-        debug_print(f"{obj.name} is not a mesh, skipping UV project.")
         return
 
-    # Ensure we're in object mode
+    assetify_settings = bpy.context.scene.assetify_bake_settings
+    use_udim = assetify_settings.use_udim
+    tile_count = assetify_settings.udim_tiles
+
+    # Ensure we're in object mode to setup layers
     bpy.ops.object.mode_set(mode='OBJECT')
 
-    # UV map name to be used for this object
     uv_map_name = "GameUV"
-
-    # Create 'GameUV' if it doesn't exist and ensure it's activated
-    if uv_map_name not in obj.data.uv_layers:
-        obj.data.uv_layers.new(name=uv_map_name)
-        debug_print(f"Created new UV map '{uv_map_name}' for {obj.name}")
     
-    # Ensure that the 'GameUV' UV layer is active
-    uv_layer_index = obj.data.uv_layers.find(uv_map_name)
-    if uv_layer_index != obj.data.uv_layers.active_index:
-        obj.data.uv_layers.active_index = uv_layer_index
-        debug_print(f"Set UV map '{uv_map_name}' as active for {obj.name}")
+    # 1. CLEANUP: Remove existing GameUV if it exists to prevent duplicates
+    if uv_map_name in obj.data.uv_layers:
+        obj.data.uv_layers.remove(obj.data.uv_layers[uv_map_name])
 
-    # Switch to edit mode
+    # 2. Create fresh UV Layer
+    uv_layer = obj.data.uv_layers.new(name=uv_map_name)
+    obj.data.uv_layers.active = uv_layer
+    
+    # Switch to edit mode for operations
     bpy.ops.object.mode_set(mode='EDIT')
-
-    # Ensure that the 'GameUV' UV layer is active in edit mode
-    obj.data.uv_layers.active_index = uv_layer_index
-    debug_print(f"Set UV map '{uv_map_name}' as active in edit mode for {obj.name}")
-
-    # Select all faces
     bpy.ops.mesh.select_all(action='SELECT')
 
-    # Apply Smart UV Project
+    # 3. Initial Smart Project (Everything goes to 0-1)
     bpy.ops.uv.smart_project(
         angle_limit=m.radians(66.0),
-        island_margin=0.0,
+        island_margin=0.001,
         area_weight=0.0,
-        correct_aspect=False,
-        scale_to_bounds=False,
-        margin_method='SCALED',
-        rotate_method='AXIS_ALIGNED_Y'
+        correct_aspect=True,
+        scale_to_bounds=False
     )
-    
-    debug_print(f"Smart UV Project applied to {obj.name}")
 
-    # Pack UV islands
-    bpy.ops.uv.pack_islands(
-        udim_source='CLOSEST_UDIM',
-        rotate=True,
-        rotate_method='ANY',
-        scale=True,
-        merge_overlap=False,
-        margin_method='SCALED',
-        margin=0.001,
-        pin=False,
-        pin_method='LOCKED',
-        shape_method='CONCAVE',
-    )
-    debug_print(f"Packed UV islands for {obj.name}")
+    # 4. Distribute to UDIMs if enabled
+    if use_udim and tile_count > 1:
+        print(f"[Assetify] Distributing UVs across {tile_count} UDIM tiles...")
+        distribute_uvs_to_udims(obj, tile_count)
+    else:
+        # Standard Single Tile Pack (Ensures nothing drifts outside 0-1)
+        bpy.ops.uv.pack_islands(
+            udim_source='CLOSEST_UDIM',
+            rotate=True,
+            scale=True,
+            margin=0.001
+        )
 
-    # Return to object mode
+    # Return to Object Mode
     bpy.ops.object.mode_set(mode='OBJECT')
     
 def convert_uvmap_attribute_to_uv_layer(obj):
@@ -5097,10 +5240,34 @@ def process_collection(collection, game_ready_collection, assetify_settings, mai
 # === Baking Functionality for Unreal Engine ===
 
 def create_bake_image(obj, map_type, resolution):
-    """Create a new blank image to use for baking."""
+    """Create a new blank image (Tiled/UDIM if enabled) for baking."""
+    assetify_settings = bpy.context.scene.assetify_bake_settings
     width = height = int(resolution)
     image_name = f"{obj.name}_{map_type}"
-    image = bpy.data.images.new(image_name, width=width, height=height)
+    
+    # Check if image exists
+    image = bpy.data.images.get(image_name)
+    if image:
+        # If settings changed (e.g. UDIM vs Single), we might want to recreate it
+        # For safety, remove old and recreate
+        bpy.data.images.remove(image)
+
+    # Create new image
+    image = bpy.data.images.new(image_name, width=width, height=height, tiled=assetify_settings.use_udim)
+    
+    if assetify_settings.use_udim:
+        image.source = 'TILED'
+        # Generate the requested number of tiles (1001, 1002, etc.)
+        # By default, 'new' creates 1001. We add more if needed.
+        target_tiles = assetify_settings.udim_tiles
+        
+        # Ensure we have the correct number of tiles
+        current_tiles = len(image.tiles)
+        if current_tiles < target_tiles:
+            for i in range(current_tiles, target_tiles):
+                # Add tile: index 1001 + i
+                image.tiles.new(tile_number=1001 + i)
+                
     return image
 
 def assign_image_to_material(obj, image, map_type):
@@ -5147,321 +5314,500 @@ def debug_print_image_assignments(obj, map_type):
             debug_print(f"Material '{mat.name}': No image node found for '{map_type}' or no image assigned.")
     
     debug_print(f"--- End of Image Assignments ---\n")
-        
+
 def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"):
-    """Bake the specified map and save it as an image in the given directory, with override functionality."""
+    """
+    Bakes maps. 
+    - Handles Bake-to-Self vs Selected-to-Active.
+    - Initializes file paths/primers.
+    - ALWAYS disconnects Metallic for BaseColor bakes (Standard OR Non-Principled).
+    - ALWAYS restores Metallic links immediately after.
+    """
+    import os, bpy
     assetify_settings = bpy.context.scene.assetify_bake_settings
 
-    # Set render device (CPU or GPU)
-    bpy.context.scene.cycles.device = assetify_settings.render_device.upper()
+    # --- 0. Determine Format ---
+    is_exr = assetify_settings.bake_format == 'OPEN_EXR'
+    ext = ".exr" if is_exr else ".png"
+    file_format = 'OPEN_EXR' if is_exr else 'PNG'
+    target_colorspace = 'Non-Color' 
     
-        # Ensure resolution is an integer
-    resolution = int(resolution)
+    if map_type in ["BaseColor", "Diffuse", "EmissionColor"]:
+        target_colorspace = 'sRGB'
 
-    # Set tile size for Cycles (Blender 3.0+)
+    # --- 1. Render Settings ---
+    bpy.context.scene.cycles.device = assetify_settings.render_device.upper()
+    resolution = int(resolution)
+    
     if assetify_settings.use_tiling:
         bpy.context.scene.cycles.tile_size = assetify_settings.tile_size
-        print(f"[DEBUG] Using tiling with size {assetify_settings.tile_size}")
     else:
-        # To bake in one pass, set the tile size to the full resolution
         bpy.context.scene.cycles.tile_size = int(resolution)
-        print("[DEBUG] Tiling disabled. Baking in one pass.")
 
-    print(f"[DEBUG] Using {assetify_settings.render_device} with tile size {assetify_settings.tile_size}")
-
-    # Ensure Cycles render engine is active
     ensure_cycles_render_engine()
-
-    # Ensure GPU rendering if available and selected
     if assetify_settings.render_device == 'GPU':
         ensure_gpu_rendering()
+    
+    bpy.context.scene.cycles.use_denoising = False
 
-    # Ensure OptiX denoiser if available
-    ensure_optix_denoiser()
+    # --- Determine Baking Method ---
+    selected = bpy.context.selected_objects
+    use_selected_to_active = False
+    
+    # If selection exists and isn't just self, assume Proxy/Cage logic
+    if len(selected) > 1 or (selected and selected[0] != obj):
+        use_selected_to_active = True
+        bpy.context.scene.render.bake.cage_extrusion = 0.01 
+    
+    bpy.context.scene.render.bake.use_selected_to_active = use_selected_to_active
+    bpy.context.scene.render.bake.use_cage = False
+    
+    print(f"[Assetify] Baking {map_type} on {obj.name}. Selected-to-Active: {use_selected_to_active}")
 
-    # Determine file path and frame-specific folder structure
-    if assetify_settings.texturebake_mode == 'ANIMATION':
-        # Create subfolder for the object
+    if map_type == "Normal":
+        bpy.context.scene.render.bake.normal_space = 'TANGENT'
+
+    # --- 2. Setup Paths ---
+    is_anim = assetify_settings.texturebake_mode == 'ANIMATION'
+    use_udim = assetify_settings.use_udim
+    
+    if is_anim:
+        frame_number = bpy.context.scene.frame_current
         object_folder = os.path.join(save_dir, f"{obj.name}_textures")
-        os.makedirs(object_folder, exist_ok=True)
-
-        # Create subfolder for the map type
         map_folder = os.path.join(object_folder, map_type)
         os.makedirs(map_folder, exist_ok=True)
-
-        # Generate file name based on the current frame
-        frame_number = bpy.context.scene.frame_current
-        file_name = f"Frame{frame_number:04d}.png"
-        texture_file_path = os.path.join(map_folder, file_name)
+        base_name = f"Frame{frame_number:04d}"
+        target_dir = map_folder
     else:
-        # For STILL mode, save in a single "textures" folder
         textures_folder = os.path.join(save_dir, "textures")
         os.makedirs(textures_folder, exist_ok=True)
+        base_name = f"{obj.name}_{map_type}"
+        target_dir = textures_folder
 
-        # Save the map directly in the "textures" folder
-        texture_file_path = os.path.join(textures_folder, f"{obj.name}_{map_type}.png")
+    # --- 3. Initialize Files (Primer) ---
+    if use_udim:
+        target_tiles = assetify_settings.udim_tiles
+        for img in list(bpy.data.images):
+            if img.name.startswith("temp_primer"):
+                bpy.data.images.remove(img)
 
-    # Delete the file if it already exists
-    if os.path.exists(texture_file_path):
-        os.remove(texture_file_path)
-        print(f"[DEBUG] Removed existing file: {texture_file_path}")
+        temp_img = bpy.data.images.new("temp_primer", width=resolution, height=resolution, alpha=True, float_buffer=is_exr, tiled=False)
+        temp_img.colorspace_settings.name = target_colorspace
+        temp_img.generated_color = (0.0, 0.0, 0.0, 0.0)
+        
+        for i in range(target_tiles):
+            tile_id = 1001 + i
+            fname = f"{base_name}.{tile_id}{ext}"
+            fpath = os.path.join(target_dir, fname)
+            temp_img.filepath_raw = fpath
+            temp_img.file_format = file_format
+            temp_img.save()
+        bpy.data.images.remove(temp_img)
+        
+        image_filepath = os.path.join(target_dir, f"{base_name}.<UDIM>{ext}")
+    else:
+        fname = f"{base_name}{ext}"
+        fpath = os.path.join(target_dir, fname)
+        if os.path.exists(fpath): os.remove(fpath)
+        
+        temp_img = bpy.data.images.new("temp_primer_single", width=resolution, height=resolution, alpha=True, float_buffer=is_exr)
+        temp_img.colorspace_settings.name = target_colorspace
+        temp_img.generated_color = (0.0, 0.0, 0.0, 0.0)
+        temp_img.filepath_raw = fpath
+        temp_img.file_format = file_format
+        temp_img.save()
+        bpy.data.images.remove(temp_img)
+        
+        image_filepath = fpath
 
-    # Create a new bake image for each frame
-    image_name = f"{obj.name}_{map_type}_Frame{bpy.context.scene.frame_current:04d}"
-    image = bpy.data.images.get(image_name) or bpy.data.images.new(
+    # --- 4. Create Main Bake Image ---
+    image_name = f"{base_name}"
+    existing = bpy.data.images.get(image_name)
+    if existing: bpy.data.images.remove(existing)
+
+    image = bpy.data.images.new(
         name=image_name,
         width=resolution,
         height=resolution,
-        alpha=True
+        alpha=True,
+        tiled=use_udim,
+        float_buffer=is_exr
     )
-    image.colorspace_settings.name = 'Non-Color' if map_type in ["Roughness", "Normal", "Metallic"] else 'sRGB'
+    image.colorspace_settings.name = target_colorspace
+    image.filepath_raw = image_filepath
+    image.filepath = image_filepath
+    
+    if use_udim:
+        image.source = 'TILED'
+        target_tiles = assetify_settings.udim_tiles
+        if len(image.tiles) < target_tiles:
+            for i in range(len(image.tiles), target_tiles):
+                image.tiles.new(tile_number=1001 + i)
 
-    # Store original material links for restoration
-    original_material_links = {}
-
+    # --- 5. Node Assignment ---
     for mat_slot in obj.material_slots:
-        if mat_slot.material and mat_slot.material.use_nodes:
-            node_tree = mat_slot.material.node_tree
-
-            # Save original links for restoration
-            material_output = next((node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
-            if material_output:
-                original_material_links[mat_slot.material.name] = [
-                    (link.from_socket, link.to_socket)
-                    for link in node_tree.links
-                    if link.to_node == material_output
-                ]
-
-            # Remove previously added texture nodes for this bake
-            nodes_to_remove = [
-                node for node in node_tree.nodes
-                if node.type == 'TEX_IMAGE' and node.image and node.image.name.startswith(f"{obj.name}_{map_type}")
-            ]
-            for node in nodes_to_remove:
-                node_tree.nodes.remove(node)
-
-            # Create a new texture node for the current frame
-            tex_node = node_tree.nodes.new(type='ShaderNodeTexImage')
-            tex_node.image = image
-            node_tree.nodes.active = tex_node  # Set as active for baking
-
-    if platform == "UNITY" and map_type == "MetallicSmoothness":
-        # Step 1: Bake the roughness map (but don't save the individual roughness map)
-        roughness_image = create_bake_image(obj, "Roughness", resolution)
-        assign_image_to_material(obj, roughness_image, "Roughness")
-        roughness_image.colorspace_settings.name = 'Non-Color'
-        # Bake roughness (in Blender, roughness is already in the right form)
-        bpy.context.scene.cycles.bake_type = 'ROUGHNESS'
-        bpy.ops.object.bake(type='ROUGHNESS')
-
-        # Step 2: Check if metallic input is connected
-        metallic_image = create_bake_image(obj, "Metallic", resolution)
-        metallic_image.colorspace_settings.name = 'Non-Color'
-        if is_metallic_input_connected(obj):
-            # If metallic input is connected, bake the metallic map using emission
-            bake_metallic_as_emission(
-                 obj,
-                 resolution,
-                 bpy.path.abspath(bpy.context.scene.assetify_bake_settings.bake_folder),
-                 platform
-            )
-        else:
-            # If metallic input is not connected, bake a black metallic map
-            assign_image_to_material(obj, metallic_image, "Metallic")
-            bpy.context.scene.cycles.bake_type = 'EMIT'
-            bpy.ops.object.bake(type='EMIT')
-
-        # Step 3: Pack metallic into Red and inverted roughness into Alpha channel
-        packed_image = pack_metallic_roughness(metallic_image, roughness_image, output_image_name=f"{obj.name}_MetallicSmoothness")
-
-        # Save the packed image
-        packed_image.filepath_raw = os.path.join(textures_folder, f"{obj.name}_MetallicSmoothness.png")
-        packed_image.file_format = 'PNG'
-        packed_image.save()
-
-        debug_print(f"Packed Roughness/Metallic for {obj.name} and saved as {packed_image.filepath_raw}")
+        if not (mat_slot.material and mat_slot.material.use_nodes): continue
+        node_tree = mat_slot.material.node_tree
         
-        # Restore original material setup
-        for mat_slot in obj.material_slots:
-            if mat_slot.material and mat_slot.material.use_nodes:
-                node_tree = mat_slot.material.node_tree
+        # Cleanup old nodes
+        for n in list(node_tree.nodes):
+            if n.type == 'TEX_IMAGE' and n.label == "ASSETIFY_BAKE":
+                node_tree.nodes.remove(n)
 
-                # Remove previously added texture nodes for this bake
-                nodes_to_remove = [
-                    node for node in node_tree.nodes
-                    if node.type == 'TEX_IMAGE' and node.image and node.image.name.startswith(f"{obj.name}_{map_type}")
-                ]
-                for node in nodes_to_remove:
-                    node_tree.nodes.remove(node)
+        tex_node = node_tree.nodes.new('ShaderNodeTexImage')
+        tex_node.image = image
+        tex_node.name = f"Bake_{map_type}"
+        tex_node.label = "ASSETIFY_BAKE"
+        tex_node.select = True
+        node_tree.nodes.active = tex_node
 
-                # Restore original links to the material output node
-                material_output = next((node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
-                original_links = original_material_links.get(mat_slot.material.name, [])
-                for link in list(node_tree.links):
-                    if link.to_node == material_output:
-                        node_tree.links.remove(link)
-                for from_socket, to_socket in original_links:
-                    node_tree.links.new(from_socket, to_socket)
-        
-        return packed_image
+    # --- 6. Metallic Special Case ---
+    if map_type == "Metallic":
+        return bake_metallic_as_emission(obj, resolution, save_dir, platform)
 
-    # Handle regular baking for UE5 or other platforms
-    else:
-        # Proceed with the regular baking process for other map types (e.g., BaseColor, Normal, etc.)
-        image = create_bake_image(obj, map_type, resolution)
-        
-        if map_type in ["Roughness", "Normal", "Metallic"]:
-            image.colorspace_settings.name = 'Non-Color'
-        
-        assign_image_to_material(obj, image, map_type)
+    # --- 7. Bake Logic & PREPARATION ---
+    
+    # Track metallic connections to restore them later
+    metallic_restore_data = {} 
 
-        # Store original metallic settings to restore after baking
-        metallic_settings = {}
-        if map_type == "BaseColor":
-            # Disconnect metallic inputs and store their original values/links,
-            # then set them to 0 for the bake.
-            for mat in obj.data.materials:
-                if not mat.use_nodes:
-                    continue
-
-                node_tree = mat.node_tree
-                # Find the Principled BSDF node connected to the Material Output.
-                principled_node = find_principled_from_output(node_tree)
-                if not principled_node:
-                    print(f"[WARNING] No Principled BSDF connected to the Material Output in material {mat.name}, skipping metallic disconnect.")
-                    continue
-
-                metallic_input = principled_node.inputs['Metallic']
-                # If the input is linked, store the link details; otherwise, store the default value.
-                if metallic_input.is_linked:
-                    # Assume only one link exists for simplicity.
-                    link = metallic_input.links[0]
-                    metallic_settings[mat.name] = (link.from_node.name, link.from_socket.name)
-                    node_tree.links.remove(link)
+    if map_type == "BaseColor":
+        # CRITICAL FIX: ALWAYS Perform disconnect, regardless of mode.
+        # Even non-principled mode generates a BSDF that must be disconnected.
+        for mat in obj.data.materials:
+            if not (mat and mat.use_nodes): continue
+            nt = mat.node_tree
+            
+            # Helper to find BSDF (Using the global helper is safer)
+            p_node = find_principled_from_output(nt)
+            
+            # Fallback simple search if helper fails or isn't defined in scope
+            if not p_node:
+                for n in nt.nodes:
+                    if n.type == 'BSDF_PRINCIPLED': 
+                        p_node = n
+                        break
+            
+            if not p_node: continue
+            
+            m_in = p_node.inputs.get('Metallic')
+            if m_in:
+                if m_in.is_linked:
+                    # Save the link: (From Node, From Socket, None)
+                    link = m_in.links[0]
+                    metallic_restore_data[mat.name] = (link.from_node, link.from_socket, None)
+                    nt.links.remove(link) # DISCONNECT
+                    print(f"[Assetify] Disconnected Metallic for {mat.name} (BaseColor Bake)")
                 else:
-                    metallic_settings[mat.name] = metallic_input.default_value
-                # Set metallic to 0 for the baking process.
-                metallic_input.default_value = 0
+                    # Save the value: (None, None, Value)
+                    metallic_restore_data[mat.name] = (None, None, m_in.default_value)
+                    m_in.default_value = 0.0 # Force 0 for Albedo Bake
+                    print(f"[Assetify] Zeroed Metallic for {mat.name} (BaseColor Bake)")
 
-            bpy.context.scene.cycles.bake_type = 'DIFFUSE'
-            bpy.context.scene.render.bake.use_pass_direct = assetify_settings.bake_direct_light
-            bpy.context.scene.render.bake.use_pass_indirect = assetify_settings.bake_indirect_light
-            bpy.context.scene.render.bake.use_pass_color = True
-            bake_type_used = 'DIFFUSE'
-        elif map_type == "Normal":
-            bpy.context.scene.cycles.bake_type = 'NORMAL'
-            bake_type_used = 'NORMAL'
-            bpy.context.scene.render.bake.normal_space = 'TANGENT'
-        elif map_type == "Roughness":
-            bpy.context.scene.cycles.bake_type = 'ROUGHNESS'
-            bake_type_used = 'ROUGHNESS'
-        elif map_type == "Metallic":
-            # Correctly bake the metallic map using emission
-            bake_metallic_as_emission(
-                 obj,
-                 resolution,
-                 bpy.path.abspath(bpy.context.scene.assetify_bake_settings.bake_folder),
-                 platform
-            )
-#            image.filepath_raw = texture_file_path
-#            image.file_format = 'PNG'
-#            image.save()
-#            debug_print(f"Baked {map_type} for {obj.name} and saved as {image.filepath_raw}")
-#            return image
+        bpy.context.scene.cycles.bake_type = 'DIFFUSE'
+        bpy.context.scene.render.bake.use_pass_color = True
+        bpy.context.scene.render.bake.use_pass_direct = assetify_settings.bake_direct_light
+        bpy.context.scene.render.bake.use_pass_indirect = assetify_settings.bake_indirect_light
+    
+    elif map_type == "Normal":
+        bpy.context.scene.cycles.bake_type = 'NORMAL'
+    elif map_type == "Roughness":
+        bpy.context.scene.cycles.bake_type = 'ROUGHNESS'
+    elif map_type == "Occlusion":
+        bpy.context.scene.cycles.bake_type = 'AO'
+
+    # EXECUTE BAKE
+    try:
+        bpy.ops.object.bake(type=bpy.context.scene.cycles.bake_type)
+    except Exception as e:
+        print(f"[ERROR] Bake failed for {map_type}: {e}")
+    
+    # SAVE IMAGE
+    try:
+        image.file_format = file_format
+        image.save(filepath=image_filepath)
+        print(f"[DEBUG] Baked and Saved: {image.filepath}")
+    except Exception as e:
+        print(f"[WARNING] Final save error: {e}")
+
+    # --- 8. CLEANUP & RESTORE ---
+    
+    # RESTORE METALLIC (Critical Step)
+    if map_type == "BaseColor":
+        for mat in obj.data.materials:
+            if not (mat and mat.use_nodes): continue
+            
+            # Retrieve backup data
+            if mat.name not in metallic_restore_data: continue
+            from_node, from_socket, default_val = metallic_restore_data[mat.name]
+            
+            nt = mat.node_tree
+            
+            # Find the node again
+            p_node = find_principled_from_output(nt)
+            if not p_node:
+                for n in nt.nodes:
+                    if n.type == 'BSDF_PRINCIPLED': 
+                        p_node = n
+                        break
+            
+            if not p_node: continue
+            m_in = p_node.inputs.get('Metallic')
+            if not m_in: continue
+
+            # Restore Logic
+            if from_node and from_socket:
+                try:
+                    nt.links.new(from_socket, m_in)
+                    print(f"[Assetify] Reconnected Metallic for {mat.name}")
+                except Exception as e:
+                    print(f"[Assetify] Failed to reconnect metallic: {e}")
+            elif default_val is not None:
+                m_in.default_value = default_val
+                print(f"[Assetify] Restored Metallic value for {mat.name}")
+
+    # Remove the temp nodes
+    for mat_slot in obj.material_slots:
+        if not (mat_slot.material and mat_slot.material.use_nodes): continue
+        node_tree = mat_slot.material.node_tree
+        for n in list(node_tree.nodes):
+            if n.type == 'TEX_IMAGE' and n.label == "ASSETIFY_BAKE":
+                node_tree.nodes.remove(n)
+
+    # Mark as baked in UI
+    for ba in assetify_settings.baked_assets:
+        if ba.name == obj.name:
+            ba.is_baked = True
+            break
+            
+    return image
+
+def bake_metallic_as_emission(obj, resolution, save_dir, platform):
+    """
+    Bake metallic map using emission.
+    MIRRORS DEBUG SCRIPT LOGIC:
+    1. Handles Scalar-to-RGB conversion (Fixes Black Bakes).
+    2. Forces Bake-to-Self (Fixes 'Not Enabled for Rendering' error).
+    """
+    import os, bpy
+    assetify_settings = bpy.context.scene.assetify_bake_settings
+    ensure_cycles_render_engine()
+    resolution = int(resolution)
+    
+    # --- 0. Determine Format ---
+    is_exr = assetify_settings.bake_format == 'OPEN_EXR'
+    ext = ".exr" if is_exr else ".png"
+    file_format = 'OPEN_EXR' if is_exr else 'PNG'
+    target_colorspace = 'Non-Color' 
+    
+    bpy.context.scene.cycles.use_denoising = False
+    
+    # 1. Paths
+    is_anim = assetify_settings.texturebake_mode == 'ANIMATION'
+    use_udim = assetify_settings.use_udim
+
+    if is_anim:
+        frame_number = bpy.context.scene.frame_current
+        object_folder = os.path.join(save_dir, f"{obj.name}_textures")
+        map_folder = os.path.join(object_folder, "Metallic")
+        os.makedirs(map_folder, exist_ok=True)
+        base_name = f"Frame{frame_number:04d}"
+        target_dir = map_folder
+    else:
+        textures_folder = os.path.join(save_dir, "textures")
+        os.makedirs(textures_folder, exist_ok=True)
+        base_name = f"{obj.name}_Metallic"
+        target_dir = textures_folder
+    
+    # --- 2. Initialize Files (Primer) ---
+    if use_udim:
+        target_tiles = assetify_settings.udim_tiles
+        for img in list(bpy.data.images):
+            if img.name.startswith("temp_met_primer"):
+                bpy.data.images.remove(img)
+
+        temp_img = bpy.data.images.new("temp_met_primer", width=resolution, height=resolution, alpha=True, float_buffer=is_exr, tiled=False)
+        temp_img.colorspace_settings.name = target_colorspace
+        temp_img.generated_color = (0.0, 0.0, 0.0, 0.0)
+        
+        for i in range(target_tiles):
+            tile_id = 1001 + i
+            fname = f"{base_name}.{tile_id}{ext}"
+            fpath = os.path.join(target_dir, fname)
+            temp_img.filepath_raw = fpath
+            temp_img.file_format = file_format
+            temp_img.save()
+        bpy.data.images.remove(temp_img)
+        image_filepath = os.path.join(target_dir, f"{base_name}.<UDIM>{ext}")
+    else:
+        fname = f"{base_name}{ext}"
+        fpath = os.path.join(target_dir, fname)
+        if os.path.exists(fpath): os.remove(fpath)
+        
+        temp_img = bpy.data.images.new("temp_met_primer_single", width=resolution, height=resolution, alpha=True, float_buffer=is_exr)
+        temp_img.colorspace_settings.name = target_colorspace 
+        temp_img.generated_color = (0.0, 0.0, 0.0, 0.0)
+        temp_img.filepath_raw = fpath
+        temp_img.file_format = file_format
+        temp_img.save()
+        bpy.data.images.remove(temp_img)
+        image_filepath = fpath
+
+    # 3. Create Main Bake Image
+    image_name = f"{base_name}"
+    existing = bpy.data.images.get(image_name)
+    if existing: bpy.data.images.remove(existing)
+
+    image = bpy.data.images.new(
+        name=image_name, 
+        width=resolution, 
+        height=resolution, 
+        alpha=True, 
+        tiled=use_udim,
+        float_buffer=is_exr
+    )
+    image.colorspace_settings.name = target_colorspace
+    image.filepath_raw = image_filepath
+    image.filepath = image_filepath
+    
+    image.generated_color = (0.0, 0.0, 0.0, 0.0)
+    if image.size[0] > 0: _ = len(image.pixels)
+
+    if use_udim:
+        image.source = 'TILED'
+        if len(image.tiles) < assetify_settings.udim_tiles:
+            for i in range(len(image.tiles), assetify_settings.udim_tiles):
+                image.tiles.new(tile_number=1001 + i)
+
+    # --- HELPERS ---
+    def find_active_output(node_tree):
+        for node in node_tree.nodes:
+            if node.type == 'OUTPUT_MATERIAL' and node.is_active_output: return node
+        for node in node_tree.nodes:
+            if node.type == 'OUTPUT_MATERIAL': return node
+        return None
+
+    # 4. Setup Emission Nodes
+    materials_original_links = {}
+    
+    for mat_slot in obj.material_slots:
+        mat = mat_slot.material
+        if not (mat and mat.use_nodes): continue
+        nt = mat.node_tree
+        
+        # Cleanup any stale temp nodes
+        for n in list(nt.nodes):
+            if n.name.startswith("Assetify_Temp_"): nt.nodes.remove(n)
+            
+        out_node = find_active_output(nt)
+        if not out_node: continue
+
+        # Add Texture Image Node (Target)
+        tex_node = nt.nodes.new('ShaderNodeTexImage')
+        tex_node.image = image
+        tex_node.name = "Assetify_Temp_TEX_" + tex_node.name
+        tex_node.location = (out_node.location.x - 300, out_node.location.y + 300)
+        
+        nt.nodes.active = tex_node 
+        tex_node.select = True
+        
+        # Find Principled BSDF
+        p_node = find_principled_from_output(nt)
+
+        if not p_node:
+            print(f"[WARNING] No connected Principled BSDF found in {mat.name}.")
+            continue
+
+        met_in = p_node.inputs.get('Metallic')
+        
+        # Create Emission Node (Source)
+        emit_node = nt.nodes.new('ShaderNodeEmission')
+        emit_node.name = "Assetify_Temp_Emission_"
+        emit_node.location = (out_node.location.x - 200, out_node.location.y)
+        emit_node.inputs['Strength'].default_value = 1.0 # Force full strength
+        
+        # --- CRITICAL FIX START: MATCHING DEBUG SCRIPT LOGIC ---
+        if met_in and met_in.is_linked:
+            src = met_in.links[0].from_socket
+            
+            # Check if source is SCALAR (Gray socket) or Alpha
+            # If so, we MUST use CombineRGB to convert "Value" -> (R,G,B)
+            if src.type in {'VALUE', 'FLOAT', 'INT', 'BOOLEAN'} or "Alpha" in src.name:
+                combine_node = nt.nodes.new('ShaderNodeCombineRGB')
+                combine_node.name = "Assetify_Temp_Combine_"
+                combine_node.location = (emit_node.location.x - 200, emit_node.location.y)
+                
+                nt.links.new(src, combine_node.inputs['R'])
+                nt.links.new(src, combine_node.inputs['G'])
+                nt.links.new(src, combine_node.inputs['B'])
+                
+                nt.links.new(combine_node.outputs['Image'], emit_node.inputs['Color'])
+                print(f"[DEBUG] {mat.name}: Converted Scalar Metallic to RGB via Combine Node.")
+            else:
+                # Source is likely already Color/Vector, link directly
+                nt.links.new(src, emit_node.inputs['Color'])
+                print(f"[DEBUG] {mat.name}: Linked Metallic Direct.")
         else:
-            bpy.context.scene.cycles.bake_type = bake_type
-            bake_type_used = bake_type
-
-        # Perform the bake if not handled above
-        if map_type != "Metallic":
-            bpy.ops.object.bake(type=bake_type_used)
-            image.filepath_raw = texture_file_path
-            image.file_format = 'PNG'
-            image.save()
-            debug_print(f"Baked {map_type} for {obj.name} and saved as {image.filepath_raw}")
+            v = met_in.default_value if met_in else 0.0
+            emit_node.inputs['Color'].default_value = (v, v, v, 1.0)
+            print(f"[DEBUG] {mat.name}: Using Static Metallic Value: {v}")
+        # --- CRITICAL FIX END ---
             
-            # Restore original metallic settings after baking
-            for mat in obj.data.materials:
-                if not mat.use_nodes:
-                    continue
-
-                node_tree = mat.node_tree
-                principled_node = find_principled_from_output(node_tree)
-                if not principled_node:
-                    continue
-
-                metallic_input = principled_node.inputs['Metallic']
-                saved_setting = metallic_settings.get(mat.name)
-                if saved_setting is not None:
-                    if isinstance(saved_setting, tuple):
-                        # If a link was originally present, restore that link.
-                        from_node_name, from_socket_name = saved_setting
-                        from_node = node_tree.nodes.get(from_node_name)
-                        if from_node:
-                            from_socket = next((sock for sock in from_node.outputs if sock.name == from_socket_name), None)
-                            if from_socket:
-                                try:
-                                    node_tree.links.new(from_socket, metallic_input)
-                                except Exception as e:
-                                    print(f"[ERROR] Could not restore link for {mat.name}: {e}")
-                            else:
-                                print(f"[WARNING] Could not find socket '{from_socket_name}' in node '{from_node_name}' for material {mat.name}")
-                        else:
-                            print(f"[WARNING] Original linking node '{from_node_name}' not found for material {mat.name}")
-                    else:
-                        # Otherwise, restore the default value.
-                        metallic_input.default_value = saved_setting
+        # Hook Emission -> Output Surface
+        surface_input = out_node.inputs.get('Surface')
+        if surface_input and surface_input.is_linked:
+            link = surface_input.links[0]
+            materials_original_links[mat.name] = (link.from_socket, link.to_socket)
+            nt.links.remove(link)
             
-                # Restore original material setup
-                for mat_slot in obj.material_slots:
-                    if mat_slot.material and mat_slot.material.use_nodes:
-                        node_tree = mat_slot.material.node_tree
+        nt.links.new(emit_node.outputs['Emission'], out_node.inputs['Surface'])
 
-                        # Remove previously added texture nodes for this bake
-                        nodes_to_remove = [
-                            node for node in node_tree.nodes
-                            if node.type == 'TEX_IMAGE' and node.image and node.image.name.startswith(f"{obj.name}_{map_type}")
-                        ]
-                        for node in nodes_to_remove:
-                            node_tree.nodes.remove(node)
+    # --- 5. EXECUTE BAKE ---
+    bpy.context.view_layer.update()
+    
+    # FORCE 'BAKE TO SELF' (Fixes "Not enabled for rendering" error)
+    # We are modifying the active object's nodes, so we must bake active-to-active.
+    prev_sel_to_act = bpy.context.scene.render.bake.use_selected_to_active
+    bpy.context.scene.render.bake.use_selected_to_active = False
+    
+    bpy.context.scene.cycles.bake_type = 'EMIT'
+    bpy.context.scene.render.bake.use_pass_direct = False
+    bpy.context.scene.render.bake.use_pass_indirect = False
+    bpy.context.scene.render.bake.use_pass_color = True
 
-                        # Restore original links to the material output node
-                        material_output = next((node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
-                        original_links = original_material_links.get(mat_slot.material.name, [])
-                        for link in list(node_tree.links):
-                            if link.to_node == material_output:
-                                node_tree.links.remove(link)
-                        for from_socket, to_socket in original_links:
-                            node_tree.links.new(from_socket, to_socket)
-            
-            return image
+    try:
+        print(f"[Assetify] Baking Metallic (EMIT) for {obj.name}...")
+        bpy.ops.object.bake(type='EMIT')
+    except Exception as e:
+        print(f"[ERROR] Metallic Bake Error: {e}")
+    finally:
+        # Restore previous bake setting to avoid breaking subsequent maps
+        bpy.context.scene.render.bake.use_selected_to_active = prev_sel_to_act
         
-    # After baking, update the status in the baked asset list
-    assetify_settings = bpy.context.scene.assetify_bake_settings
-    for baked_asset in assetify_settings.baked_assets:
-        if baked_asset.name == obj.name:
-            baked_asset.is_baked = True
-            break
+    try:
+        image.file_format = file_format
+        image.save(filepath=image_filepath)
+        print(f"[DEBUG] Metallic Map Saved to: {image.filepath_raw}")
+    except:
+        pass
 
-def update_baked_status(obj, is_baked):
-    """Update the baked status of an asset in the baked_assets list and in collections."""
-    assetify_settings = bpy.context.scene.assetify_bake_settings
-
-    # Update in baked_assets
-    for asset in assetify_settings.baked_assets:
-        if asset.name == obj.name:
-            asset.is_baked = is_baked
-            print(f"Updated baked_assets: {asset.name} is_baked set to {is_baked}")
-            break
-
-    # Update in baked_collections
-    for baked_collection in assetify_settings.baked_collections:
-        for asset in baked_collection.assets:
-            if asset.name == obj.name:
-                asset.is_baked = is_baked
-                print(f"Updated baked_collection {baked_collection.name}: {asset.name} is_baked set to {is_baked}")
-                break
+    # 6. Cleanup
+    for mat_slot in obj.material_slots:
+        mat = mat_slot.material
+        if not (mat and mat.use_nodes): continue
+        nt = mat.node_tree
         
+        for n in list(nt.nodes):
+            if n.name.startswith("Assetify_Temp_"): nt.nodes.remove(n)
+            
+        if mat.name in materials_original_links:
+            src, dst = materials_original_links[mat.name]
+            try:
+                nt.links.new(src, dst)
+            except Exception as e:
+                pass
+
+    return image
+
 def is_metallic_input_connected(obj):
     """Check if the metallic input is connected in the active material."""
     for mat in obj.data.materials:
@@ -5520,174 +5866,84 @@ def pack_metallic_roughness(metallic_image, roughness_image, output_image_name="
 
     return dst_image
 
-def bake_metallic_as_emission(obj, resolution, save_dir, platform):
-    """Bake the metallic map for all materials on the object into a single image using the emission method."""
-    import os, bpy
-    assetify_settings = bpy.context.scene.assetify_bake_settings
-    ensure_cycles_render_engine()
+def pack_orm_textures(obj, ao_image, roughness_image, metallic_image, output_image_name, use_float=False, filepath=None, file_format='PNG'):
+    """
+    Combines AO, Roughness, and Metallic into one image (ORM).
+    Supports 32-bit Float buffers for OpenEXR.
+    """
+    import numpy as np
+
+    # 1. Determine Dimensions from whichever image exists
+    ref_image = roughness_image or metallic_image or ao_image
+    if not ref_image:
+        return None
+        
+    w, h = ref_image.size
     
-    resolution = int(resolution)
+    # 2. Prepare Target Array (Float32 for precision)
+    # RGBA = 4 channels
+    dst_array = np.zeros(w * h * 4, dtype=np.float32)
     
-    # Setup file paths for Metallic bake
-    if assetify_settings.texturebake_mode == 'ANIMATION':
-        object_folder = os.path.join(save_dir, f"{obj.name}_textures")
-        os.makedirs(object_folder, exist_ok=True)
-        map_folder = os.path.join(object_folder, "Metallic")
-        os.makedirs(map_folder, exist_ok=True)
-        frame_number = bpy.context.scene.frame_current
-        file_name = f"Frame{frame_number:04d}.png"
-        texture_file_path = os.path.join(map_folder, file_name)
-    else:
-        textures_folder = os.path.join(save_dir, "textures")
-        os.makedirs(textures_folder, exist_ok=True)
-        texture_file_path = os.path.join(textures_folder, f"{obj.name}_Metallic.png")
-    
-    if os.path.exists(texture_file_path):
-        os.remove(texture_file_path)
-        print(f"[DEBUG] Removed existing file: {texture_file_path}")
-    
-    # Create or get the bake image
-    image_name = (f"{obj.name}_Metallic_Frame{bpy.context.scene.frame_current:04d}"
-                  if assetify_settings.texturebake_mode == 'ANIMATION'
-                  else f"{obj.name}_Metallic")
-    image = bpy.data.images.get(image_name) or bpy.data.images.new(
-        name=image_name, width=resolution, height=resolution, alpha=True)
-    image.colorspace_settings.name = 'Non-Color'
-    
-    materials_original_links = {}
-    temporary_output_nodes = {}
-    added_nodes = {}  # Dictionary keyed by material name; each value is a list of nodes we add.
-    
-    # Process each material on the object
-    for mat_slot in obj.material_slots:
-        mat = mat_slot.material
-        if not (mat and mat.use_nodes):
-            print(f"[WARNING] Material {mat.name if mat else 'None'} does not use nodes, skipping.")
-            continue
-        node_tree = mat.node_tree
-        
-        # Remove any previously added temporary nodes for this bake.
-        for node in list(node_tree.nodes):
-            if node.name.startswith("Assetify_Temp_"):
-                node_tree.nodes.remove(node)
-        
-        # Create a new texture node for baking and set it active.
-        tex_node = node_tree.nodes.new(type='ShaderNodeTexImage')
-        tex_node.image = image
-        tex_node.name = "Assetify_Temp_TEX_" + tex_node.name
-        node_tree.nodes.active = tex_node
-        added_nodes.setdefault(mat.name, []).append(tex_node)
-        
-        # Find the last Principled BSDF node connected to the Material Output.
-        principled_node = find_principled_from_output(node_tree)
-        if not principled_node:
-            print(f"[WARNING] No Principled BSDF connected to the Material Output in material {mat.name}, skipping metallic bake.")
-            continue
-        
-        # Access the 'Metallic' input from the Principled BSDF.
-        metallic_input = principled_node.inputs.get('Metallic')
-        if not metallic_input:
-            print(f"[WARNING] Material {mat.name} has no Metallic input, skipping.")
-            continue
-        
-        # Create an Emission node that will output the metallic value as color.
-        emission_node = node_tree.nodes.new(type='ShaderNodeEmission')
-        emission_node.name = "Assetify_Temp_Emission_" + emission_node.name
-        emission_node.location = (principled_node.location.x - 200, principled_node.location.y)
-        
-        # For metallic, link the Metallic input source to the Emission node's Color input.
-        if metallic_input.is_linked:
-            color_source = metallic_input.links[0].from_socket
-            # If the metallic source is a float value, convert it to a color using CombineRGB.
-            if color_source.type in {'VALUE', 'FLOAT'}:
-                combine_node = node_tree.nodes.new(type='ShaderNodeCombineRGB')
-                combine_node.name = "Assetify_Temp_CombineRGB_" + combine_node.name
-                # Position the combine node near the color_source's node.
-                combine_node.location = (color_source.node.location.x - 200, color_source.node.location.y)
-                node_tree.links.new(color_source, combine_node.inputs['R'])
-                node_tree.links.new(color_source, combine_node.inputs['G'])
-                node_tree.links.new(color_source, combine_node.inputs['B'])
-                node_tree.links.new(combine_node.outputs['Image'], emission_node.inputs['Color'])
-                print(f"[DEBUG] Metallic input is a value; created CombineRGB for {mat.name}")
-                added_nodes.setdefault(mat.name, []).append(combine_node)
-            else:
-                node_tree.links.new(color_source, emission_node.inputs['Color'])
-                print(f"[DEBUG] Linked Metallic input for {mat.name}")
-        else:
-            default_metallic = metallic_input.default_value
-            emission_node.inputs['Color'].default_value = (default_metallic, default_metallic, default_metallic, 1.0)
-            print(f"[DEBUG] Metallic input not linked for {mat.name}, using default value {default_metallic}")
-        added_nodes.setdefault(mat.name, []).append(emission_node)
-        
-        # Find the Material Output node (create one if necessary)
-        material_output_node = next((node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
-        if not material_output_node:
-            material_output_node = node_tree.nodes.new(type='ShaderNodeOutputMaterial')
-            material_output_node.name = "Assetify_Temp_Output_" + material_output_node.name
-            material_output_node.location = (0, 0)
-            temporary_output_nodes[mat.name] = material_output_node
-        
-        # Store original links from the Material Output node.
-        original_links = [
-            (link.from_socket, link.to_socket)
-            for link in node_tree.links if link.to_node == material_output_node
-        ]
-        materials_original_links[mat.name] = original_links
-        for from_socket, to_socket in original_links:
-            for link in list(node_tree.links):
-                if link.from_socket == from_socket and link.to_socket == to_socket:
-                    node_tree.links.remove(link)
-                    break
-        
-        # Reroute: Connect the Emission node's output to the Material Output node's Surface input.
+    # 3. Load AO (Red)
+    if ao_image:
         try:
-            node_tree.links.new(emission_node.outputs['Emission'], material_output_node.inputs['Surface'])
-            print(f"[DEBUG] Connected Emission shader to Material Output for {mat.name}.")
+            # Resize check could be added here, but assuming bake ensured matching sizes
+            ao_pixels = np.empty(w * h * 4, dtype=np.float32)
+            ao_image.pixels.foreach_get(ao_pixels)
+            dst_array[0::4] = ao_pixels[0::4] # Copy Red channel
+        except Exception as e: 
+            print(f"Error packing AO: {e}")
+            dst_array[0::4] = 1.0 # Default white
+    else: 
+        dst_array[0::4] = 1.0
+
+    # 4. Load Roughness (Green)
+    if roughness_image:
+        try:
+            rgh_pixels = np.empty(w * h * 4, dtype=np.float32)
+            roughness_image.pixels.foreach_get(rgh_pixels)
+            # Roughness maps are usually B&W, so any channel works. We take Red index 0.
+            dst_array[1::4] = rgh_pixels[0::4] 
+        except: dst_array[1::4] = 0.5
+    else: dst_array[1::4] = 0.5
+
+    # 5. Load Metallic (Blue)
+    if metallic_image:
+        try:
+            met_pixels = np.empty(w * h * 4, dtype=np.float32)
+            metallic_image.pixels.foreach_get(met_pixels)
+            dst_array[2::4] = met_pixels[0::4]
+        except: dst_array[2::4] = 0.0
+    else: dst_array[2::4] = 0.0
+
+    # 6. Alpha (Full Opaque)
+    dst_array[3::4] = 1.0
+
+    # 7. Create Output Image
+    if output_image_name in bpy.data.images:
+        bpy.data.images.remove(bpy.data.images[output_image_name])
+
+    # Create image with correct bit depth
+    dst_image = bpy.data.images.new(output_image_name, w, h, alpha=False, float_buffer=use_float)
+    
+    # Fill pixels
+    dst_image.pixels.foreach_set(dst_array)
+    
+    # 8. Save immediately if filepath is provided
+    if filepath:
+        try:
+            dst_image.filepath_raw = filepath
+            dst_image.file_format = file_format
+            dst_image.save()
+            print(f"[Assetify] Saved ORM map: {filepath}")
         except Exception as e:
-            print(f"[ERROR] Linking error in {mat.name}: {e}")
+            print(f"[ERROR] Failed to save ORM map: {e}")
         
-    # Set bake type to 'EMIT' and perform the bake.
-    bpy.context.scene.cycles.bake_type = 'EMIT'
-    try:
-        bpy.ops.object.bake(type='EMIT')
-        print(f"[DEBUG] Successfully baked Metallic map for {obj.name}")
-    except RuntimeError as e:
-        print(f"[ERROR] Baking error for {obj.name}: {e}")
+        # Cleanup memory immediately
+        bpy.data.images.remove(dst_image)
+        return None
     
-    # Save the baked image.
-    try:
-        image.filepath_raw = texture_file_path
-        image.file_format = 'PNG'
-        image.save()
-        print(f"[DEBUG] Saved Metallic map at {image.filepath_raw}.")
-    except Exception as e:
-        print(f"[ERROR] Saving error for {obj.name}: {e}")
-    
-    #(Optional) Cleanup: If you want to immediately restore the original material setups,
-    #consider deferring cleanup to a later frame. For now, the cleanup is commented out.
-    #If you do restore here, only remove nodes with our "Assetify_Temp_" prefix.
-    for mat_slot in obj.material_slots:
-        mat = mat_slot.material
-        if not (mat and mat.use_nodes):
-            continue
-        node_tree = mat.node_tree
-        for node in list(node_tree.nodes):
-            if node.name.startswith("Assetify_Temp_"):
-                node_tree.nodes.remove(node)
-        for key, temp_node in temporary_output_nodes.items():
-            if temp_node in node_tree.nodes:
-                node_tree.nodes.remove(temp_node)
-        material_output_node = next((node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
-        original_links = materials_original_links.get(mat.name, [])
-        for link in list(node_tree.links):
-            if link.to_node == material_output_node:
-                node_tree.links.remove(link)
-        for from_socket, to_socket in original_links:
-            try:
-                node_tree.links.new(from_socket, to_socket)
-            except Exception as e:
-                print(f"[ERROR] Restoring link in {mat.name}: {e}")
-        print(f"[DEBUG] Restored original shader connections for material {mat.name}")
+    return dst_image
 
 
 def bake_metallic_map(obj, image):
@@ -6438,23 +6694,27 @@ def bake_alpha_map(obj, resolution, save_dir):
                 print(f"[ERROR] Restoring link in {mat.name}: {e}")
         print(f"[DEBUG] Restored original shader connections for material {mat.name}")
 
-def apply_baked_textures(obj, save_dir, platform="UE5"):
+def apply_baked_textures(obj, save_dir, platform="UE5", asset_name_override=None):
     """
-    Apply baked textures to the object's material using a Principled BSDF shader.
-    In ANIMATION mode, it loads an image sequence by loading the first frame from:
-       <save_dir>/<obj.name>_textures/<map_type>/Frame0001.png
-    and sets its source to 'SEQUENCE'. The texture node's Image User properties
-    are then set to control playback.
+    Apply baked textures to the object's material.
+    FIXED: Automatically multiplies AO (from ORM or separate map) over Base Color.
     """
     import os
     import bpy
 
     assetify_settings = bpy.context.scene.assetify_bake_settings
     is_animation = assetify_settings.texturebake_mode == 'ANIMATION'
+    use_udim = assetify_settings.use_udim
     
-    # Ensure the object has a material; if not, create one.
+    clean_name = asset_name_override if asset_name_override else obj.name
+    
+    # Determine extension
+    is_exr = assetify_settings.bake_format == 'OPEN_EXR'
+    ext = ".exr" if is_exr else ".png"
+
+    # Material Setup
     if not obj.data.materials:
-        new_material = bpy.data.materials.new(name=f"{obj.name}_Material")
+        new_material = bpy.data.materials.new(name=f"{clean_name}_Material")
         obj.data.materials.append(new_material)
     else:
         new_material = obj.data.materials[0]
@@ -6463,176 +6723,219 @@ def apply_baked_textures(obj, save_dir, platform="UE5"):
     node_tree = new_material.node_tree
     node_tree.nodes.clear()
     
-    # Create the Principled BSDF and Material Output nodes.
     bsdf_node = node_tree.nodes.new(type='ShaderNodeBsdfPrincipled')
     bsdf_node.location = (200, 0)
     output_node = node_tree.nodes.new(type='ShaderNodeOutputMaterial')
-    output_node.location = (700, 0)
+    output_node.location = (500, 0)
     node_tree.links.new(bsdf_node.outputs['BSDF'], output_node.inputs['Surface'])
     
-    # Vertical layout parameters for node placement.
-    current_y = 250
-    spacing = 250
+    current_y = 400
+    spacing = 300
 
-    # Helper to load a texture image or sequence.
+    # Helper: Load Texture
     def load_texture(map_type, colorspace='sRGB'):
         if is_animation:
-            # Folder structure: <save_dir>/<obj.name>_textures/<map_type>/
-            object_folder = os.path.join(save_dir, f"{obj.name}_textures")
+            object_folder = os.path.join(save_dir, f"{clean_name}_textures")
             map_folder = os.path.join(object_folder, map_type)
-            first_frame_path = os.path.join(map_folder, "Frame0001.png")
-            if os.path.exists(map_folder) and os.path.exists(first_frame_path):
-                # Load the first frame to use as the basis for the sequence.
-                seq_image = bpy.data.images.load(first_frame_path)
-                seq_image.source = 'SEQUENCE'
-                seq_image.colorspace_settings.name = colorspace
-                # The node's Image User will later be configured.
-                return seq_image
-            else:
-                print(f"No sequence images found for {map_type} at: {map_folder}")
-                return None
+            start_frame = bpy.context.scene.frame_start
+            filename = f"Frame{start_frame:04d}{ext}"
+            file_path = os.path.join(map_folder, filename)
+            
+            if os.path.exists(file_path):
+                try:
+                    img = bpy.data.images.load(file_path)
+                    img.source = 'SEQUENCE'
+                    img.colorspace_settings.name = colorspace
+                    return img
+                except: return None
         else:
-            # STILL mode: images are stored in a common "textures" folder.
             textures_folder = os.path.join(save_dir, "textures")
-            texture_path = os.path.join(textures_folder, f"{obj.name}_{map_type}.png")
-            if os.path.exists(texture_path):
-                image = bpy.data.images.load(texture_path)
-                image.colorspace_settings.name = colorspace
-                return image
+            if use_udim:
+                filename = f"{clean_name}_{map_type}.1001{ext}"
             else:
-                print(f"No texture found for {map_type} at: {texture_path}")
-                return None
+                filename = f"{clean_name}_{map_type}{ext}"
+            
+            file_path = os.path.join(textures_folder, filename)
+            if os.path.exists(file_path):
+                try:
+                    img = bpy.data.images.load(file_path)
+                    img.colorspace_settings.name = colorspace
+                    if use_udim: img.source = 'TILED'
+                    return img
+                except: return None
+        return None
 
-    # Helper to create an image texture node and configure its Image User.
-    def create_tex_node(image, input_socket):
+    # Helper: Create Node
+    def create_tex_node(image, label=""):
+        if not image: return None
         tex_node = node_tree.nodes.new('ShaderNodeTexImage')
         tex_node.image = image
-        tex_node.location = (-400, current_y)
-        if image and image.source == 'SEQUENCE':
-            # Mimic your provided snippet:
+        tex_node.location = (-600, current_y)
+        tex_node.label = label
+        
+        if image.source == 'SEQUENCE':
             tex_node.image_user.use_auto_refresh = True
-            # Set frame_duration to the number of frames in the scene (or use a fixed value, e.g., 350)
-            frame_duration = bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
-            tex_node.image_user.frame_duration = frame_duration
+            tex_node.image_user.frame_duration = bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
             tex_node.image_user.frame_start = bpy.context.scene.frame_start
             tex_node.image_user.frame_offset = 0
-        node_tree.links.new(tex_node.outputs["Color"], input_socket)
         return tex_node
 
-    # --- Load and assign textures for each map type ---
+    # --- 1. Load Maps ---
+    # We load them first to establish connections later
+    
+    # Base Color
+    img_bc = load_texture("BaseColor", 'sRGB')
+    node_bc = create_tex_node(img_bc, "Base Color")
+    if node_bc: current_y -= spacing
 
-    # BaseColor
-    basecolor_image = load_texture("BaseColor", colorspace='sRGB')
-    if basecolor_image:
-        create_tex_node(basecolor_image, bsdf_node.inputs['Base Color'])
-        print(f"Loaded BaseColor {'sequence' if is_animation else 'texture'} for {obj.name}")
-        current_y -= spacing
+    # ORM or Standard PBR
+    node_orm = None
+    node_rough = None
+    node_meta = None
+    node_ao = None
+    ao_socket = None # This will hold the AO output socket (Red channel or Mono image)
 
-    # Normal Map
-    normal_image = load_texture("Normal", colorspace='Non-Color')
-    if normal_image:
-        normal_node = node_tree.nodes.new('ShaderNodeTexImage')
-        normal_node.image = normal_image
-        normal_node.location = (-400, current_y)
-        normal_node.image.colorspace_settings.name = 'Non-Color'
-        if normal_image.source == 'SEQUENCE':
-            normal_node.image_user.use_auto_refresh = True
-            frame_duration = bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
-            normal_node.image_user.frame_duration = frame_duration
-            normal_node.image_user.frame_start = bpy.context.scene.frame_start
-            normal_node.image_user.frame_offset = 0
-        normal_map_node = node_tree.nodes.new('ShaderNodeNormalMap')
-        normal_map_node.location = (-50, current_y)
-        node_tree.links.new(normal_node.outputs["Color"], normal_map_node.inputs["Color"])
-        node_tree.links.new(normal_map_node.outputs["Normal"], bsdf_node.inputs["Normal"])
-        print(f"Loaded Normal {'sequence' if is_animation else 'texture'} for {obj.name}")
-        current_y -= spacing
-
-    # For non-UNITY platforms, load Roughness and Metallic.
-    if platform != 'UNITY':
-        roughness_image = load_texture("Roughness", colorspace='Non-Color')
-        if roughness_image:
-            create_tex_node(roughness_image, bsdf_node.inputs['Roughness'])
-            print(f"Loaded Roughness {'sequence' if is_animation else 'texture'} for {obj.name}")
+    if assetify_settings.pack_orm:
+        img_orm = load_texture("ORM", 'Non-Color')
+        if img_orm:
+            node_orm = create_tex_node(img_orm, "ORM")
+            sep = node_tree.nodes.new('ShaderNodeSeparateColor')
+            sep.location = (-300, node_orm.location.y)
+            node_tree.links.new(node_orm.outputs['Color'], sep.inputs['Color'])
+            
+            # ORM Mapping: Red=AO, Green=Roughness, Blue=Metallic
+            ao_socket = sep.outputs['Red'] 
+            node_tree.links.new(sep.outputs['Green'], bsdf_node.inputs['Roughness'])
+            node_tree.links.new(sep.outputs['Blue'], bsdf_node.inputs['Metallic'])
+            current_y -= spacing
+    else:
+        # Standard Maps
+        img_r = load_texture("Roughness", 'Non-Color')
+        if img_r: 
+            node_rough = create_tex_node(img_r, "Roughness")
+            node_tree.links.new(node_rough.outputs['Color'], bsdf_node.inputs['Roughness'])
+            current_y -= spacing
+            
+        img_m = load_texture("Metallic", 'Non-Color')
+        if img_m: 
+            node_meta = create_tex_node(img_m, "Metallic")
+            node_tree.links.new(node_meta.outputs['Color'], bsdf_node.inputs['Metallic'])
+            current_y -= spacing
+            
+        # Separate AO Map
+        img_ao = load_texture("Occlusion", 'Non-Color')
+        if img_ao:
+            node_ao = create_tex_node(img_ao, "Ambient Occlusion")
+            ao_socket = node_ao.outputs['Color']
             current_y -= spacing
 
-        metallic_image = load_texture("Metallic", colorspace='Non-Color')
-        if metallic_image:
-            create_tex_node(metallic_image, bsdf_node.inputs['Metallic'])
-            print(f"Loaded Metallic {'sequence' if is_animation else 'texture'} for {obj.name}")
+    # --- 2. Connect Base Color (Multiply with AO if exists) ---
+    if node_bc:
+        color_socket = node_bc.outputs['Color']
+        
+        # If we have an AO socket, multiply it
+        if ao_socket:
+            # Use 'ShaderNodeMix' for Blender 3.4+
+            mix_node = node_tree.nodes.new('ShaderNodeMix')
+            mix_node.data_type = 'RGBA'
+            mix_node.blend_type = 'MULTIPLY'
+            mix_node.inputs['Factor'].default_value = 1.0 # 100% AO Influence
+            mix_node.location = (-200, node_bc.location.y)
+            
+            node_tree.links.new(color_socket, mix_node.inputs['A']) # Base Color 
+            node_tree.links.new(ao_socket, mix_node.inputs['B'])    # AO         
+            
+            # Hook result to BSDF
+            node_tree.links.new(mix_node.outputs['Result'], bsdf_node.inputs['Base Color'])
+        else:
+            # Direct Link if no AO
+            node_tree.links.new(color_socket, bsdf_node.inputs['Base Color'])
+
+    # --- 3. Normal ---
+    img_n = load_texture("Normal", 'Non-Color')
+    if img_n:
+        n_node = create_tex_node(img_n, "Normal")
+        norm_map = node_tree.nodes.new('ShaderNodeNormalMap')
+        norm_map.location = (-300, n_node.location.y)
+        node_tree.links.new(n_node.outputs['Color'], norm_map.inputs['Color'])
+        node_tree.links.new(norm_map.outputs['Normal'], bsdf_node.inputs['Normal'])
+        current_y -= spacing
+
+    # --- 4. Emission ---
+    if assetify_settings.bake_emission:
+        img_e = load_texture("EmissionColor", 'sRGB')
+        if img_e:
+            e_node = create_tex_node(img_e, "Emission Color")
+            node_tree.links.new(e_node.outputs['Color'], bsdf_node.inputs['Emission Color'])
+            current_y -= spacing
+            
+        img_es = load_texture("EmissionStrength", 'Non-Color')
+        if img_es:
+            es_node = create_tex_node(img_es, "Emission Strength")
+            node_tree.links.new(es_node.outputs['Color'], bsdf_node.inputs['Emission Strength'])
             current_y -= spacing
 
-    # Alpha Map (if baking alpha is enabled)
-    alpha_image = load_texture("Alpha", colorspace='Non-Color')
-    if alpha_image and bpy.context.scene.assetify_bake_settings.bake_alpha:
-        create_tex_node(alpha_image, bsdf_node.inputs['Alpha'])
-        print(f"Loaded Alpha {'sequence' if is_animation else 'texture'} for {obj.name}")
-        current_y -= spacing
-
-    # Emission Textures
-    emissioncolor_image = load_texture("EmissionColor", colorspace='sRGB')
-    if emissioncolor_image and bpy.context.scene.assetify_bake_settings.bake_emission:
-        create_tex_node(emissioncolor_image, bsdf_node.inputs["Emission Color"])
-        print(f"Loaded EmissionColor {'sequence' if is_animation else 'texture'} for {obj.name}")
-        current_y -= spacing
-
-        emissionstrength_image = load_texture("EmissionStrength", colorspace='sRGB')
-        if emissionstrength_image:
-            create_tex_node(emissionstrength_image, bsdf_node.inputs["Emission Strength"])
-            print(f"Loaded EmissionStrength {'sequence' if is_animation else 'texture'} for {obj.name}")
+    # --- 5. Transmission ---
+    if assetify_settings.bake_transmission:
+        img_t = load_texture("Transmission", 'Non-Color')
+        if img_t:
+            t_node = create_tex_node(img_t, "Transmission")
+            node_tree.links.new(t_node.outputs['Color'], bsdf_node.inputs['Transmission Weight'])
             current_y -= spacing
 
-    # Transmission Map
-    transmission_image = load_texture("Transmission", colorspace='sRGB')
-    if transmission_image and bpy.context.scene.assetify_bake_settings.bake_transmission:
-        create_tex_node(transmission_image, bsdf_node.inputs['Transmission Weight'])
-        print(f"Loaded Transmission {'sequence' if is_animation else 'texture'} for {obj.name}")
-        current_y -= spacing
-
-    print(f"Applied baked {'animation sequences' if is_animation else 'textures'} to material of {obj.name}")
+    print(f"[Assetify] Applied textures to {obj.name}. AO Multiplied: {ao_socket is not None}")
 
 def simplify_materials_and_uv_maps(obj):
-    
     """
-    Removes all UV maps except 'GameUV' and skips renaming.
+    Removes extra material slots and ensures ONLY the active UV map remains.
+    Renames the remaining UV map to 'UVMap'.
     """
-    
+    if obj.type != 'MESH':
+        return
+
+    # --- 1. Simplify Materials ---
     # Remove all material slots except the first one
-    if len(obj.data.materials) > 1:
-        for i in range(len(obj.data.materials) - 1, 0, -1):  # Start from the end and remove backwards
-            obj.data.materials.pop(index=i)
-        debug_print(f"Removed all material slots except the first one for {obj.name}")
-    else:
-        debug_print(f"No extra material slots to remove for {obj.name}")
+    while len(obj.data.materials) > 1:
+        obj.data.materials.pop(index=len(obj.data.materials) - 1)
     
-    game_uv_name = "GameUV"
-    
-    # Check if the object supports UV layers
-    if not hasattr(obj.data, 'uv_layers'):
-        debug_print(f"Object '{obj.name}' does not support UV layers (type: {obj.type}). Skipping.")
+    # --- 2. Simplify UV Maps ---
+    if not obj.data.uv_layers:
         return
 
-    # Confirm 'GameUV' exists to avoid issues
-    game_uv = obj.data.uv_layers.get(game_uv_name)
-    if not game_uv:
-        debug_print(f"Error: Expected 'GameUV' not found for {obj.name}")
-        return
+    # Identify the target layer (The active one, or first one)
+    target_layer = obj.data.uv_layers.active or obj.data.uv_layers[0]
 
-    # Gather names of all UV maps
-    uv_map_names = [uv_layer.name for uv_layer in obj.data.uv_layers]
-    debug_print(f"Initial UV maps for {obj.name}: {uv_map_names}")
+    # Rename to safe name to protect it
+    safe_name = "KEEP_ME_SAFE"
+    target_layer.name = safe_name
 
-    # Progressively remove UV maps that are not 'GameUV'
-    for uv_name in uv_map_names:
-        if uv_name != game_uv_name:
-            uv_layer = obj.data.uv_layers.get(uv_name)
-            if uv_layer:
-                obj.data.uv_layers.remove(uv_layer)
-                debug_print(f"Removed UV map '{uv_name}' from {obj.name}")
+    # Delete ALL other layers
+    # We loop backwards or repeatedly find non-matching layers to avoid index errors
+    while True:
+        # Find any layer that is NOT our safe layer
+        layer_to_delete = None
+        for layer in obj.data.uv_layers:
+            if layer.name != safe_name:
+                layer_to_delete = layer
+                break
+        
+        if layer_to_delete:
+            obj.data.uv_layers.remove(layer_to_delete)
+        else:
+            break # Only the safe layer remains
 
-    # Final list of remaining UV maps for verification
-    remaining_uv_maps = [uv.name for uv in obj.data.uv_layers]
-    debug_print(f"Final UV maps for {obj.name}: {remaining_uv_maps}")
+    # --- 3. Finalize Name (Re-fetch to prevent ReferenceError) ---
+    # The old 'target_layer' variable might be stale after removals.
+    final_layer = obj.data.uv_layers.get(safe_name)
+    
+    if final_layer:
+        final_layer.name = "UVMap"
+        final_layer.active = True
+        final_layer.active_render = True
+        # Explicitly set as active active layer for the object data
+        obj.data.uv_layers.active = final_layer
+    
+    print(f"[Assetify] Simplified {obj.name}: 1 Material, 1 UV Map ('UVMap').")
 
 def finalize_uv_maps(obj):
     """
@@ -7150,105 +7453,158 @@ class ASSETIFY_OT_join_assets(bpy.types.Operator):
         return {'FINISHED'}
 
     def invoke(self, context, event):
-        # Open the pop-up for naming
         return context.window_manager.invoke_props_dialog(self)
+
+    def cleanup_uvs_for_join(self, obj):
+        """
+        Robust cleanup: Keeps ONLY the active render UV map.
+        Uses a while loop to safely remove layers without stale reference errors.
+        """
+        if obj.type != 'MESH' or not obj.data.uv_layers:
+            return
+
+        # 1. Identify Target (Priority: Active Render > Active > First)
+        target_layer = None
+        for layer in obj.data.uv_layers:
+            if layer.active_render:
+                target_layer = layer
+                break
+        
+        if not target_layer:
+            target_layer = obj.data.uv_layers.active
+
+        if not target_layer and len(obj.data.uv_layers) > 0:
+            target_layer = obj.data.uv_layers[0]
+
+        if not target_layer:
+            return 
+
+        print(f"[Assetify] Processing {obj.name}: Keeping '{target_layer.name}'")
+
+        # 2. Rename Target to TEMP to avoid name collisions
+        safe_temp_name = "___ASSETIFY_TEMP_UV___"
+        target_layer.name = safe_temp_name
+
+        # 3. Remove all other layers using a safer WHILE loop
+        # We cannot iterate over the list while deleting; references become stale.
+        # Instead, we repeatedly check if there is any 'bad' layer left and delete it.
+        while True:
+            # Fetch a fresh list of layers every time
+            layers = obj.data.uv_layers
+            
+            # Find the first layer that DOES NOT match our safe name
+            layer_to_delete = None
+            for layer in layers:
+                if layer.name != safe_temp_name:
+                    layer_to_delete = layer
+                    break # Stop and delete this one immediately
+            
+            if layer_to_delete:
+                print(f"   -> Removing: '{layer_to_delete.name}'")
+                layers.remove(layer_to_delete)
+            else:
+                # If we didn't find anything to delete, we are done
+                break
+
+        # 4. Rename to Standard "UVMap"
+        # Since we are now the only layer left, this rename is safe.
+        # We re-fetch the layer by name to be absolutely sure the reference is valid.
+        final_layer = obj.data.uv_layers.get(safe_temp_name)
+        if final_layer:
+            final_layer.name = "UVMap"
+            
+            # 5. Set Flags
+            obj.data.uv_layers.active = final_layer
+            final_layer.active_render = True
 
     def join_objects(self, context, objects):
         assetify_settings = context.scene.assetify_bake_settings
 
-        # Ensure there's at least one object to join and set an active object
         if not objects:
-            self.report({'ERROR'}, "No objects selected for joining.")
             return
+
+        # --- STEP 1: CLEAN UP UVs ---
+        print("[Assetify] Standardizing UV maps before join...")
+        for obj in objects:
+            self.cleanup_uvs_for_join(obj)
+        # ----------------------------
 
         # Gather object names and collections before joining
         object_names = [obj.name for obj in objects]
         collections_to_link = set()
-        all_baked = True  # Track if all assets being joined are baked
+        all_baked = True 
 
         for obj in objects:
-            # Collect all collections this object is part of
             for collection in obj.users_collection:
                 collections_to_link.add(collection)
-                print(f"[DEBUG] Asset '{obj.name}' is part of collection '{collection.name}'.")
 
-            # Check the baked status of each object
             for asset in assetify_settings.baked_assets:
                 if asset.name == obj.name:
                     if not asset.is_baked:
                         all_baked = False
 
-        # Add the joined asset to baked collections before the join operation
+        # Add the joined asset to baked collections
         for collection in collections_to_link:
             for baked_collection in assetify_settings.baked_collections:
                 if baked_collection.name == collection.name:
                     joined_asset_entry = baked_collection.assets.add()
                     joined_asset_entry.name = self.joined_name
-                    print(f"[DEBUG] Pre-joining: Added '{self.joined_name}' to collection '{baked_collection.name}'.")
 
-        # Deselect all objects first, then select the objects to join
+        # --- STEP 2: PERFORM JOIN ---
         bpy.ops.object.select_all(action='DESELECT')
+        
+        # Select all valid objects
         for obj in objects:
+            obj.hide_viewport = False 
             obj.select_set(True)
-        context.view_layer.objects.active = objects[0]  # Set the first object as the active object
+        
+        # Set active object
+        context.view_layer.objects.active = objects[0]
 
-        # Ensure we're in Object mode to perform the join operation
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        # Join selected objects
         bpy.ops.object.join()
 
-        # Get the newly joined object and rename it
+        # Handle Result
         joined_object = context.view_layer.objects.active
         joined_object.name = self.joined_name
 
-        # Link the joined object to all the collections the original objects were part of
+        # Verify Resulting UVs (Debug)
+        print(f"[Assetify] Join Result UVs: {[uv.name for uv in joined_object.data.uv_layers]}")
+
+        # Link to collections
         for collection in collections_to_link:
             if joined_object.name not in [obj.name for obj in collection.objects]:
                 collection.objects.link(joined_object)
-                print(f"[DEBUG] Joined object '{joined_object.name}' linked to collection '{collection.name}'.")
 
-        # Update the baked assets list: Remove old entries by index and add a new entry for the joined object
+        # Update Lists (Asset Mode)
         if assetify_settings.asset_mode == 'ASSET':
-            # Remove old entries based on pre-join object names
             for asset_name in object_names:
                 for i, asset in enumerate(assetify_settings.baked_assets):
                     if asset.name == asset_name:
-                        print(f"[DEBUG] Removing asset '{asset.name}' from baked assets list.")
                         assetify_settings.baked_assets.remove(i)
-                        break  # Exit the inner loop to avoid altering list during iteration
-
-            # Add a new entry for the joined object
+                        break 
+            
             new_asset = assetify_settings.baked_assets.add()
             new_asset.name = self.joined_name
-            new_asset.is_baked = all_baked  # Set baked status based on all components
+            new_asset.is_baked = all_baked 
             new_asset.is_game_asset = True
-            print(f"[DEBUG] Added joined asset '{new_asset.name}' to baked assets list with baked status '{new_asset.is_baked}'.")
 
-        # Handle collection mode: Update the collection assets list if applicable
+        # Update Lists (Collection Mode)
         if assetify_settings.asset_mode == 'COLLECTION':
             for baked_collection in assetify_settings.baked_collections:
                 collection_assets = [asset.name for asset in baked_collection.assets]
                 if any(name in collection_assets for name in object_names):
-                    print(f"[DEBUG] Clearing assets in collection '{baked_collection.name}'.")
-                    baked_collection.assets.clear()  # Clear existing assets
+                    baked_collection.assets.clear()
                     joined_asset = baked_collection.assets.add()
                     joined_asset.name = self.joined_name
-                    joined_asset.is_baked = all_baked  # Set baked status based on all components
+                    joined_asset.is_baked = all_baked
                     joined_asset.is_game_asset = True
-                    print(f"[DEBUG] Added joined asset '{joined_asset.name}' to collection '{baked_collection.name}' with baked status '{joined_asset.is_baked}'.")
 
-        # Verify and log the final state of collections
-        for collection in collections_to_link:
-            linked_objects = [obj.name for obj in collection.objects]
-            print(f"[DEBUG] Final objects in collection '{collection.name}': {linked_objects}")
-
-        # Report the completion
-        self.report({'INFO'}, f"Assets joined as '{self.joined_name}' and lists updated.")
+        self.report({'INFO'}, f"Assets joined as '{self.joined_name}' (UVs Normalized).")
 
     def collect_objects_from_collection(self, collection):
-        """Recursively collect all mesh objects from the collection and its subcollections."""
         objects = []
         def collect_from_collection(col):
             for obj in col.objects:
@@ -8153,7 +8509,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             item.collection is not None for item in assetify_settings.asset_collections
         )
 
-        # Process Settings Section
+        # --- PROCESS ASSETS SECTION ---
         box = layout.box()
         row = box.row()
         row.prop(
@@ -8163,9 +8519,9 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             icon="TRIA_DOWN" if assetify_settings.show_bake_mode_menu else "TRIA_RIGHT",
             emboss=False
         )
-        row.label(text="Process Assets")
+        row.label(text="Process Assets", icon="GEOMETRY_SET")
 
-        if assetify_settings.show_bake_mode_menu:            
+        if assetify_settings.show_bake_mode_menu:                   
             # Still Mode button
             texbake_button = row.operator(
                 "assetify.switch_bake_mode",
@@ -8187,7 +8543,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             split = row.split(factor=0.8)
             col = split.column()
 
-            # Calculate the number of rows based on the number of items in the list, with a min of 2 and max of 5
+            # Calculate the number of rows based on the number of items in the list
             asset_collections_count = len(assetify_settings.asset_collections)
             asset_collections_rows = min(max(asset_collections_count, 1), 100)
 
@@ -8208,7 +8564,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             # Mossify Mode option with Info button
             row = box.row(align=True)
             row.operator(
-                "assetify.show_mossify_mode_info",  # Create an operator for the info popup
+                "assetify.show_mossify_mode_info", 
                 text="",
                 icon='INFO',
                 emboss=False
@@ -8222,7 +8578,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             # Show the "Enable Custom Attributes" option only if Mossify is not enabled
             if not assetify_settings.use_mossify:
                 row = box.row(align=True)
-                row.operator("assetify.show_custom_attributes_info", text="", icon='INFO', emboss=False)  # Set emboss=False
+                row.operator("assetify.show_custom_attributes_info", text="", icon='INFO', emboss=False)
                 row.prop(assetify_settings, "enable_custom_attributes", text="Enable Custom Attributes")
 
             # Show the emitter input if Mossify is enabled or if custom attributes are enabled
@@ -8233,7 +8589,6 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             if not assetify_settings.use_mossify and assetify_settings.enable_custom_attributes:
                 box.label(text="Custom Attributes")
                 row = box.row()
-                # Calculate the number of rows based on the number of items in the list, with a min of 3 and max of 6
                 custom_attributes_count = len(assetify_settings.custom_attributes)
                 custom_attributes_rows = min(max(custom_attributes_count, 1), 100)
 
@@ -8270,26 +8625,21 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 # Animation Mode settings
                 if hasattr(scene, "assetify_animation_settings"):
                     settings = scene.assetify_animation_settings
-
-                    # Animation Type dropdown
                     row = box.row(align=True)
                     split = row.split(factor=0.5, align=True)
                     split.label(text="Animation Type:")
                     split.prop(settings, "animation_type", text="")
 
-                    # File Format dropdown
                     row = box.row(align=True)
                     split = row.split(factor=0.5, align=True)
                     split.label(text="Desired Format:")
                     split.prop(settings, "file_format", text="")
 
-                    # Process Animation button
                     row = box.row(align=True)
                     animation_type = settings.animation_type
                     file_format = settings.file_format
                     button_label = f"Process Animation ({file_format})"
 
-                    # Enable button only if asset collections exist and are assigned
                     row.enabled = has_asset_collections and all_collections_assigned
                     row.operator("object.convert_to_game_ready", text=button_label)
                 else:
@@ -8298,20 +8648,13 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 # Still Mode settings
                 row = box.row(align=True)
                 button_label = "Process Assets"
-
-                # Enable button only if asset collections exist and are assigned
                 row.enabled = has_asset_collections and all_collections_assigned
                 row.operator("object.convert_to_game_ready", text=button_label)
 
-                # Ensure everything remains functional and consistent
-                process_assets_row = layout.row(align=True)
-                process_button_col = process_assets_row.column()
-                process_button_col.enabled = has_asset_collections and all_collections_assigned
-
+        # --- ASSET LIST SECTION ---
         box = layout.box()
         row = box.row()
 
-        # Collapsible triangle icon and label for the Asset List
         row.prop(
             assetify_settings,
             "show_asset_list_menu",
@@ -8319,11 +8662,10 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             icon="TRIA_DOWN" if assetify_settings.show_asset_list_menu else "TRIA_RIGHT",
             emboss=False
         )
-        row.label(text="Processed Asset List")
+        row.label(text="Processed Asset List", icon="ALIGN_JUSTIFY")
 
-        # Add Asset/Collection switch buttons if the menu is expanded
         if assetify_settings.show_asset_list_menu:
-            # Asset/Collection switch buttons (placed next to the label)
+            # Asset/Collection switch buttons
             row.operator(
                 "assetify.switch_mode",
                 text="Asset",
@@ -8361,19 +8703,11 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 )
 
                 box.operator("assetify.refresh_asset_collection_list", text="Refresh List", icon='FILE_REFRESH')
-
-                # Buttons for delete, separate, and join
+                
+                # Delete button
                 delete_assets_row = box.row()
                 delete_assets_row.enabled = any(asset.include_in_send for asset in assetify_settings.baked_assets)
                 delete_assets_row.operator("assetify.delete_selected_assets", text="Delete Selected Assets", icon='TRASH')
-
-                separate_assets_row = box.row()
-                separate_assets_row.enabled = any(asset.include_in_send for asset in assetify_settings.baked_assets)
-                separate_assets_row.operator("assetify.separate_by_material", text="Separate by Material", icon='OUTLINER_OB_MESH')
-
-                join_assets_row = box.row()
-                join_assets_row.enabled = any(asset.include_in_send for asset in assetify_settings.baked_assets)
-                join_assets_row.operator("assetify.join_assets", text="Join Assets", icon='OBJECT_DATA')
 
             else:
                 # Draw headers for Collection List
@@ -8404,287 +8738,293 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
 
                 box.operator("assetify.refresh_asset_collection_list", text="Refresh List", icon='FILE_REFRESH')
 
-                # Enable buttons for collections
+                # Delete button
                 collection_in_send = any(
                     collection.include_in_send for collection in assetify_settings.baked_collections
                 )
-
+                
                 delete_collections_row = box.row()
                 delete_collections_row.enabled = collection_in_send
                 delete_collections_row.operator("assetify.delete_selected_collections", text="Delete Selected Collections", icon='TRASH')
 
-                separate_collections_row = box.row()
-                separate_collections_row.enabled = collection_in_send
-                separate_collections_row.operator("assetify.separate_by_material", text="Separate by Material", icon='OUTLINER_OB_MESH')
+        # --- UTILITIES SECTION ---
+        box = layout.box()
+        row = box.row()
+        row.prop(
+            assetify_settings, 
+            "utilities_menu_expanded", 
+            text="", 
+            icon="TRIA_DOWN" if assetify_settings.utilities_menu_expanded else "TRIA_RIGHT", 
+            emboss=False
+        )
+        row.label(text="Utilities", icon='MODIFIER')
+        
+        if assetify_settings.utilities_menu_expanded:
+            
+            # Pivot Tool
+            row = box.row()
+            row.operator("assetify.set_pivot_bottom", text="Set Pivot to Bottom", icon='TRANSFORM_ORIGINS')
 
-                join_collections_row = box.row()
-                join_collections_row.enabled = collection_in_send
-                join_collections_row.operator("assetify.join_assets", text="Join Assets", icon='OBJECT_DATA')
+            # Calculate if buttons should be enabled
+            assets_selected = any(asset.include_in_send for asset in assetify_settings.baked_assets)
+            collections_selected = any(c.include_in_send for c in assetify_settings.baked_collections)
+            
+            is_enabled = False
+            if assetify_settings.asset_mode == 'ASSET':
+                is_enabled = assets_selected
+            else:
+                is_enabled = collections_selected
 
-                if assetify_settings.asset_mode == 'COLLECTION':
-                    # Swap button with info icon
-                    swap_row = box.row(align=True)
-                    info_col = swap_row.column()
-                    info_col.operator("assetify.show_swap_info", text="", icon='INFO', emboss=False)
-                    swap_button_col = swap_row.column()
-                    swap_button_col.enabled = collection_in_send
-                    swap_button_col.operator("assetify.swap_collections", text="Swap Selected Original & Game Assets")
+            # Separation & Join
+            row = box.row()
+            row.enabled = is_enabled
+            row.operator("assetify.separate_by_material", text="Separate by Material", icon='OUTLINER_OB_MESH')
+            
+            row = box.row()
+            row.enabled = is_enabled
+            row.operator("assetify.join_assets", text="Join Assets", icon='OBJECT_DATA')
 
-        # Bake Settings Section
+            # Swap (Collection Mode Only)
+            if assetify_settings.asset_mode == 'COLLECTION':
+                 row = box.row(align=True)
+                 row.enabled = collections_selected
+                 row.operator("assetify.show_swap_info", text="", icon='INFO', emboss=False)
+                 row.operator("assetify.swap_collections", text="Swap Original & Game Assets")
+
+        # --- BAKE ASSETS SECTION ---
         box = layout.box()
         row = box.row()
         row.prop(assetify_settings, "bake_menu_expanded", text="", 
                  icon="TRIA_DOWN" if assetify_settings.bake_menu_expanded else "TRIA_RIGHT", emboss=False)
-        row.label(text="Bake Assets")
+        row.label(text="Bake Assets", icon="NODE_TEXTURE")
 
         if assetify_settings.bake_menu_expanded:
+            
+            # Mode Selection
+            row = box.row(align=True)
+            row.operator("assetify.switch_texturebake_mode", text="Still", depress=assetify_settings.texturebake_mode == 'STILL').mode = 'STILL'
+            row.operator("assetify.switch_texturebake_mode", text="Animation", depress=assetify_settings.texturebake_mode == 'ANIMATION').mode = 'ANIMATION'
 
-            # Texture Bake Mode Buttons
-            row = box.row()
-            texbake_button = row.operator("assetify.switch_texturebake_mode",
-                                          text="Still",
-                                          depress=assetify_settings.texturebake_mode == 'STILL')
-            texbake_button.mode = 'STILL'
-            animbake_button = row.operator("assetify.switch_texturebake_mode",
-                                           text="Animation",
-                                           depress=assetify_settings.texturebake_mode == 'ANIMATION')
-            animbake_button.mode = 'ANIMATION'
-
-            # Show "Apply Attributes" button only in Animation mode
             if assetify_settings.texturebake_mode == 'ANIMATION':
                 row = box.row(align=True)
                 row.operator("assetify.show_apply_frame_attributes_info", text="", icon='INFO', emboss=False)
-                split = row.split(factor=0.465, align=True)
-                split.label(text="Apply Attributes")
-                apply_button_col = split.column()
-                apply_button_col.enabled = (
-                    (assetify_settings.asset_mode == 'ASSET' and any(
-                        asset.include_in_send for asset in assetify_settings.baked_assets
-                    )) or
-                    (assetify_settings.asset_mode == 'COLLECTION' and any(
-                        collection.include_in_send for collection in assetify_settings.baked_collections
-                    ))
-                )
-                apply_button_col.operator("animation.add_frame_dependent_attributes", text="Apply Attributes")
+                row.operator("animation.add_frame_dependent_attributes", text="Apply Attributes", icon='DRIVER')
 
-            # --- Map Options Box ---
-            maps_box = box.box()
-            maps_box.label(text="Extra Map Bakes", icon='IMAGE_RGB')
+            # Submenu: Extra Map Bakes
+            col = box.column(align=True)
+            row = col.row(align=True)
+            row.prop(assetify_settings, "extra_maps_expanded", text="", icon="TRIA_DOWN" if assetify_settings.extra_maps_expanded else "TRIA_RIGHT", emboss=False)
+            row.label(text="Extra Map Bakes", icon='IMAGE_RGB')
             
-            # Direct / Indirect Light toggles
-            row = maps_box.row(align=True)
-            split = row.split(factor=0.5, align=True)
-            split.label(text="Bake Direct Light")
-            split.prop(assetify_settings, "bake_direct_light", text="")
-            row = maps_box.row(align=True)
-            split = row.split(factor=0.5, align=True)
-            split.label(text="Bake Indirect Light")
-            split.prop(assetify_settings, "bake_indirect_light", text="")
+            if assetify_settings.extra_maps_expanded:
+                sub_box = col.box()
+                grid = sub_box.grid_flow(row_major=True, columns=2, even_columns=True, even_rows=True, align=True)
+                
+                grid.prop(assetify_settings, "bake_ao", text="Ambient Occlusion")
+                grid.prop(assetify_settings, "bake_alpha", text="Alpha")
+                grid.prop(assetify_settings, "bake_emission", text="Emission")
+                grid.prop(assetify_settings, "bake_transmission", text="Transmission")
+                grid.prop(assetify_settings, "bake_direct_light", text="Direct Light")
+                grid.prop(assetify_settings, "bake_indirect_light", text="Indirect Light")
+                
+                if assetify_settings.bake_alpha:
+                    row = sub_box.row()
+                    row.prop(assetify_settings, "force_transparent_black", text="Force Transparent Black", icon='GHOST_ENABLED')
 
-            # ALPHA (label + 2 checkboxes on the same row)
-            row = maps_box.row(align=True)
-            split = row.split(factor=0.52, align=True)
-            split.label(text="Alpha")
-            # Now the second half of the row for the checkboxes
-            split.prop(assetify_settings, "bake_alpha", text="")
-            split.prop(assetify_settings, "force_transparent_black",
-                     text="", icon='GHOST_ENABLED', toggle=True)
+            # Submenu: General Settings
+            col = box.column(align=True)
+            row = col.row(align=True)
+            row.prop(assetify_settings, "settings_submenu_expanded", text="", icon="TRIA_DOWN" if assetify_settings.settings_submenu_expanded else "TRIA_RIGHT", emboss=False)
+            row.label(text="General Settings", icon='PREFERENCES')
 
-            # EMISSION (label + 1 checkbox)
-            row = maps_box.row(align=True)
-            split = row.split(factor=0.5, align=True)
-            split.label(text="Emission")
-            split.prop(assetify_settings, "bake_emission", text="")
+            if assetify_settings.settings_submenu_expanded:
+                
+                # Output & Quality
+                box_out = col.box()
+                box_out.label(text="Output & Quality", icon='OUTPUT')
+                col_sub = box_out.column(align=True)
+                col_sub.prop(assetify_settings, "bake_folder", text="")
+                
+                row = col_sub.row(align=True)
+                row.label(text="Format")
+                row.prop(assetify_settings, "bake_format", text="")
+                
+                row = col_sub.row(align=True)
+                row.label(text="Resolution")
+                row.prop(assetify_settings, "bake_resolution", text="")
+                
+                row = col_sub.row(align=True)
+                row.label(text="Samples")
+                row.prop(assetify_settings, "bake_samples", text="")
 
-            # TRANSMISSION (label + 1 checkbox)
-            row = maps_box.row(align=True)
-            split = row.split(factor=0.5, align=True)
-            split.label(text="Transmission")
-            split.prop(assetify_settings, "bake_transmission", text="")
+                # Pipeline & Format
+                box_pipe = col.box()
+                box_pipe.label(text="Pipeline", icon='NODE')
+                col_sub = box_pipe.column(align=True)
+                
+                row = col_sub.row(align=True)
+                row.label(text="Platform")
+                row.prop(assetify_settings, "platform_target", text="") 
+                
+                col_sub.prop(assetify_settings, "skip_uv_unwrap", text="Skip UV Unwrap")
+                col_sub.prop(assetify_settings, "non_principled_baking", text="Non-Principled Logic")
+                col_sub.prop(assetify_settings, "clear_proxy_normals", text="Force Smooth Normals")
+                
+                col_sub.prop(assetify_settings, "pack_orm", text="Pack ORM (UE5/glTF)")
+                
+                row_udim = col_sub.row(align=True)
+                
+                # 1. Place 'Use UDIMs' checkbox on the shared row
+                row_udim.prop(assetify_settings, "use_udim", text="Use UDIMs")
 
-            # --- Bake Settings Box ---
-            settings_box = box.box()
-            settings_box.label(text="Bake Settings", icon='SETTINGS')
-            
-            row = settings_box.row(align=True)
-            split = row.split(factor=0.5, align=True)
-            split.label(text="Non-PrincipledBSDF Baking")
-            split.prop(assetify_settings, "non_principled_baking", text="")
-            
-            row = settings_box.row(align=True)
-            split = row.split(factor=0.5, align=True)
-            split.label(text="Skip UV Unwrap")
-            split.prop(assetify_settings, "skip_uv_unwrap", text="")
-            
-#            # Ungroup Nodes with Info
-#            row = settings_box.row(align=True)
-#            row.operator("assetify.show_ungroup_info", text="", icon='INFO', emboss=False)
-#            split = row.split(factor=0.45, align=True)
-#            split.label(text="Skip Ungrouping")
-#            split.prop(assetify_settings, "ungroup_node_groups", text="")
-            
-            row = settings_box.row(align=True)
-            split = row.split(factor=0.5, align=True)
-            split.label(text="Target Platform")
-            split.prop(assetify_settings, "platform_target", text="")
+                # 2. Conditionally place 'Tile Count' on the SAME row
+                if assetify_settings.use_udim:
+                    # Optional: Add a small separator for visual spacing
+                    row_udim.separator()
+                    # Add 'Tile Count' property to the shared row
+                    row_udim.prop(assetify_settings, "udim_tiles", text="")
 
-            row = settings_box.row(align=True)
-            split = row.split(factor=0.5, align=True)
-            split.label(text="Render Mode")
-            split.prop(assetify_settings, "render_device", text="")
-            
-            # Checkbox for device override
-            row = settings_box.row(align=True)
-            split = row.split(factor=0.5, align=True)
-            split.label(text="Override Device")
-            split.prop(assetify_settings, "use_device_override", text="")
-            
-            if assetify_settings.use_device_override:
-                row = settings_box.row(align=True)
-                split = row.split(factor=0.5, align=True)
-                split.label(text="Render Device")
-                split.prop(assetify_settings, "device_override", text="")
-            
-            row = settings_box.row(align=True)
-            split = row.split(factor=0.5, align=True)
-            split.label(text="Use Tiling")
-            split.prop(assetify_settings, "use_tiling", text="")  # Checkbox only
-            
-            if assetify_settings.use_tiling:
-                row = settings_box.row(align=True)
-                split = row.split(factor=0.5, align=True)
-                split.label(text="Tile Size")
-                split.prop(assetify_settings, "tile_size", text="")  # Numeric input
-            
-            row = settings_box.row(align=True)
-            split = row.split(factor=0.5, align=True)
-            split.label(text="Bake Folder")
-            split.prop(assetify_settings, "bake_folder", text="")
-            
-            row = settings_box.row(align=True)
-            split = row.split(factor=0.5, align=True)
-            split.label(text="Bake Resolution")
-            split.prop(assetify_settings, "bake_resolution", text="")
-            
-            row = settings_box.row(align=True)
-            split = row.split(factor=0.5, align=True)
-            split.label(text="Bake Samples")
-            split.prop(assetify_settings, "bake_samples", text="")  # Numeric input
-            
-            # Bake Button Row
+                # Hardware & Optimization
+                box_hw = col.box()
+                box_hw.label(text="Hardware & Optimzation", icon='SYSTEM')
+                col_sub = box_hw.column(align=True)
+                
+                row = col_sub.row(align=True)
+                row.label(text="Device")
+                row.prop(assetify_settings, "render_device", text="")
+                
+                row = col_sub.row(align=True)
+                row.prop(assetify_settings, "use_device_override", text="Override")
+                if assetify_settings.use_device_override:
+                    row.prop(assetify_settings, "device_override", text="")
+                
+                row = col_sub.row(align=True)
+                row.prop(assetify_settings, "use_tiling", text="Use Tiling")
+                if assetify_settings.use_tiling:
+                    row.prop(assetify_settings, "tile_size", text="Size")
+
+            # Bake Button
             bake_row = box.row(align=True)
-            info_col = bake_row.column()
-            info_col.operator("assetify.show_bake_info", text="", icon='INFO', emboss=False)
+            bake_row.scale_y = 1.5
+            bake_row.operator("assetify.show_bake_info", text="", icon='INFO', emboss=False)
             
-            bake_button_label = (
-                "Bake Selected Assets (STILL)" if assetify_settings.texturebake_mode == 'STILL'
-                else "Bake Selected Assets (ANIM)"
+            label = "Bake (Animation)" if assetify_settings.texturebake_mode == 'ANIMATION' else "Bake (Still)"
+            is_valid_bake = (
+                (assetify_settings.asset_mode == 'ASSET' and any(a.include_in_send for a in assetify_settings.baked_assets)) or
+                (assetify_settings.asset_mode == 'COLLECTION' and any(c.include_in_send for c in assetify_settings.baked_collections))
             )
-            bake_button_col = bake_row.column()
-            bake_button_col.enabled = (
-                (assetify_settings.asset_mode == 'ASSET' and any(
-                    asset.include_in_send for asset in assetify_settings.baked_assets
-                )) or
-                (assetify_settings.asset_mode == 'COLLECTION' and any(
-                    collection.include_in_send for collection in assetify_settings.baked_collections
-                ))
-            )
-            bake_button_col.operator("object.bake_textures_modal", text=bake_button_label)
+            op = bake_row.operator("object.bake_textures_modal", text=label, icon='RENDER_STILL')
+            bake_row.enabled = is_valid_bake
 
-        # Export Settings Section
+        # --- LOD & COLLIDER MANAGER ---
         box = layout.box()
         row = box.row()
-        row.prop(assetify_settings, "export_menu_expanded", text="", icon="TRIA_DOWN" if assetify_settings.export_menu_expanded else "TRIA_RIGHT", emboss=False)
-        row.label(text="Export/Import Assets")
+        row.prop(assetify_settings, "lod_menu_expanded", text="", 
+                 icon="TRIA_DOWN" if assetify_settings.lod_menu_expanded else "TRIA_RIGHT", emboss=False)
+        row.label(text="LOD & Collider Manager", icon='MOD_DECIM')
+
+        if assetify_settings.lod_menu_expanded:
+            if hasattr(scene, "assetify_lod_settings"):
+                lod_settings = scene.assetify_lod_settings
+
+                # LOD Rows
+                row = box.row(align=True)
+                row.prop(lod_settings, "generate_lod1", text="LOD 1")
+                sub = row.row()
+                sub.enabled = lod_settings.generate_lod1
+                sub.prop(lod_settings, "lod1_ratio", text="Ratio", slider=True)
+
+                row = box.row(align=True)
+                row.prop(lod_settings, "generate_lod2", text="LOD 2")
+                sub = row.row()
+                sub.enabled = lod_settings.generate_lod2
+                sub.prop(lod_settings, "lod2_ratio", text="Ratio", slider=True)
+
+                row = box.row(align=True)
+                row.prop(lod_settings, "generate_lod3", text="LOD 3")
+                sub = row.row()
+                sub.enabled = lod_settings.generate_lod3
+                sub.prop(lod_settings, "lod3_ratio", text="Ratio", slider=True)
+
+                box.prop(lod_settings, "auto_rename_original")
+
+                # Action Buttons
+                row = box.row(align=True)
+                row.operator("assetify.generate_lods", text="Generate LODs", icon='MOD_DECIM')
+                row.operator("assetify.clear_lods", text="", icon='TRASH')
+                
+                row = box.row(align=True)
+                row.operator("assetify.generate_collision", text="Generate Collider", icon='MESH_ICOSPHERE')
+                row.operator("assetify.clear_collision", text="", icon='TRASH')
+            else:
+                box.label(text="Error: LOD settings missing", icon="ERROR")
+       
+        # --- EXPORT / IMPORT SECTION ---
+        box = layout.box()
+        row = box.row()
+        row.prop(assetify_settings, "export_menu_expanded", text="", 
+                 icon="TRIA_DOWN" if assetify_settings.export_menu_expanded else "TRIA_RIGHT", emboss=False)
+        row.label(text="Export/Import Assets", icon="EXPORT")
 
         if assetify_settings.export_menu_expanded:
-            
-            # Button for Still Mode (Highlight if selected)
-            still_button = row.operator(
-                "assetify.switch_export_mode",
-                text="Still",
-                depress=assetify_settings.export_mode == 'STILL'
-            )
+            # Mode Buttons
+            row = box.row(align=True)
+            still_button = row.operator("assetify.switch_export_mode", text="Still", depress=assetify_settings.export_mode == 'STILL')
             still_button.mode = 'STILL'
-
-            # Button for Animation Mode (Highlight if selected)
-            animation_button = row.operator(
-                "assetify.switch_export_mode",
-                text="Animation",
-                depress=assetify_settings.export_mode == 'ANIMATION'
-            )
+            animation_button = row.operator("assetify.switch_export_mode", text="Animation", depress=assetify_settings.export_mode == 'ANIMATION')
             animation_button.mode = 'ANIMATION'
                 
-            # Export Section
-            export_box = layout.box()  # Create a dedicated container for export elements
-
-            # Display export_fbx_path, which is automatically updated
+            # Export Settings
+            export_box = box.box()
             row = export_box.row(align=True)
             split = row.split(factor=0.5, align=True)
             split.label(text="Export Path")
             split.prop(assetify_settings, "export_fbx_path", text="")
 
-            # Export Format Dropdown Row
-            dropdown_row = export_box.row(align=True)
+            row = export_box.row(align=True)
             if assetify_settings.export_mode == 'STILL':
-                dropdown_row.label(text="Still Export Format")
-                dropdown_row.prop(assetify_settings, "export_format", text="")
-            elif assetify_settings.export_mode == 'ANIMATION':
-                dropdown_row.label(text="Anim Export Format")
-                dropdown_row.prop(assetify_settings, "animation_export_format", text="")
+                row.label(text="Still Export Format")
+                row.prop(assetify_settings, "export_format", text="")
+            else:
+                row.label(text="Anim Export Format")
+                row.prop(assetify_settings, "animation_export_format", text="")
 
-            # Export Info Button and Export Button in the same row
+            # Export Button
             export_row = export_box.row(align=True)
-
-            # Info button always enabled to check missing files
-            info_col = export_row.column()
-            info_col.operator("assetify.show_unbaked_assets", text="", icon='INFO', emboss=False)
-
-            # Export button with dynamic operator and label
+            export_row.operator("assetify.show_unbaked_assets", text="", icon='INFO', emboss=False)
+            
             export_button_col = export_row.column()
-
             if assetify_settings.export_mode == 'STILL':
-                export_format = assetify_settings.export_format.upper()
-                export_label = f"Export Selected Still ({export_format})"
-                export_operator = "assetify.export_selected_assets"
-            elif assetify_settings.export_mode == 'ANIMATION':
-                export_format = assetify_settings.animation_export_format.upper()
-                export_label = f"Export Selected Anim ({export_format})"
-                export_operator = "assetify.export_selected_animations"
+                lbl = f"Export Selected Still ({assetify_settings.export_format.upper()})"
+                op_name = "assetify.export_selected_assets"
+            else:
+                lbl = f"Export Selected Anim ({assetify_settings.animation_export_format.upper()})"
+                op_name = "assetify.export_selected_animations"
 
             export_button_col.enabled = self.check_export_button_enabled(assetify_settings)
-            export_button_col.operator(export_operator, text=export_label)
+            export_button_col.operator(op_name, text=lbl)
 
-            # Import Section
-            import_box = layout.box()  # Create a dedicated container for import elements
-
-            # Dynamically display the appropriate import format dropdown
+            # Import Settings
+            import_box = box.box()
+            row = import_box.row(align=True)
             if assetify_settings.export_mode == 'STILL':
-                dropdown_row = import_box.row(align=True)
-                dropdown_row.label(text="Still Import Format")
-                dropdown_row.prop(assetify_settings, "import_format", text="")
-            elif assetify_settings.export_mode == 'ANIMATION':
-                dropdown_row = import_box.row(align=True)
-                dropdown_row.label(text="Anim Import Format")
-                dropdown_row.prop(assetify_settings, "animation_import_format", text="")
+                row.label(text="Still Import Format")
+                row.prop(assetify_settings, "import_format", text="")
+            else:
+                row.label(text="Anim Import Format")
+                row.prop(assetify_settings, "animation_import_format", text="")
 
-            # Import Settings Row
+            # Import Button
             import_row = import_box.row(align=True)
-
-            # Info button always enabled for checking missing files
-            info_col = import_row.column()
-            info_col.operator("assetify.show_unimportable_assets", text="", icon='INFO', emboss=False)
-
-            # Import button conditional based on file existence check
+            import_row.operator("assetify.show_unimportable_assets", text="", icon='INFO', emboss=False)
+            
             import_button_col = import_row.column()
-
-            # Dynamically update the import button label
             if assetify_settings.export_mode == 'STILL':
-                import_label = f"Import Selected Still ({assetify_settings.import_format.upper()})"
-            elif assetify_settings.export_mode == 'ANIMATION':
-                import_label = f"Import Selected Anim ({assetify_settings.animation_import_format.upper()})"
+                lbl = f"Import Selected Still ({assetify_settings.import_format.upper()})"
+            else:
+                lbl = f"Import Selected Anim ({assetify_settings.animation_import_format.upper()})"
 
-            import_button_col.operator("assetify.import_selected_fbx", text=import_label)
+            import_button_col.operator("assetify.import_selected_fbx", text=lbl)
     
     def check_import_button_enabled(self, assetify_settings):
         """Returns True if the Import button should be enabled based on include_in_send and file existence."""
@@ -8777,13 +9117,19 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         return unexported_asset_names
 
     def draw_social_links(self, layout):
+        # --- SAFETY CHECK ---
+        # If custom_icons hasn't loaded yet (is None), stop here to prevent the crash.
+        global custom_icons
+        if custom_icons is None:
+            return
+
         # Define the URLs and icon values for the social buttons
         socials = [
             ("https://www.youtube.com/@NinoDefoq", "youtube_icon"),
             ("https://www.instagram.com/defo.q", "instagram_icon"),
             ("https://x.com/DefoNino", "x_icon"),
             ("https://discord.gg/tgbuXp3eav", "discord_icon"),
-            ("https://www.patreon.com/NinoDefoQ", "patreon_icon"),
+            #("https://www.patreon.com/NinoDefoQ", "patreon_icon"),
             ("https://www.ninodefoq.com", "website_icon"),
             ("https://www.linkedin.com/in/ninobolink/", "linkedin_icon"),
             ("https://www.tiktok.com/@defo.q", "tiktok_icon")
@@ -8794,12 +9140,14 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
 
         # Iterate over the list of socials and add each icon
         for url, icon_key in socials:
+            # Check if key exists in the loaded icons collection
             if icon_key in custom_icons:
                 icon_id = custom_icons[icon_key].icon_id
                 # Add an operator for each social link
                 flow.operator("wm.url_open", text="", icon_value=icon_id).url = url
             else:
-                print(f"Warning: Icon '{icon_key}' not found in custom_icons.")
+                # Fallback if icon file is missing (avoids silent failure)
+                flow.operator("wm.url_open", text="Link", icon='URL').url = url
 
 class ASSETIFY_OT_show_ungroup_info(bpy.types.Operator):
     """Show detailed info about ungrouping node groups"""  
@@ -9037,6 +9385,30 @@ def register():
             print(f"[INFO] Class {cls.__name__} registered successfully.")
         except Exception as e:
             print(f"[ERROR] Failed to register class {cls.__name__}: {e}")
+            
+    # Register LOD Manager
+    try:
+        lod_manager.register()
+        print("[INFO] lod_manager registered successfully.")
+    except Exception as e:
+        print(f"[ERROR] Failed to register lod_manager: {e}")
+
+    # Register Collision Manager
+    try:
+        collision.register()
+        print("[INFO] collision registered successfully.")
+    except Exception as e:
+        print(f"[ERROR] Failed to register collision: {e}")
+    
+    try:
+        pivot_tool.register()
+        print("[INFO] pivot_tool registered successfully.")
+    except Exception as e:
+        print(f"[ERROR] Failed to register pivot_tool: {e}")
+    
+    # Register Scene property for the toggle (Keep this in init.py)
+    bpy.types.Scene.show_lod_manager = bpy.props.BoolProperty(default=False)
+        
 
     # Load custom icons
     load_custom_icons()
@@ -9121,6 +9493,17 @@ def unregister():
         print("[INFO] AssetifyAnimationSettings unregistered successfully.")
     except Exception as e:
         print(f"[ERROR] Failed to unregister AssetifyAnimationSettings: {e}")
+        
+    try:
+        lod_manager.unregister()
+        collision.unregister()
+    except Exception as e:
+        print(f"[INFO] lod_manager was not registered: {e}")
+        
+    try:
+        pivot_tool.unregister()
+    except Exception as e:
+        print(f"[INFO] pivot_tool was not registered: {e}")
 
     # Unregister addon updater operations
     addon_updater_ops.unregister()
