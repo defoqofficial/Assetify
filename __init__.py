@@ -4394,6 +4394,8 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                 baking_steps.append({"name": "Baking Emission Strength", "map": "EmissionStrength", "type": "EMIT"})
             if assetify_settings.bake_transmission:
                 baking_steps.append({"name": "Baking Transmission", "map": "Transmission", "type": "EMIT"})
+            if assetify_settings.bake_alpha:
+                baking_steps.append({"name": "Baking Alpha", "map": "Alpha", "type": "EMIT"})
 
             # 2. ORM Packing
             if assetify_settings.pack_orm:
@@ -4479,6 +4481,8 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                                 bake_emission_strength_map(obj_to_process, assetify_settings.bake_resolution, save_dir, platform)
                             elif step["map"] == "Transmission":
                                 bake_transmission_map(obj_to_process, assetify_settings.bake_resolution, save_dir, platform)
+                            elif step["map"] == "Alpha":
+                                bake_alpha_map(obj_to_process, assetify_settings.bake_resolution, save_dir)
                             else:
                                 # Standard Bake
                                 bake_and_save(
@@ -5732,16 +5736,20 @@ def bake_metallic_as_emission(obj, resolution, save_dir, platform):
             # Check if source is SCALAR (Gray socket) or Alpha
             # If so, we MUST use CombineRGB to convert "Value" -> (R,G,B)
             if src.type in {'VALUE', 'FLOAT', 'INT', 'BOOLEAN'} or "Alpha" in src.name:
-                combine_node = nt.nodes.new('ShaderNodeCombineRGB')
+                # FIX: Use ShaderNodeCombineColor
+                combine_node = nt.nodes.new('ShaderNodeCombineColor')
+                combine_node.mode = 'RGB'
                 combine_node.name = "Assetify_Temp_Combine_"
                 combine_node.location = (emit_node.location.x - 200, emit_node.location.y)
                 
-                nt.links.new(src, combine_node.inputs['R'])
-                nt.links.new(src, combine_node.inputs['G'])
-                nt.links.new(src, combine_node.inputs['B'])
+                # FIX: Inputs 'Red', 'Green', 'Blue'
+                nt.links.new(src, combine_node.inputs['Red'])
+                nt.links.new(src, combine_node.inputs['Green'])
+                nt.links.new(src, combine_node.inputs['Blue'])
                 
-                nt.links.new(combine_node.outputs['Image'], emit_node.inputs['Color'])
-                print(f"[DEBUG] {mat.name}: Converted Scalar Metallic to RGB via Combine Node.")
+                # FIX: Output 'Color'
+                nt.links.new(combine_node.outputs['Color'], emit_node.inputs['Color'])
+                print(f"[DEBUG] {mat.name}: Converted Scalar Metallic to RGB via CombineColor Node.")
             else:
                 # Source is likely already Color/Vector, link directly
                 nt.links.new(src, emit_node.inputs['Color'])
@@ -6452,14 +6460,20 @@ def bake_transmission_map(obj, resolution, save_dir, platform):
         # Convert transmission value (a float) to grayscale.
         if transmission_source:
             if transmission_source.type in {'VALUE', 'FLOAT'}:
-                combine_node = node_tree.nodes.new(type='ShaderNodeCombineRGB')
+                # FIX: Use ShaderNodeCombineColor
+                combine_node = node_tree.nodes.new(type='ShaderNodeCombineColor')
+                combine_node.mode = 'RGB'
                 combine_node.name = "Assetify_Temp_CombineRGB_" + combine_node.name
                 combine_node.location = (transmission_source.node.location.x - 200, transmission_source.node.location.y)
-                node_tree.links.new(transmission_source, combine_node.inputs['R'])
-                node_tree.links.new(transmission_source, combine_node.inputs['G'])
-                node_tree.links.new(transmission_source, combine_node.inputs['B'])
-                node_tree.links.new(combine_node.outputs['Image'], emission_node.inputs['Color'])
-                print(f"[DEBUG] Connected Transmission Weight through CombineRGB for {mat.name}.")
+                
+                # FIX: Inputs 'Red', 'Green', 'Blue'
+                node_tree.links.new(transmission_source, combine_node.inputs['Red'])
+                node_tree.links.new(transmission_source, combine_node.inputs['Green'])
+                node_tree.links.new(transmission_source, combine_node.inputs['Blue'])
+                
+                # FIX: Output 'Color'
+                node_tree.links.new(combine_node.outputs['Color'], emission_node.inputs['Color'])
+                print(f"[DEBUG] Connected Transmission Weight through CombineColor for {mat.name}.")
                 added_nodes.setdefault(mat.name, []).append(combine_node)
             else:
                 node_tree.links.new(transmission_source, emission_node.inputs['Color'])
@@ -6603,14 +6617,21 @@ def bake_alpha_map(obj, resolution, save_dir):
         if alpha_input.is_linked:
             alpha_source = alpha_input.links[0].from_socket
             if alpha_source.type in {'VALUE', 'FLOAT'}:
-                combine_node = node_tree.nodes.new(type='ShaderNodeCombineRGB')
+                # FIX: Use ShaderNodeCombineColor for Blender 4.0+
+                combine_node = node_tree.nodes.new(type='ShaderNodeCombineColor')
+                combine_node.mode = 'RGB'  # Ensure mode is RGB
                 combine_node.name = "Assetify_Temp_CombineRGB_" + combine_node.name
                 combine_node.location = (alpha_source.node.location.x - 200, alpha_source.node.location.y)
-                node_tree.links.new(alpha_source, combine_node.inputs['R'])
-                node_tree.links.new(alpha_source, combine_node.inputs['G'])
-                node_tree.links.new(alpha_source, combine_node.inputs['B'])
-                node_tree.links.new(combine_node.outputs['Image'], emission_node.inputs['Color'])
-                print(f"[DEBUG] Connected Alpha value through CombineRGB for {mat.name}.")
+                
+                # FIX: Inputs are 'Red', 'Green', 'Blue'
+                node_tree.links.new(alpha_source, combine_node.inputs['Red'])
+                node_tree.links.new(alpha_source, combine_node.inputs['Green'])
+                node_tree.links.new(alpha_source, combine_node.inputs['Blue'])
+                
+                # FIX: Output is 'Color'
+                node_tree.links.new(combine_node.outputs['Color'], emission_node.inputs['Color'])
+                
+                print(f"[DEBUG] Connected Alpha value through CombineColor for {mat.name}.")
                 added_nodes.setdefault(mat.name, []).append(combine_node)
             else:
                 node_tree.links.new(alpha_source, emission_node.inputs['Color'])
@@ -6881,6 +6902,15 @@ def apply_baked_textures(obj, save_dir, platform="UE5", asset_name_override=None
         if img_t:
             t_node = create_tex_node(img_t, "Transmission")
             node_tree.links.new(t_node.outputs['Color'], bsdf_node.inputs['Transmission Weight'])
+            current_y -= spacing
+            
+    # --- 6. Alpha ---
+    if assetify_settings.bake_alpha:
+        img_a = load_texture("Alpha", 'Non-Color')
+        if img_a:
+            a_node = create_tex_node(img_a, "Alpha")
+            # Connect to Principled BSDF Alpha input
+            node_tree.links.new(a_node.outputs['Color'], bsdf_node.inputs['Alpha'])
             current_y -= spacing
 
     print(f"[Assetify] Applied textures to {obj.name}. AO Multiplied: {ao_socket is not None}")
