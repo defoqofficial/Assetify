@@ -3908,16 +3908,31 @@ def start_progress_bar(operator, initial_message="Initializing Process..."):
     # bpy.app.timers.register(lambda: update_progress(operator), first_interval=0.1)
     
 def remove_progress_bar(operator):
-    """Removes the progress bar and stops updating."""
+    """Removes the progress bar and forces a redraw to clear the UI."""
     if operator.draw_handler is not None and operator.space_reference is not None:
-        operator.space_reference.draw_handler_remove(operator.draw_handler, 'WINDOW')
+        try:
+            operator.space_reference.draw_handler_remove(operator.draw_handler, 'WINDOW')
+        except Exception as e:
+            # If the space was closed or context changed, this might fail, but we continue anyway
+            print(f"[Assetify] Warning: Could not remove draw handler cleanly: {e}")
+        
         operator.draw_handler = None
         operator.space_reference = None
-        print("Progress bar draw handler removed.")
+        print("[Assetify] Progress bar draw handler removed.")
+
+    # Reset strings
     operator.current_operation = ""
     operator.current_sub_operation = ""
     
-    print("Progress bar removed and baking complete.")
+    # --- CRITICAL FIX: FORCE REDRAW ---
+    # We must iterate through all areas and force them to refresh 
+    # to wipe the "ghost" progress bar pixels immediately.
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+    
+    print("[Assetify] UI Redraw triggered to clear progress bar.")
 
 class ASSETIFY_OT_refresh_asset_collection_list(bpy.types.Operator):
     """Refresh the Asset and Collection Lists"""
@@ -4530,7 +4545,10 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
             else:
                 # All Done
                 self.current_operation = "Baking Complete."
-                remove_progress_bar(self)
+                
+                # This calls our new robust function
+                remove_progress_bar(self) 
+                
                 switch_to_solid_shading_and_back()
                 context.window_manager.event_timer_remove(self._timer)
                 return {'FINISHED'}
@@ -4646,11 +4664,7 @@ def ensure_optix_denoiser():
         scene.cycles.use_denoising = False
         print("[DEBUG] No compatible denoiser available, disabling denoising.")
         
-def distribute_uvs_to_udims(obj, tile_count):
-    """
-    Distributes UV islands across UDIM tiles by packing bins into 0-1 
-    and then shifting the UV coordinates directly.
-    """
+def distribute_uvs_to_udims(obj, tile_count, uv_margin):
     import bmesh
     import bpy
     
@@ -4662,6 +4676,10 @@ def distribute_uvs_to_udims(obj, tile_count):
     islands = []
     faces_processed = set()
     
+    # Helper to calc island area
+    def get_island_area(faces):
+        return sum(f.calc_area() for f in faces)
+
     for face in bm.faces:
         if face in faces_processed:
             continue
@@ -4672,7 +4690,6 @@ def distribute_uvs_to_udims(obj, tile_count):
         while stack:
             f = stack.pop()
             faces_processed.add(f)
-            
             for edge in f.edges:
                 for linked_face in edge.link_faces:
                     if linked_face not in faces_processed and linked_face not in island_faces:
@@ -4681,115 +4698,101 @@ def distribute_uvs_to_udims(obj, tile_count):
         
         islands.append(list(island_faces))
 
-    # 2. Distribute Islands into Bins (Simple Area Balancing)
+    # 2. Distribute Islands into Bins (Balanced by AREA, not count)
     bins = [[] for _ in range(tile_count)]
     bin_areas = [0.0] * tile_count
     
-    # Sort by face count (approximate size)
-    islands.sort(key=len, reverse=True)
+    # Sort islands by area (largest first) to pack efficiently
+    islands.sort(key=get_island_area, reverse=True)
     
     for island in islands:
+        area = get_island_area(island)
+        # Find the bin with the least area so far
         min_bin_idx = bin_areas.index(min(bin_areas))
         bins[min_bin_idx].extend(island)
-        bin_areas[min_bin_idx] += len(island)
+        bin_areas[min_bin_idx] += area
 
     # 3. Pack and Move Each Bin
     for i, bin_faces in enumerate(bins):
         if not bin_faces:
             continue
             
-        # Deselect everything first
         bpy.ops.mesh.select_all(action='DESELECT')
         
-        # Select faces in this bin
         for face in bin_faces:
             face.select = True
         
-        # Force update so the operator sees the selection
         bmesh.update_edit_mesh(me)
             
-        # Pack these faces into the 0-1 unit square
+        # Pack this tile's islands
+        # scale=True ensures we maximize texture usage for this tile
         bpy.ops.uv.pack_islands(
             udim_source='CLOSEST_UDIM', 
             rotate=False,
-            scale=True,
-            margin=0.001
+            scale=True, 
+            margin=uv_margin
         )
         
         # 4. Offset UVs to the correct UDIM Tile
-        # Tile 0 (1001) = No offset
-        # Tile 1 (1002) = +1 U offset
         u_offset = i % 10
         v_offset = i // 10
         
         if u_offset > 0 or v_offset > 0:
-            # We must modify the UVs directly in the BMesh
-            # Re-acquire BMesh after operator might have touched it
-            # (Though pack_islands usually plays nice, let's be safe by iterating current selection)
             for face in bm.faces:
                 if face.select:
                     for loop in face.loops:
                         loop[uv_layer].uv.x += u_offset
                         loop[uv_layer].uv.y += v_offset
         
-    # Final Update
     bmesh.update_edit_mesh(me)
         
 def smart_uv_project(obj):
-    """
-    Adds a clean 'GameUV' map, applies Smart UV Project, and handles UDIM distribution.
-    Running this on the Original Object first ensures consistency.
-    """
     if obj.type != 'MESH':
         return
 
     assetify_settings = bpy.context.scene.assetify_bake_settings
     use_udim = assetify_settings.use_udim
     tile_count = assetify_settings.udim_tiles
+    
+    # Get user setting for margin
+    uv_margin = assetify_settings.uv_margin
 
-    # Ensure we're in object mode to setup layers
     bpy.ops.object.mode_set(mode='OBJECT')
 
     uv_map_name = "GameUV"
-    
-    # 1. CLEANUP: Remove existing GameUV if it exists to prevent duplicates
     if uv_map_name in obj.data.uv_layers:
         obj.data.uv_layers.remove(obj.data.uv_layers[uv_map_name])
 
-    # 2. Create fresh UV Layer
     uv_layer = obj.data.uv_layers.new(name=uv_map_name)
     obj.data.uv_layers.active = uv_layer
     
-    # Switch to edit mode for operations
     bpy.ops.object.mode_set(mode='EDIT')
     bpy.ops.mesh.select_all(action='SELECT')
 
-    # 3. Initial Smart Project (Everything goes to 0-1)
+    # 1. Initial Smart Project (Cuts seams and creates initial islands)
     bpy.ops.uv.smart_project(
         angle_limit=m.radians(66.0),
-        island_margin=0.001,
+        island_margin=uv_margin, 
         area_weight=0.0,
         correct_aspect=True,
         scale_to_bounds=False
     )
+    
+    # 2. Average Scale (Crucial step to normalize texel density before splitting)
+    bpy.ops.uv.average_islands_scale()
 
-    # Retrieve the margin setting
-    uv_margin = assetify_settings.uv_margin
-
-    # 4. Distribute to UDIMs if enabled
+    # 3. Distribute or Pack
     if use_udim and tile_count > 1:
         print(f"[Assetify] Distributing UVs across {tile_count} UDIM tiles...")
-        distribute_uvs_to_udims(obj, tile_count)
+        distribute_uvs_to_udims(obj, tile_count, uv_margin)
     else:
-        # Standard Single Tile Pack (Ensures nothing drifts outside 0-1)
         bpy.ops.uv.pack_islands(
             udim_source='CLOSEST_UDIM',
             rotate=True,
             scale=True,
-            margin=uv_margin  # <--- CHANGED from 0.001
+            margin=uv_margin
         )
 
-    # Return to Object Mode
     bpy.ops.object.mode_set(mode='OBJECT')
     
 def convert_uvmap_attribute_to_uv_layer(obj):
