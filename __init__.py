@@ -3345,6 +3345,26 @@ def apply_global_animation_setting(assetify_settings):
             print(f"[DEBUG] Set animation processing for '{asset.name}' to {assetify_settings.process_animations_global}.")    
 
 class AssetifyBakeSettings(bpy.types.PropertyGroup):
+    
+    uv_mode: bpy.props.EnumProperty(
+        name="UV Mode",
+        description="Choose whether to auto-unwrap or use existing UVs",
+        items=[
+            ('UNWRAP', "UV Unwrap", "Automatically unwrap UVs before baking", 'UV', 0),
+            ('SKIP', "Skip UV Unwrap", "Use existing UV maps", 'LOCKED', 1)
+        ],
+        default='UNWRAP'
+    )
+    
+    uv_margin: bpy.props.FloatProperty(
+        name="UV Margin",
+        description="Space between UV islands to prevent texture bleeding",
+        default=0.001,
+        min=0.0,
+        max=1.0,
+        precision=4
+    )
+    
     clear_proxy_normals: bpy.props.BoolProperty(
         name="Clear Proxy Normals",
         description="Removes custom split normals and Weighted Normal modifiers from the baking proxy. Enable if shading looks incorrect.",
@@ -4394,8 +4414,6 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                 baking_steps.append({"name": "Baking Emission Strength", "map": "EmissionStrength", "type": "EMIT"})
             if assetify_settings.bake_transmission:
                 baking_steps.append({"name": "Baking Transmission", "map": "Transmission", "type": "EMIT"})
-            if assetify_settings.bake_alpha:
-                baking_steps.append({"name": "Baking Alpha", "map": "Alpha", "type": "EMIT"})
 
             # 2. ORM Packing
             if assetify_settings.pack_orm:
@@ -4469,10 +4487,10 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                                 obj_to_process = real_obj
 
                             # Unwrap Once
-                            if self._step_index == 0 and not assetify_settings.skip_uv_unwrap:
-                                 if not real_obj.get("assetify_unwrapped"):
-                                     smart_uv_project(real_obj)
-                                     real_obj["assetify_unwrapped"] = True
+                            if self._step_index == 0 and assetify_settings.uv_mode == 'UNWRAP':
+                                if not real_obj.get("assetify_unwrapped"):
+                                    smart_uv_project(real_obj)
+                                    real_obj["assetify_unwrapped"] = True
 
                             # Special Handling for Emission Maps
                             if step["map"] == "EmissionColor":
@@ -4481,8 +4499,6 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                                 bake_emission_strength_map(obj_to_process, assetify_settings.bake_resolution, save_dir, platform)
                             elif step["map"] == "Transmission":
                                 bake_transmission_map(obj_to_process, assetify_settings.bake_resolution, save_dir, platform)
-                            elif step["map"] == "Alpha":
-                                bake_alpha_map(obj_to_process, assetify_settings.bake_resolution, save_dir)
                             else:
                                 # Standard Bake
                                 bake_and_save(
@@ -4757,6 +4773,9 @@ def smart_uv_project(obj):
         scale_to_bounds=False
     )
 
+    # Retrieve the margin setting
+    uv_margin = assetify_settings.uv_margin
+
     # 4. Distribute to UDIMs if enabled
     if use_udim and tile_count > 1:
         print(f"[Assetify] Distributing UVs across {tile_count} UDIM tiles...")
@@ -4767,7 +4786,7 @@ def smart_uv_project(obj):
             udim_source='CLOSEST_UDIM',
             rotate=True,
             scale=True,
-            margin=0.001
+            margin=uv_margin  # <--- CHANGED from 0.001
         )
 
     # Return to Object Mode
@@ -5736,20 +5755,16 @@ def bake_metallic_as_emission(obj, resolution, save_dir, platform):
             # Check if source is SCALAR (Gray socket) or Alpha
             # If so, we MUST use CombineRGB to convert "Value" -> (R,G,B)
             if src.type in {'VALUE', 'FLOAT', 'INT', 'BOOLEAN'} or "Alpha" in src.name:
-                # FIX: Use ShaderNodeCombineColor
-                combine_node = nt.nodes.new('ShaderNodeCombineColor')
-                combine_node.mode = 'RGB'
+                combine_node = nt.nodes.new('ShaderNodeCombineRGB')
                 combine_node.name = "Assetify_Temp_Combine_"
                 combine_node.location = (emit_node.location.x - 200, emit_node.location.y)
                 
-                # FIX: Inputs 'Red', 'Green', 'Blue'
-                nt.links.new(src, combine_node.inputs['Red'])
-                nt.links.new(src, combine_node.inputs['Green'])
-                nt.links.new(src, combine_node.inputs['Blue'])
+                nt.links.new(src, combine_node.inputs['R'])
+                nt.links.new(src, combine_node.inputs['G'])
+                nt.links.new(src, combine_node.inputs['B'])
                 
-                # FIX: Output 'Color'
-                nt.links.new(combine_node.outputs['Color'], emit_node.inputs['Color'])
-                print(f"[DEBUG] {mat.name}: Converted Scalar Metallic to RGB via CombineColor Node.")
+                nt.links.new(combine_node.outputs['Image'], emit_node.inputs['Color'])
+                print(f"[DEBUG] {mat.name}: Converted Scalar Metallic to RGB via Combine Node.")
             else:
                 # Source is likely already Color/Vector, link directly
                 nt.links.new(src, emit_node.inputs['Color'])
@@ -6460,20 +6475,14 @@ def bake_transmission_map(obj, resolution, save_dir, platform):
         # Convert transmission value (a float) to grayscale.
         if transmission_source:
             if transmission_source.type in {'VALUE', 'FLOAT'}:
-                # FIX: Use ShaderNodeCombineColor
-                combine_node = node_tree.nodes.new(type='ShaderNodeCombineColor')
-                combine_node.mode = 'RGB'
+                combine_node = node_tree.nodes.new(type='ShaderNodeCombineRGB')
                 combine_node.name = "Assetify_Temp_CombineRGB_" + combine_node.name
                 combine_node.location = (transmission_source.node.location.x - 200, transmission_source.node.location.y)
-                
-                # FIX: Inputs 'Red', 'Green', 'Blue'
-                node_tree.links.new(transmission_source, combine_node.inputs['Red'])
-                node_tree.links.new(transmission_source, combine_node.inputs['Green'])
-                node_tree.links.new(transmission_source, combine_node.inputs['Blue'])
-                
-                # FIX: Output 'Color'
-                node_tree.links.new(combine_node.outputs['Color'], emission_node.inputs['Color'])
-                print(f"[DEBUG] Connected Transmission Weight through CombineColor for {mat.name}.")
+                node_tree.links.new(transmission_source, combine_node.inputs['R'])
+                node_tree.links.new(transmission_source, combine_node.inputs['G'])
+                node_tree.links.new(transmission_source, combine_node.inputs['B'])
+                node_tree.links.new(combine_node.outputs['Image'], emission_node.inputs['Color'])
+                print(f"[DEBUG] Connected Transmission Weight through CombineRGB for {mat.name}.")
                 added_nodes.setdefault(mat.name, []).append(combine_node)
             else:
                 node_tree.links.new(transmission_source, emission_node.inputs['Color'])
@@ -6617,21 +6626,14 @@ def bake_alpha_map(obj, resolution, save_dir):
         if alpha_input.is_linked:
             alpha_source = alpha_input.links[0].from_socket
             if alpha_source.type in {'VALUE', 'FLOAT'}:
-                # FIX: Use ShaderNodeCombineColor for Blender 4.0+
-                combine_node = node_tree.nodes.new(type='ShaderNodeCombineColor')
-                combine_node.mode = 'RGB'  # Ensure mode is RGB
+                combine_node = node_tree.nodes.new(type='ShaderNodeCombineRGB')
                 combine_node.name = "Assetify_Temp_CombineRGB_" + combine_node.name
                 combine_node.location = (alpha_source.node.location.x - 200, alpha_source.node.location.y)
-                
-                # FIX: Inputs are 'Red', 'Green', 'Blue'
-                node_tree.links.new(alpha_source, combine_node.inputs['Red'])
-                node_tree.links.new(alpha_source, combine_node.inputs['Green'])
-                node_tree.links.new(alpha_source, combine_node.inputs['Blue'])
-                
-                # FIX: Output is 'Color'
-                node_tree.links.new(combine_node.outputs['Color'], emission_node.inputs['Color'])
-                
-                print(f"[DEBUG] Connected Alpha value through CombineColor for {mat.name}.")
+                node_tree.links.new(alpha_source, combine_node.inputs['R'])
+                node_tree.links.new(alpha_source, combine_node.inputs['G'])
+                node_tree.links.new(alpha_source, combine_node.inputs['B'])
+                node_tree.links.new(combine_node.outputs['Image'], emission_node.inputs['Color'])
+                print(f"[DEBUG] Connected Alpha value through CombineRGB for {mat.name}.")
                 added_nodes.setdefault(mat.name, []).append(combine_node)
             else:
                 node_tree.links.new(alpha_source, emission_node.inputs['Color'])
@@ -6902,15 +6904,6 @@ def apply_baked_textures(obj, save_dir, platform="UE5", asset_name_override=None
         if img_t:
             t_node = create_tex_node(img_t, "Transmission")
             node_tree.links.new(t_node.outputs['Color'], bsdf_node.inputs['Transmission Weight'])
-            current_y -= spacing
-            
-    # --- 6. Alpha ---
-    if assetify_settings.bake_alpha:
-        img_a = load_texture("Alpha", 'Non-Color')
-        if img_a:
-            a_node = create_tex_node(img_a, "Alpha")
-            # Connect to Principled BSDF Alpha input
-            node_tree.links.new(a_node.outputs['Color'], bsdf_node.inputs['Alpha'])
             current_y -= spacing
 
     print(f"[Assetify] Applied textures to {obj.name}. AO Multiplied: {ao_socket is not None}")
@@ -8896,23 +8889,100 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 row.label(text="Platform")
                 row.prop(assetify_settings, "platform_target", text="") 
                 
-                col_sub.prop(assetify_settings, "skip_uv_unwrap", text="Skip UV Unwrap")
-                col_sub.prop(assetify_settings, "non_principled_baking", text="Non-Principled Logic")
-                col_sub.prop(assetify_settings, "clear_proxy_normals", text="Force Smooth Normals")
+                DECORATOR_WIDTH = 0.1 
                 
-                col_sub.prop(assetify_settings, "pack_orm", text="Pack ORM (UE5/glTF)")
+                # ==========================
+                # ROW 3: MIX SHADER SETUP
+                # [ Checkbox ] | [ "Mix Shader Setup" ]
+                # ==========================
+                row = col_sub.row(align=True)
+                split = row.split(factor=DECORATOR_WIDTH, align=True)
                 
-                row_udim = col_sub.row(align=True)
+                # Left Col
+                c_left = split.column(align=False)
+                c_left.prop(assetify_settings, "non_principled_baking", text="")
                 
-                # 1. Place 'Use UDIMs' checkbox on the shared row
-                row_udim.prop(assetify_settings, "use_udim", text="Use UDIMs")
+                # Right Col
+                c_right = split.column(align=True)
+                c_right.label(text="Mix Shader Setup")
 
-                # 2. Conditionally place 'Tile Count' on the SAME row
-                if assetify_settings.use_udim:
-                    # Optional: Add a small separator for visual spacing
-                    row_udim.separator()
-                    # Add 'Tile Count' property to the shared row
-                    row_udim.prop(assetify_settings, "udim_tiles", text="")
+
+                # ==========================
+                # ROW 4: FORCE SMOOTH NORMALS
+                # [ Checkbox ] | [ "Force Smooth Normals" ]
+                # ==========================
+                row = col_sub.row(align=True)
+                split = row.split(factor=DECORATOR_WIDTH, align=True)
+                
+                c_left = split.column(align=False)
+                c_left.prop(assetify_settings, "clear_proxy_normals", text="")
+                
+                c_right = split.column(align=True)
+                c_right.label(text="Force Smooth Normals")
+
+
+                # ==========================
+                # ROW 5: PACK ORM
+                # [ Checkbox ] | [ "Pack ORM (UE5/glTF)" ]
+                # ==========================
+                row = col_sub.row(align=True)
+                split = row.split(factor=DECORATOR_WIDTH, align=True)
+                
+                c_left = split.column(align=False)
+                c_left.prop(assetify_settings, "pack_orm", text="")
+                
+                c_right = split.column(align=True)
+                c_right.label(text="Pack ORM (UE5/glTF)")
+                
+                # Small separator to push the numeric settings slightly down
+                col_sub.separator(factor=1)
+
+                # 1. UV Mode Toggle (With Icons defined in property)
+                row = col_sub.row(align=True)
+                row.scale_y = 1.2  # Make the toggle buttons slightly taller/fatter
+                row.prop(assetify_settings, "uv_mode", expand=True)
+
+                if assetify_settings.uv_mode == 'UNWRAP':
+                    
+                    col_sub.separator(factor=1)
+
+                    # ==========================
+                    # ROW 1: UV MARGIN
+                    # [ Icon ] | [ "UV Margin" + Input ]
+                    # ==========================
+                    row = col_sub.row(align=True)
+                    split = row.split(factor=DECORATOR_WIDTH, align=True)
+                    
+                    # Left Col (Icon)
+                    # We remove align=True here so the icon/checkbox isn't crushed
+                    c_left = split.column(align=False) 
+                    c_left.label(text="", icon='TEXTURE')
+                    
+                    # Right Col (Label + Value)
+                    c_right = split.column(align=True)
+                    r_sub = c_right.row(align=True)
+                    r_sub.label(text="UV Margin")
+                    r_sub.prop(assetify_settings, "uv_margin", text="")
+
+
+                    # ==========================
+                    # ROW 2: USE UDIMS
+                    # [ Checkbox ] | [ "Use UDIMs" + Tile Count ]
+                    # ==========================
+                    row = col_sub.row(align=True)
+                    split = row.split(factor=DECORATOR_WIDTH, align=True)
+                    
+                    # Left Col (Checkbox)
+                    c_left = split.column(align=False)
+                    c_left.prop(assetify_settings, "use_udim", text="")
+
+                    # Right Col (Label + Tile Count)
+                    c_right = split.column(align=True)
+                    r_sub = c_right.row(align=True)
+                    r_sub.label(text="Use UDIMs")
+                    
+                    if assetify_settings.use_udim:
+                        r_sub.prop(assetify_settings, "udim_tiles", text="")
 
                 # Hardware & Optimization
                 box_hw = col.box()
