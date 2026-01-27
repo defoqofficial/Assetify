@@ -2,7 +2,7 @@ bl_info = {
     "name": "Assetify",
     "description": "Convert ANYTHING into game-ready assets with baked textures.",
     "author": "Nino Defoq",
-    "version": (3, 0, 0),
+    "version": (3, 0, 1),
     "blender": (4, 0, 0),
     "location": "3D View > Tool Shelf > Assetify",
     "warning": "",
@@ -33,6 +33,7 @@ from . import animation_processor
 from . import anim_cloth
 from . import lod_manager
 from . import collision
+from . import op_send_to_unreal
 import bpy.utils.previews
 import numpy
 import uuid
@@ -4297,6 +4298,51 @@ def restore_original_object(context, original_obj, proxy_obj, original_name):
                 bpy.data.meshes.remove(mesh_data)
             except: pass
         
+class ASSETIFY_OT_UnrealHelp(bpy.types.Operator):
+    """Show Unreal Engine Connection Setup Instructions"""
+    bl_idname = "assetify.unreal_help"
+    bl_label = "Unreal Connection Setup"
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    def invoke(self, context, event):
+        # Using invoke_props_dialog forces a modal 'OK' box, which is more visible
+        return context.window_manager.invoke_props_dialog(self, width=400)
+
+    def draw(self, context):
+        # INDENTATION IS CRITICAL HERE
+        layout = self.layout
+        
+        # Main Box
+        box = layout.box()
+        row = box.row()
+        row.alignment = 'CENTER'
+        row.label(text="Unreal Engine 5 Setup", icon='INFO')
+        
+        box.separator()
+        
+        # Instructions
+        col = box.column(align=True)
+        col.label(text="1. In Unreal: Edit > Plugins")
+        col.label(text="   - Enable 'Python Editor Script Plugin'")
+        col.label(text="   - Enable 'Editor Scripting Utilities'")
+        col.label(text="   - Restart Unreal Engine")
+        
+        box.separator()
+        
+        col.label(text="2. In Unreal: Edit > Project Settings > Plugins > Python")
+        col.label(text="   - Check 'Enable Remote Execution'")
+        col.label(text="   - Below that, under Advanced: Set Multicast Group Endpoint to:")
+        
+        # IP Address Box
+        ip_box = col.box()
+        r = ip_box.row()
+        r.alignment = 'CENTER'
+        r.label(text="239.0.0.1:6766")
+
+    def execute(self, context):
+        # This handles the 'OK' click
+        return {'FINISHED'} 
+        
 class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
     """Bake Textures for Unreal Engine with Progress Bar (Modal)"""
     bl_idname = "object.bake_textures_modal"
@@ -4348,10 +4394,22 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                     collection = bpy.data.collections.get(baked_collection.name)
                     if collection:
                         self._objects_to_bake.extend(self.collect_objects_from_collection(collection))
+                        
+            self._objects_to_bake = list(dict.fromkeys(self._objects_to_bake))
 
         if not self._objects_to_bake:
             self.report({'ERROR'}, "No objects to bake.")
             return {'CANCELLED'}
+        
+        print("[Assetify] Forcing ungroup of all node groups...")
+        for obj in self._objects_to_bake:
+            for mat in obj.data.materials:
+                if mat and mat.use_nodes and mat.node_tree:
+                    try:
+                        # Use the safe function from your module that preserves values
+                        non_principled_baking.ungroup_all_node_groups(mat.node_tree)
+                    except Exception as e:
+                        print(f"Warning: Could not ungroup {mat.name}: {e}")
 
         # --- NON-PRINCIPLED LOGIC SETUP ---
         # FIX: We run the logic conversion but DO NOT GROUP IT.
@@ -4531,6 +4589,13 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                         
                     except Exception as e:
                         print(f"Error processing {step['name']}: {e}")
+                        
+                        # [INSERT THIS BLOCK HERE]
+#                        if "DEBUG_STOP" in str(e):
+#                            self.report({'WARNING'}, "🛑 DEBUG PAUSE: Script stopped for inspection.")
+#                            # This cancels the modal operator so it stops looping
+#                            return {'CANCELLED'} 
+                        # -------------------------
                     
                     self._step_index += 1
                 else:
@@ -4757,8 +4822,10 @@ def smart_uv_project(obj):
     # Get user setting for margin
     uv_margin = assetify_settings.uv_margin
 
+    # Ensure we are in Object mode to manipulate layers safely
     bpy.ops.object.mode_set(mode='OBJECT')
 
+    # Reset/Setup UV Map
     uv_map_name = "GameUV"
     if uv_map_name in obj.data.uv_layers:
         obj.data.uv_layers.remove(obj.data.uv_layers[uv_map_name])
@@ -4766,8 +4833,15 @@ def smart_uv_project(obj):
     uv_layer = obj.data.uv_layers.new(name=uv_map_name)
     obj.data.uv_layers.active = uv_layer
     
+    # Switch to Edit Mode for operations
     bpy.ops.object.mode_set(mode='EDIT')
     bpy.ops.mesh.select_all(action='SELECT')
+
+    # --- FIX: Merge Overlapping Vertices ---
+    # This welds loose geometry (common in curve-to-mesh conversions) 
+    # preventing the UV unwrapper from shattering the mesh into tiny dots.
+    bpy.ops.mesh.remove_doubles(threshold=0.0001)
+    # ---------------------------------------
 
     # 1. Initial Smart Project (Cuts seams and creates initial islands)
     bpy.ops.uv.smart_project(
@@ -5497,16 +5571,15 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
     metallic_restore_data = {} 
 
     if map_type == "BaseColor":
-        # CRITICAL FIX: ALWAYS Perform disconnect, regardless of mode.
-        # Even non-principled mode generates a BSDF that must be disconnected.
+        # CRITICAL FIX: ALWAYS Force Metallic to 0.0, regardless of links or values.
         for mat in obj.data.materials:
             if not (mat and mat.use_nodes): continue
             nt = mat.node_tree
             
-            # Helper to find BSDF (Using the global helper is safer)
+            # Helper to find BSDF
             p_node = find_principled_from_output(nt)
             
-            # Fallback simple search if helper fails or isn't defined in scope
+            # Fallback simple search if helper fails
             if not p_node:
                 for n in nt.nodes:
                     if n.type == 'BSDF_PRINCIPLED': 
@@ -5517,18 +5590,35 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
             
             m_in = p_node.inputs.get('Metallic')
             if m_in:
-                if m_in.is_linked:
-                    # Save the link: (From Node, From Socket, None)
-                    link = m_in.links[0]
-                    metallic_restore_data[mat.name] = (link.from_node, link.from_socket, None)
-                    nt.links.remove(link) # DISCONNECT
-                    print(f"[Assetify] Disconnected Metallic for {mat.name} (BaseColor Bake)")
-                else:
-                    # Save the value: (None, None, Value)
-                    metallic_restore_data[mat.name] = (None, None, m_in.default_value)
-                    m_in.default_value = 0.0 # Force 0 for Albedo Bake
-                    print(f"[Assetify] Zeroed Metallic for {mat.name} (BaseColor Bake)")
+                # 1. Capture the current slider value
+                original_val = m_in.default_value
+                from_node = None
+                from_socket = None
 
+                # 2. Check and capture link if it exists
+                if m_in.is_linked:
+                    link = m_in.links[0]
+                    from_node = link.from_node
+                    from_socket = link.from_socket
+                    
+                    # Remove the link
+                    nt.links.remove(link)
+                    print(f"[Assetify] Disconnected Metallic link for {mat.name}")
+
+                # 3. Store EVERYTHING: (Node, Socket, Value)
+                metallic_restore_data[mat.name] = (from_node, from_socket, original_val)
+
+                # 4. ALWAYS force to 0.0 for the bake
+                m_in.default_value = 0.0 
+                print(f"[Assetify] Forced Metallic to 0.0 for {mat.name}")
+
+        # === DEBUG STOP ===
+        # This is aligned with the 'for' loop (inside the 'if BaseColor')
+#        print("DEBUG: Stopping before BaseColor bake to inspect nodes.")
+#        raise Exception("DEBUG_STOP")
+        # ==================
+
+        # These lines are technically unreachable now, but kept for structure
         bpy.context.scene.cycles.bake_type = 'DIFFUSE'
         bpy.context.scene.render.bake.use_pass_color = True
         bpy.context.scene.render.bake.use_pass_direct = assetify_settings.bake_direct_light
@@ -5557,18 +5647,13 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
 
     # --- 8. CLEANUP & RESTORE ---
     
-    # RESTORE METALLIC (Critical Step)
+    # Restore Metallic State
     if map_type == "BaseColor":
-        for mat in obj.data.materials:
+        for mat_name, data in metallic_restore_data.items():
+            mat = bpy.data.materials.get(mat_name)
             if not (mat and mat.use_nodes): continue
             
-            # Retrieve backup data
-            if mat.name not in metallic_restore_data: continue
-            from_node, from_socket, default_val = metallic_restore_data[mat.name]
-            
             nt = mat.node_tree
-            
-            # Find the node again
             p_node = find_principled_from_output(nt)
             if not p_node:
                 for n in nt.nodes:
@@ -5576,20 +5661,26 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
                         p_node = n
                         break
             
-            if not p_node: continue
-            m_in = p_node.inputs.get('Metallic')
-            if not m_in: continue
+            if p_node and p_node.inputs.get('Metallic'):
+                m_in = p_node.inputs['Metallic']
+                
+                # Unpack our saved data: (Node, Socket, Value)
+                saved_node = data[0]
+                saved_socket = data[1]
+                saved_value = data[2]
 
-            # Restore Logic
-            if from_node and from_socket:
-                try:
-                    nt.links.new(from_socket, m_in)
-                    print(f"[Assetify] Reconnected Metallic for {mat.name}")
-                except Exception as e:
-                    print(f"[Assetify] Failed to reconnect metallic: {e}")
-            elif default_val is not None:
-                m_in.default_value = default_val
-                print(f"[Assetify] Restored Metallic value for {mat.name}")
+                # 1. Always restore the slider value
+                m_in.default_value = saved_value
+                
+                # 2. Restore link if we had one
+                if saved_node and saved_socket:
+                    try:
+                        nt.links.new(saved_socket, m_in)
+                        print(f"[Assetify] Restored Metallic link for {mat_name}")
+                    except Exception as e:
+                        print(f"Warning: Could not relink metallic for {mat_name}: {e}")
+                else:
+                    print(f"[Assetify] Restored Metallic value to {saved_value} for {mat_name}")
 
     # Remove the temp nodes
     for mat_slot in obj.material_slots:
@@ -9091,6 +9182,14 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             else:
                 row.label(text="Anim Export Format")
                 row.prop(assetify_settings, "animation_export_format", text="")
+                
+            ue_row = export_box.row(align=True)
+            
+            # The Main "Send" Button
+            ue_row.operator("assetify.send_to_unreal", text="Send to Unreal", icon='IMPORT')
+            
+            # The Help Button (Small '?' icon next to it)
+            ue_row.operator("assetify.unreal_help", text="", icon='QUESTION')
 
             # Export Button
             export_row = export_box.row(align=True)
@@ -9435,6 +9534,9 @@ classes = (
     ASSETIFY_OT_add_asset_collection,
     ASSETIFY_OT_remove_asset_collection,
     ASSETIFY_OT_show_custom_attributes_info,
+    ASSETIFY_OT_UnrealHelp,
+    op_send_to_unreal.ASSETIFY_OT_SendToUnreal,
+    op_send_to_unreal.ASSETIFY_OT_TransferFinished,
 )
 
 def register():
