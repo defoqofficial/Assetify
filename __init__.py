@@ -3462,6 +3462,20 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
         default=True
     )
     
+    active_pipeline_step: bpy.props.EnumProperty(
+        name="Active Pipeline Step",
+        description="Select which pipeline step to display",
+        items=[
+            ('1', "Setup", "Step 1: Setup & Generators"),
+            ('2', "Bake", "Step 2: Bake & Channel Pack"),
+            ('3', "Collide", "Step 3: Colliders & LODs"),
+            ('4', "Export", "Step 4: Export & Engine Bridge"),
+            ('UTILS', "Utilities", "Mesh Utilities & Community"),
+            ('ALL', "All", "View all pipeline steps simultaneously"),
+        ],
+        default='1'
+    )
+    
     show_bake_mode_menu: bpy.props.BoolProperty(
         name="Show Bake Mode Menu",
         description="Toggle visibility of the bake mode settings menu",
@@ -8985,48 +8999,43 @@ class ASSETIFY_OT_focus_step(bpy.types.Operator):
 
     def execute(self, context):
         settings = context.scene.assetify_bake_settings
+        settings.active_pipeline_step = self.step
         if self.step == '1':
-            if settings.show_bake_mode_menu and not (settings.bake_menu_expanded or settings.lod_menu_expanded or settings.export_menu_expanded):
-                settings.show_bake_mode_menu = False
-            else:
-                settings.show_bake_mode_menu = True
-                settings.bake_menu_expanded = False
-                settings.lod_menu_expanded = False
-                settings.export_menu_expanded = False
+            settings.show_bake_mode_menu = True
+            settings.bake_menu_expanded = False
+            settings.lod_menu_expanded = False
+            settings.export_menu_expanded = False
+            settings.utilities_menu_expanded = False
         elif self.step == '2':
-            if settings.bake_menu_expanded and not (settings.show_bake_mode_menu or settings.lod_menu_expanded or settings.export_menu_expanded):
-                settings.bake_menu_expanded = False
-            else:
-                settings.show_bake_mode_menu = False
-                settings.bake_menu_expanded = True
-                settings.lod_menu_expanded = False
-                settings.export_menu_expanded = False
+            settings.show_bake_mode_menu = False
+            settings.bake_menu_expanded = True
+            settings.lod_menu_expanded = False
+            settings.export_menu_expanded = False
+            settings.utilities_menu_expanded = False
         elif self.step == '3':
-            if settings.lod_menu_expanded and not (settings.show_bake_mode_menu or settings.bake_menu_expanded or settings.export_menu_expanded):
-                settings.lod_menu_expanded = False
-            else:
-                settings.show_bake_mode_menu = False
-                settings.bake_menu_expanded = False
-                settings.lod_menu_expanded = True
-                settings.export_menu_expanded = False
+            settings.show_bake_mode_menu = False
+            settings.bake_menu_expanded = False
+            settings.lod_menu_expanded = True
+            settings.export_menu_expanded = False
+            settings.utilities_menu_expanded = False
         elif self.step == '4':
-            if settings.export_menu_expanded and not (settings.show_bake_mode_menu or settings.bake_menu_expanded or settings.lod_menu_expanded):
-                settings.export_menu_expanded = False
-            else:
-                settings.show_bake_mode_menu = False
-                settings.bake_menu_expanded = False
-                settings.lod_menu_expanded = False
-                settings.export_menu_expanded = True
+            settings.show_bake_mode_menu = False
+            settings.bake_menu_expanded = False
+            settings.lod_menu_expanded = False
+            settings.export_menu_expanded = True
+            settings.utilities_menu_expanded = False
+        elif self.step == 'UTILS':
+            settings.show_bake_mode_menu = False
+            settings.bake_menu_expanded = False
+            settings.lod_menu_expanded = False
+            settings.export_menu_expanded = False
+            settings.utilities_menu_expanded = True
         elif self.step == 'ALL':
-            all_open = (settings.show_bake_mode_menu and 
-                        settings.bake_menu_expanded and 
-                        settings.lod_menu_expanded and 
-                        settings.export_menu_expanded)
-            new_val = not all_open
-            settings.show_bake_mode_menu = new_val
-            settings.bake_menu_expanded = new_val
-            settings.lod_menu_expanded = new_val
-            settings.export_menu_expanded = new_val
+            settings.show_bake_mode_menu = True
+            settings.bake_menu_expanded = True
+            settings.lod_menu_expanded = True
+            settings.export_menu_expanded = True
+            settings.utilities_menu_expanded = True
         return {'FINISHED'}
 
 class ASSETIFY_PT_asset_queue_panel(bpy.types.Panel):
@@ -9270,25 +9279,28 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         layout.separator(factor=1.5)
 
         # =========================================================================
-        # TOP PIPELINE STEPPER BAR (QUICK JUMP & STATUS)
+        # TOP PIPELINE STEPPER BAR (LANDSCAPE NAVIGATION)
         # =========================================================================
+        cur_step = getattr(assetify_settings, "active_pipeline_step", "1")
+        
         stepper_box = layout.box()
         st_row = stepper_box.row(align=True)
         st_row.scale_y = 1.25
         
-        op1 = st_row.operator("assetify.focus_step", text="1: Setup", depress=assetify_settings.show_bake_mode_menu)
+        op1 = st_row.operator("assetify.focus_step", text="1: Setup", depress=(cur_step == '1'))
         op1.step = '1'
-        op2 = st_row.operator("assetify.focus_step", text="2: Bake", depress=assetify_settings.bake_menu_expanded)
+        op2 = st_row.operator("assetify.focus_step", text="2: Bake", depress=(cur_step == '2'))
         op2.step = '2'
-        op3 = st_row.operator("assetify.focus_step", text="3: Collide/LOD", depress=assetify_settings.lod_menu_expanded)
+        op3 = st_row.operator("assetify.focus_step", text="3: Collide/LOD", depress=(cur_step == '3'))
         op3.step = '3'
-        op4 = st_row.operator("assetify.focus_step", text="4: Export", depress=assetify_settings.export_menu_expanded)
+        op4 = st_row.operator("assetify.focus_step", text="4: Export", depress=(cur_step == '4'))
         op4.step = '4'
-        all_open = (assetify_settings.show_bake_mode_menu and 
-                    assetify_settings.bake_menu_expanded and 
-                    assetify_settings.lod_menu_expanded and 
-                    assetify_settings.export_menu_expanded)
-        op_all = st_row.operator("assetify.focus_step", text="All", depress=all_open)
+
+        st_row2 = stepper_box.row(align=True)
+        st_row2.scale_y = 1.15
+        op_u = st_row2.operator("assetify.focus_step", text="Mesh Utilities", icon='TOOL_SETTINGS', depress=(cur_step == 'UTILS'))
+        op_u.step = 'UTILS'
+        op_all = st_row2.operator("assetify.focus_step", text="View All Steps", icon='FULLSCREEN_ENTER', depress=(cur_step == 'ALL'))
         op_all.step = 'ALL'
 
         layout.separator(factor=1.5)
@@ -9296,20 +9308,14 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         # =========================================================================
         # STEP 1: SETUP & INPUT
         # =========================================================================
-        coll_count = len(assetify_settings.asset_collections)
-        badge_step1 = f"({coll_count} Colls)" if coll_count > 0 else "(Empty)"
-        
-        step1_box = layout.box()
-        s1_head = step1_box.row(align=True)
-        s1_head.prop(
-            assetify_settings,
-            "show_bake_mode_menu",
-            text=f"  Step 1: Setup & Generators  {badge_step1}",
-            icon="TRIA_DOWN" if assetify_settings.show_bake_mode_menu else "TRIA_RIGHT",
-            toggle=True
-        )
+        if cur_step in {'1', 'ALL'}:
+            coll_count = len(assetify_settings.asset_collections)
+            badge_step1 = f"({coll_count} Colls)" if coll_count > 0 else "(Empty)"
+            
+            step1_box = layout.box()
+            s1_head = step1_box.row(align=True)
+            s1_head.label(text=f"Step 1: Setup & Generators  {badge_step1}", icon="GEOMETRY_SET")
 
-        if assetify_settings.show_bake_mode_menu:
             col1 = step1_box.column(align=False)
             
             # Still / Animation Selector
@@ -9384,26 +9390,20 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             else:
                 btn_row.operator("object.convert_to_game_ready", text="Process Assets", icon='GEOMETRY_SET')
 
-        layout.separator(factor=1.5)
+            layout.separator(factor=1.5)
 
         # =========================================================================
         # STEP 2: BAKE & CHANNEL PACK
         # =========================================================================
-        preset_badge = assetify_settings.orm_format if assetify_settings.pack_orm else "Standard"
-        res_badge = assetify_settings.bake_resolution
-        badge_step2 = f"({res_badge} • {preset_badge})"
-        
-        step2_box = layout.box()
-        s2_head = step2_box.row(align=True)
-        s2_head.prop(
-            assetify_settings,
-            "bake_menu_expanded",
-            text=f"  Step 2: Bake & Channel Pack  {badge_step2}",
-            icon="TRIA_DOWN" if assetify_settings.bake_menu_expanded else "TRIA_RIGHT",
-            toggle=True
-        )
+        if cur_step in {'2', 'ALL'}:
+            preset_badge = assetify_settings.orm_format if assetify_settings.pack_orm else "Standard"
+            res_badge = assetify_settings.bake_resolution
+            badge_step2 = f"({res_badge} • {preset_badge})"
+            
+            step2_box = layout.box()
+            s2_head = step2_box.row(align=True)
+            s2_head.label(text=f"Step 2: Bake & Channel Pack  {badge_step2}", icon="NODE_TEXTURE")
 
-        if assetify_settings.bake_menu_expanded:
             col2 = step2_box.column(align=False)
             
             # Still / Animation Selector
@@ -9522,25 +9522,19 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             bake_row.enabled = is_valid_bake
             bake_row.operator("object.bake_textures_modal", text=lbl, icon='RENDER_STILL')
 
-        layout.separator(factor=1.5)
+            layout.separator(factor=1.5)
 
         # =========================================================================
         # STEP 3: COLLIDERS & LODS
         # =========================================================================
-        nanite_active = getattr(assetify_settings, 'nanite_mode', False)
-        badge_step3 = "(Nanite Active)" if nanite_active else "(Compound • LODs)"
-        
-        step3_box = layout.box()
-        s3_head = step3_box.row(align=True)
-        s3_head.prop(
-            assetify_settings,
-            "lod_menu_expanded",
-            text=f"  Step 3: Colliders & LODs  {badge_step3}",
-            icon="TRIA_DOWN" if assetify_settings.lod_menu_expanded else "TRIA_RIGHT",
-            toggle=True
-        )
+        if cur_step in {'3', 'ALL'}:
+            nanite_active = getattr(assetify_settings, 'nanite_mode', False)
+            badge_step3 = "(Nanite Active)" if nanite_active else "(Compound • LODs)"
+            
+            step3_box = layout.box()
+            s3_head = step3_box.row(align=True)
+            s3_head.label(text=f"Step 3: Colliders & LODs  {badge_step3}", icon="MOD_DECIM")
 
-        if assetify_settings.lod_menu_expanded:
             col3 = step3_box.column(align=False)
             
             # --- Collision Section ---
@@ -9590,25 +9584,19 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 else:
                     lod_box.label(text="LOD settings unavailable", icon='ERROR')
 
-        layout.separator(factor=1.5)
+            layout.separator(factor=1.5)
 
         # =========================================================================
         # STEP 4: EXPORT & ENGINE BRIDGE
         # =========================================================================
-        exp_fmt = assetify_settings.export_format.upper() if assetify_settings.export_mode == 'STILL' else assetify_settings.animation_export_format.upper()
-        badge_step4 = f"({exp_fmt})"
-        
-        step4_box = layout.box()
-        s4_head = step4_box.row(align=True)
-        s4_head.prop(
-            assetify_settings,
-            "export_menu_expanded",
-            text=f"  Step 4: Export & Engine Bridge  {badge_step4}",
-            icon="TRIA_DOWN" if assetify_settings.export_menu_expanded else "TRIA_RIGHT",
-            toggle=True
-        )
+        if cur_step in {'4', 'ALL'}:
+            exp_fmt = assetify_settings.export_format.upper() if assetify_settings.export_mode == 'STILL' else assetify_settings.animation_export_format.upper()
+            badge_step4 = f"({exp_fmt})"
+            
+            step4_box = layout.box()
+            s4_head = step4_box.row(align=True)
+            s4_head.label(text=f"Step 4: Export & Engine Bridge  {badge_step4}", icon="EXPORT")
 
-        if assetify_settings.export_menu_expanded:
             col4 = step4_box.column(align=False)
             
             # Mode Buttons
@@ -9672,22 +9660,16 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 lbl_imp = f"Import Selected Anim ({assetify_settings.animation_import_format.upper()})"
             imp_col.operator("assetify.import_selected_fbx", text=lbl_imp)
 
-        layout.separator(factor=1.5)
+            layout.separator(factor=1.5)
 
         # =========================================================================
         # UTILITIES & TOOLS (COLLAPSIBLE DRAWER)
         # =========================================================================
-        drawer_box = layout.box()
-        dr_head = drawer_box.row(align=True)
-        dr_head.prop(
-            assetify_settings,
-            "utilities_menu_expanded",
-            text="  Mesh Utilities & Community",
-            icon="TRIA_DOWN" if assetify_settings.utilities_menu_expanded else "TRIA_RIGHT",
-            toggle=True
-        )
+        if cur_step in {'UTILS', 'ALL'}:
+            drawer_box = layout.box()
+            dr_head = drawer_box.row(align=True)
+            dr_head.label(text="Mesh Utilities & Community", icon="TOOL_SETTINGS")
 
-        if assetify_settings.utilities_menu_expanded:
             d_col = drawer_box.column(align=False)
 
             # --- Mesh & Transform Utilities Sub-Box ---
