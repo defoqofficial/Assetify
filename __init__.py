@@ -3930,6 +3930,36 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
     extra_maps_expanded: bpy.props.BoolProperty(name="Extra Maps", default=False)
     settings_submenu_expanded: bpy.props.BoolProperty(name="General Settings", default=False)
 
+    # --- Submenu Expansion States (A-Z Sequential Submenus, Collapsed by Default) ---
+    # Step 1: Setup
+    step1_a_mode_expanded: bpy.props.BoolProperty(name="A. Pipeline Mode", default=False)
+    step1_b_collections_expanded: bpy.props.BoolProperty(name="B. Input Collections", default=False)
+    step1_c_advanced_expanded: bpy.props.BoolProperty(name="C. Advanced Setup", default=False)
+    step1_d_queue_expanded: bpy.props.BoolProperty(name="D. Processed Asset Queue", default=False)
+
+    # Step 2: Bake
+    step2_a_output_expanded: bpy.props.BoolProperty(name="A. Output & Resolution", default=False)
+    step2_b_packing_expanded: bpy.props.BoolProperty(name="B. Channel Packing & Presets", default=False)
+    step2_c_passes_expanded: bpy.props.BoolProperty(name="C. Extra Map Passes", default=False)
+    step2_d_hardware_expanded: bpy.props.BoolProperty(name="D. Hardware & UV Settings", default=False)
+    step2_e_targets_expanded: bpy.props.BoolProperty(name="E. Target Assets to Bake", default=False)
+
+    # Step 3: Collide & LOD
+    step3_a_targets_expanded: bpy.props.BoolProperty(name="A. Target Assets", default=False)
+    step3_b_collision_expanded: bpy.props.BoolProperty(name="B. Compound Collision (UCX)", default=False)
+    step3_c_lods_expanded: bpy.props.BoolProperty(name="C. LOD Decimation & Nanite", default=False)
+
+    # Step 4: Export
+    step4_a_targets_expanded: bpy.props.BoolProperty(name="A. Target Assets to Export", default=False)
+    step4_b_destination_expanded: bpy.props.BoolProperty(name="B. Destination & Format", default=False)
+    step4_c_unreal_expanded: bpy.props.BoolProperty(name="C. Unreal Engine Live Bridge", default=False)
+    step4_d_import_expanded: bpy.props.BoolProperty(name="D. Verified Game Asset Import", default=False)
+
+    # Mesh Utilities
+    utils_a_pivot_expanded: bpy.props.BoolProperty(name="A. Pivot Alignment", default=False)
+    utils_b_geometry_expanded: bpy.props.BoolProperty(name="B. Mesh Geometry", default=False)
+    utils_c_swap_expanded: bpy.props.BoolProperty(name="C. Collection Swap", default=False)
+
     def get_asset_by_name(self, name):
         """Retrieve an asset by its name."""
         for asset in self.baked_assets:
@@ -9184,8 +9214,8 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         if total > 0:
             layout.label(text=f"({selected}/{total} Active)")
 
-    def draw_target_summary_bar(self, layout, assetify_settings, action_label="Bake"):
-        """Draws a compact, smart target summary bar with quick selection dropdown."""
+    def draw_target_selection_submenu(self, layout, assetify_settings, action_label="Bake", letter_prefix="A", expanded_prop_name="show_quick_target_select"):
+        """Draws the target asset selection as an A-Z lettered submenu collapsed by default."""
         if assetify_settings.asset_mode == 'ASSET':
             total = len(assetify_settings.baked_assets)
             active = sum(1 for a in assetify_settings.baked_assets if a.include_in_send)
@@ -9193,28 +9223,25 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             total = count_top_level_collections(assetify_settings.baked_collections)
             active = sum(1 for c in assetify_settings.baked_collections if c.include_in_send and get_collection_level(c.name) == 0)
 
+        is_expanded = getattr(assetify_settings, expanded_prop_name, False)
         t_box = layout.box()
-        if total == 0:
-            r = t_box.row(align=True)
-            r.label(text=f"No assets in queue to {action_label.lower()} (Process in Step 1)", icon='ERROR')
-            op_go = r.operator("assetify.focus_step", text="Go to Step 1", icon='GEOMETRY_SET')
-            op_go.step = '1'
-            return
-
-        r = t_box.row(align=True)
+        t_head = t_box.row(align=True)
+        icon_arrow = "TRIA_DOWN" if is_expanded else "TRIA_RIGHT"
+        t_head.prop(assetify_settings, expanded_prop_name, text="", icon=icon_arrow, emboss=False)
+        
         status_icon = 'CHECKBOX_HLT' if active > 0 else 'CHECKBOX_DEHLT'
-        r.label(text=f"Target: {active} of {total} Selected for {action_label}", icon=status_icon)
-        r.prop(
-            assetify_settings,
-            "show_quick_target_select",
-            text="Quick Select",
-            icon="TRIA_DOWN" if assetify_settings.show_quick_target_select else "TRIA_RIGHT",
-            toggle=True
-        )
+        badge = f"{active} of {total} Selected" if total > 0 else "0 in Queue"
+        t_head.label(text=f"{letter_prefix}. Target Assets to {action_label} ({badge})", icon=status_icon)
 
-        if assetify_settings.show_quick_target_select:
+        if is_expanded:
+            if total == 0:
+                sub = t_box.column(align=True)
+                sub.label(text=f"No assets in queue to {action_label.lower()}.", icon='INFO')
+                op_go = sub.row().operator("assetify.focus_step", text="Go to Step 1: Setup", icon='GEOMETRY_SET')
+                op_go.step = '1'
+                return
+
             sub = t_box.column(align=False)
-            
             sel_row = sub.row(align=True)
             op = sel_row.operator("assetify.toggle_select_assets", text="All")
             op.action = 'SELECT'
@@ -9227,7 +9254,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             if assetify_settings.asset_mode == 'ASSET':
                 sub.template_list(
                     "ASSETIFY_UL_baked_assets",
-                    "target_bar_assets",
+                    f"target_bar_{letter_prefix}_assets",
                     assetify_settings,
                     "baked_assets",
                     assetify_settings,
@@ -9237,7 +9264,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             else:
                 sub.template_list(
                     "ASSETIFY_UL_collection_list",
-                    "target_bar_colls",
+                    f"target_bar_{letter_prefix}_colls",
                     assetify_settings,
                     "baked_collections",
                     assetify_settings,
@@ -9248,6 +9275,10 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             m_row = sub.row(align=True)
             op_m = m_row.operator("assetify.focus_step", text="Manage Full Queue in Step 1", icon='GEOMETRY_SET')
             op_m.step = '1'
+
+    def draw_target_summary_bar(self, layout, assetify_settings, action_label="Bake"):
+        """Backward-compatible wrapper."""
+        self.draw_target_selection_submenu(layout, assetify_settings, action_label=action_label, letter_prefix="A", expanded_prop_name="show_quick_target_select")
 
     def draw(self, context):
         layout = self.layout
@@ -9331,40 +9362,91 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
 
             col1 = step1_box.column(align=False)
             
-            # Still / Animation Selector
-            mode_row = col1.row(align=True)
-            tb = mode_row.operator("assetify.switch_bake_mode", text="Still", depress=(assetify_settings.bake_mode == 'STILL'))
-            tb.mode = 'STILL'
-            ab = mode_row.operator("assetify.switch_bake_mode", text="Animation", depress=(assetify_settings.bake_mode == 'ANIMATION'))
-            ab.mode = 'ANIMATION'
+            # --- A. Pipeline Mode Submenu ---
+            a_box = col1.box()
+            a_head = a_box.row(align=True)
+            a_icon = "TRIA_DOWN" if assetify_settings.step1_a_mode_expanded else "TRIA_RIGHT"
+            a_head.prop(assetify_settings, "step1_a_mode_expanded", text="", icon=a_icon, emboss=False)
+            a_head.label(text=f"A. Pipeline Mode ({assetify_settings.bake_mode.title()})", icon='TIME')
+            if assetify_settings.step1_a_mode_expanded:
+                mode_row = a_box.row(align=True)
+                tb = mode_row.operator("assetify.switch_bake_mode", text="Still", depress=(assetify_settings.bake_mode == 'STILL'))
+                tb.mode = 'STILL'
+                ab = mode_row.operator("assetify.switch_bake_mode", text="Animation", depress=(assetify_settings.bake_mode == 'ANIMATION'))
+                ab.mode = 'ANIMATION'
 
-            # Asset Collections List
+            # --- B. Input Collections Submenu ---
+            b_box = col1.box()
+            b_head = b_box.row(align=True)
+            b_icon = "TRIA_DOWN" if assetify_settings.step1_b_collections_expanded else "TRIA_RIGHT"
+            b_head.prop(assetify_settings, "step1_b_collections_expanded", text="", icon=b_icon, emboss=False)
+            coll_badge = f"{coll_count} Assigned" if coll_count > 0 else "Empty"
+            b_head.label(text=f"B. Input Collections ({coll_badge})", icon='OUTLINER_COLLECTION')
+            if assetify_settings.step1_b_collections_expanded:
+                if coll_count == 0:
+                    empty_row = b_box.row(align=True)
+                    empty_row.scale_y = 1.2
+                    empty_row.operator("assetify.add_asset_collection", text="+ Add Collection to Process", icon='ADD')
+                else:
+                    c_row = b_box.row()
+                    split = c_row.split(factor=0.82)
+                    c_left = split.column()
+                    c_left.template_list(
+                        "ASSETIFY_UL_asset_collections",
+                        "assetify_step1_in",
+                        assetify_settings,
+                        "asset_collections",
+                        assetify_settings,
+                        "active_asset_collection_index",
+                        rows=min(max(coll_count, 1), 4)
+                    )
+                    c_btns = split.column(align=True)
+                    c_btns.operator("assetify.add_asset_collection", icon='ADD', text="")
+                    c_btns.operator("assetify.remove_asset_collection", icon='REMOVE', text="")
+
+            # --- C. Advanced Setup (Mossify & Custom Attributes) ---
             c_box = col1.box()
-            c_box.label(text="Input Collections to Process:", icon='OUTLINER_COLLECTION')
-            if coll_count == 0:
-                empty_row = c_box.row(align=True)
-                empty_row.scale_y = 1.2
-                empty_row.operator("assetify.add_asset_collection", text="+ Add Collection to Process", icon='ADD')
-            else:
-                c_row = c_box.row()
-                split = c_row.split(factor=0.82)
-                c_left = split.column()
-                c_left.template_list(
-                    "ASSETIFY_UL_asset_collections",
-                    "assetify_step1_in",
-                    assetify_settings,
-                    "asset_collections",
-                    assetify_settings,
-                    "active_asset_collection_index",
-                    rows=min(max(coll_count, 1), 4)
-                )
-                c_btns = split.column(align=True)
-                c_btns.operator("assetify.add_asset_collection", icon='ADD', text="")
-                c_btns.operator("assetify.remove_asset_collection", icon='REMOVE', text="")
+            c_head = c_box.row(align=True)
+            c_icon = "TRIA_DOWN" if assetify_settings.step1_c_advanced_expanded else "TRIA_RIGHT"
+            c_head.prop(assetify_settings, "step1_c_advanced_expanded", text="", icon=c_icon, emboss=False)
+            adv_active = assetify_settings.use_mossify or assetify_settings.enable_custom_attributes
+            adv_badge = "Active" if adv_active else "Off"
+            c_head.label(text=f"C. Advanced Setup ({adv_badge})", icon='PREFERENCES')
+            if assetify_settings.step1_c_advanced_expanded:
+                opt_box = c_box.column(align=False)
+                r_moss = opt_box.row(align=True)
+                r_moss.operator("assetify.show_mossify_mode_info", text="", icon='INFO', emboss=False)
+                r_moss.prop(assetify_settings, "use_mossify", text="Mossify Mode")
 
-            # Process / Convert Action Button
+                if not assetify_settings.use_mossify:
+                    r_attr = opt_box.row(align=True)
+                    r_attr.operator("assetify.show_custom_attributes_info", text="", icon='INFO', emboss=False)
+                    r_attr.prop(assetify_settings, "enable_custom_attributes", text="Enable Custom Attributes")
+
+                if assetify_settings.use_mossify or assetify_settings.enable_custom_attributes:
+                    opt_box.prop_search(scene, "custom_object", bpy.data, "objects", text="Emitter", icon='OUTLINER_OB_EMPTY')
+
+                if not assetify_settings.use_mossify and assetify_settings.enable_custom_attributes:
+                    ca_count = len(assetify_settings.custom_attributes)
+                    ca_box = opt_box.box()
+                    ca_box.label(text="Custom Attributes:", icon='SPREADSHEET')
+                    r_ca = ca_box.row()
+                    r_ca.template_list(
+                        "ASSETIFY_UL_custom_attributes",
+                        "",
+                        assetify_settings,
+                        "custom_attributes",
+                        assetify_settings,
+                        "active_custom_attribute_index",
+                        rows=min(max(ca_count, 1), 4)
+                    )
+                    ca_btns = r_ca.column(align=True)
+                    ca_btns.operator("assetify.add_custom_attribute", icon='ADD', text="")
+                    ca_btns.operator("assetify.remove_custom_attribute", icon='REMOVE', text="")
+
+            # --- Full-Width Execution Button: Process Assets ---
             btn_row = col1.row(align=True)
-            btn_row.scale_y = 1.3
+            btn_row.scale_y = 1.35
             btn_row.enabled = has_asset_collections and all_collections_assigned
             if assetify_settings.bake_mode == 'ANIMATION':
                 fmt = getattr(scene.assetify_animation_settings, "file_format", "FBX") if hasattr(scene, "assetify_animation_settings") else "FBX"
@@ -9372,87 +9454,91 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             else:
                 btn_row.operator("object.convert_to_game_ready", text="Process Assets → Add to Queue", icon='GEOMETRY_SET')
 
-            # --- Processed Asset Queue Sub-Box ---
-            q_box = col1.box()
-            q_head = q_box.row(align=True)
-            q_head.label(text=f"Processed Asset Queue ({active_assets}/{total_assets} Active)", icon='OUTLINER_OB_MESH')
+            # --- D. Processed Asset Queue Submenu ---
+            d_box = col1.box()
+            d_head = d_box.row(align=True)
+            d_icon = "TRIA_DOWN" if assetify_settings.step1_d_queue_expanded else "TRIA_RIGHT"
+            d_head.prop(assetify_settings, "step1_d_queue_expanded", text="", icon=d_icon, emboss=False)
+            d_badge = f"{active_assets}/{total_assets} Active" if total_assets > 0 else "Empty"
+            d_head.label(text=f"D. Processed Asset Queue ({d_badge})", icon='OUTLINER_OB_MESH')
 
-            if total_assets == 0:
-                hint_col = q_box.column(align=True)
-                hint_col.label(text="No processed assets in queue yet.", icon='INFO')
-                hint_col.label(text="Add collections above and click 'Process Assets'.")
-            else:
-                # Mode Switcher (Asset Mode vs Collection Mode)
-                sw_row = q_box.row(align=True)
-                sw_row.operator("assetify.switch_mode", text="Asset Mode", icon='OBJECT_DATA', depress=(assetify_settings.asset_mode == 'ASSET')).mode = 'ASSET'
-                sw_row.operator("assetify.switch_mode", text="Collection Mode", icon='OUTLINER_COLLECTION', depress=(assetify_settings.asset_mode == 'COLLECTION')).mode = 'COLLECTION'
-
-                # Selection Controls
-                sel_row = q_box.row(align=True)
-                op = sel_row.operator("assetify.toggle_select_assets", text="All")
-                op.action = 'SELECT'
-                op = sel_row.operator("assetify.toggle_select_assets", text="None")
-                op.action = 'DESELECT'
-                op = sel_row.operator("assetify.toggle_select_assets", text="Invert")
-                op.action = 'INVERT'
-                sel_row.label(text=f"{active_assets}/{total_assets} active")
-
-                if assetify_settings.asset_mode == 'ASSET':
-                    header = q_box.row(align=True)
-                    split = header.split(factor=0.15)
-                    split.label(text="", icon='CHECKMARK')
-                    split = split.split(factor=0.4 / 0.85)
-                    split.label(text="Asset Name")
-                    remaining = split.split(factor=0.5)
-                    remaining.label(text="Bake", icon='NODE_TEXTURE')
-                    remaining.label(text="File", icon='FILE_TICK')
-
-                    num_rows = max(min(total_assets, 6), 3)
-                    q_box.template_list(
-                        "ASSETIFY_UL_baked_assets",
-                        "",
-                        assetify_settings,
-                        "baked_assets",
-                        assetify_settings,
-                        "active_baked_asset_index",
-                        rows=num_rows
-                    )
-
-                    act_row = q_box.row(align=True)
-                    act_row.operator("assetify.refresh_asset_collection_list", text="Refresh", icon='FILE_REFRESH')
-                    del_col = act_row.column()
-                    del_col.alert = True
-                    del_col.enabled = active_assets > 0
-                    del_col.operator("assetify.delete_selected_assets", text="Delete Selected", icon='TRASH')
+            if assetify_settings.step1_d_queue_expanded:
+                if total_assets == 0:
+                    hint_col = d_box.column(align=True)
+                    hint_col.label(text="No processed assets in queue yet.", icon='INFO')
+                    hint_col.label(text="Add collections in 'B' and click 'Process Assets'.")
                 else:
-                    header = q_box.row(align=True)
-                    split = header.split(factor=0.15)
-                    split.label(text="", icon='CHECKMARK')
-                    split = split.split(factor=0.4 / 0.9)
-                    split.label(text="Collection Name")
-                    remaining = split.split(factor=0.33)
-                    remaining.label(text="Swap", icon='ARROW_LEFTRIGHT')
-                    remaining = remaining.split(factor=0.5)
-                    remaining.label(text="Bake", icon='NODE_TEXTURE')
-                    remaining.label(text="File", icon='FILE_TICK')
+                    # Mode Switcher (Asset Mode vs Collection Mode)
+                    sw_row = d_box.row(align=True)
+                    sw_row.operator("assetify.switch_mode", text="Asset Mode", icon='OBJECT_DATA', depress=(assetify_settings.asset_mode == 'ASSET')).mode = 'ASSET'
+                    sw_row.operator("assetify.switch_mode", text="Collection Mode", icon='OUTLINER_COLLECTION', depress=(assetify_settings.asset_mode == 'COLLECTION')).mode = 'COLLECTION'
 
-                    num_rows = max(min(total_assets, 6), 3)
-                    q_box.template_list(
-                        "ASSETIFY_UL_collection_list",
-                        "",
-                        assetify_settings,
-                        "baked_collections",
-                        assetify_settings,
-                        "active_baked_collection_index",
-                        rows=num_rows
-                    )
+                    # Selection Controls
+                    sel_row = d_box.row(align=True)
+                    op = sel_row.operator("assetify.toggle_select_assets", text="All")
+                    op.action = 'SELECT'
+                    op = sel_row.operator("assetify.toggle_select_assets", text="None")
+                    op.action = 'DESELECT'
+                    op = sel_row.operator("assetify.toggle_select_assets", text="Invert")
+                    op.action = 'INVERT'
+                    sel_row.label(text=f"{active_assets}/{total_assets} active")
 
-                    act_row = q_box.row(align=True)
-                    act_row.operator("assetify.refresh_asset_collection_list", text="Refresh", icon='FILE_REFRESH')
-                    del_col = act_row.column()
-                    del_col.alert = True
-                    del_col.enabled = active_assets > 0
-                    del_col.operator("assetify.delete_selected_collections", text="Delete Selected", icon='TRASH')
+                    if assetify_settings.asset_mode == 'ASSET':
+                        header = d_box.row(align=True)
+                        split = header.split(factor=0.15)
+                        split.label(text="", icon='CHECKMARK')
+                        split = split.split(factor=0.4 / 0.85)
+                        split.label(text="Asset Name")
+                        remaining = split.split(factor=0.5)
+                        remaining.label(text="Bake", icon='NODE_TEXTURE')
+                        remaining.label(text="File", icon='FILE_TICK')
+
+                        num_rows = max(min(total_assets, 6), 3)
+                        d_box.template_list(
+                            "ASSETIFY_UL_baked_assets",
+                            "",
+                            assetify_settings,
+                            "baked_assets",
+                            assetify_settings,
+                            "active_baked_asset_index",
+                            rows=num_rows
+                        )
+
+                        act_row = d_box.row(align=True)
+                        act_row.operator("assetify.refresh_asset_collection_list", text="Refresh", icon='FILE_REFRESH')
+                        del_col = act_row.column()
+                        del_col.alert = True
+                        del_col.enabled = active_assets > 0
+                        del_col.operator("assetify.delete_selected_assets", text="Delete Selected", icon='TRASH')
+                    else:
+                        header = d_box.row(align=True)
+                        split = header.split(factor=0.15)
+                        split.label(text="", icon='CHECKMARK')
+                        split = split.split(factor=0.4 / 0.9)
+                        split.label(text="Collection Name")
+                        remaining = split.split(factor=0.33)
+                        remaining.label(text="Swap", icon='ARROW_LEFTRIGHT')
+                        remaining = remaining.split(factor=0.5)
+                        remaining.label(text="Bake", icon='NODE_TEXTURE')
+                        remaining.label(text="File", icon='FILE_TICK')
+
+                        num_rows = max(min(total_assets, 6), 3)
+                        d_box.template_list(
+                            "ASSETIFY_UL_collection_list",
+                            "",
+                            assetify_settings,
+                            "baked_collections",
+                            assetify_settings,
+                            "active_baked_collection_index",
+                            rows=num_rows
+                        )
+
+                        act_row = d_box.row(align=True)
+                        act_row.operator("assetify.refresh_asset_collection_list", text="Refresh", icon='FILE_REFRESH')
+                        del_col = act_row.column()
+                        del_col.alert = True
+                        del_col.enabled = active_assets > 0
+                        del_col.operator("assetify.delete_selected_collections", text="Delete Selected", icon='TRASH')
 
             layout.separator(factor=1.5)
 
@@ -9470,59 +9556,75 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
 
             col2 = step2_box.column(align=False)
             
-            # Still / Animation Selector
-            t_row = col2.row(align=True)
-            t_row.operator("assetify.switch_texturebake_mode", text="Still", depress=(assetify_settings.texturebake_mode == 'STILL')).mode = 'STILL'
-            t_row.operator("assetify.switch_texturebake_mode", text="Animation", depress=(assetify_settings.texturebake_mode == 'ANIMATION')).mode = 'ANIMATION'
+            # --- A. Output & Resolution Submenu ---
+            a_box = col2.box()
+            a_head = a_box.row(align=True)
+            a_icon = "TRIA_DOWN" if assetify_settings.step2_a_output_expanded else "TRIA_RIGHT"
+            a_head.prop(assetify_settings, "step2_a_output_expanded", text="", icon=a_icon, emboss=False)
+            a_head.label(text=f"A. Output & Resolution ({assetify_settings.bake_resolution} • {assetify_settings.bake_format})", icon='OUTPUT')
+            if assetify_settings.step2_a_output_expanded:
+                out_col = a_box.column(align=False)
+                # Still / Animation Selector
+                t_row = out_col.row(align=True)
+                t_row.operator("assetify.switch_texturebake_mode", text="Still", depress=(assetify_settings.texturebake_mode == 'STILL')).mode = 'STILL'
+                t_row.operator("assetify.switch_texturebake_mode", text="Animation", depress=(assetify_settings.texturebake_mode == 'ANIMATION')).mode = 'ANIMATION'
 
-            if assetify_settings.texturebake_mode == 'ANIMATION':
-                a_row = col2.row(align=True)
-                a_row.operator("assetify.show_apply_frame_attributes_info", text="", icon='INFO', emboss=False)
-                a_row.operator("animation.add_frame_dependent_attributes", text="Apply Frame Attributes", icon='DRIVER')
+                if assetify_settings.texturebake_mode == 'ANIMATION':
+                    a_row = out_col.row(align=True)
+                    a_row.operator("assetify.show_apply_frame_attributes_info", text="", icon='INFO', emboss=False)
+                    a_row.operator("animation.add_frame_dependent_attributes", text="Apply Frame Attributes", icon='DRIVER')
 
-            # --- Output & Quality Box ---
-            out_box = col2.box()
-            out_box.label(text="Output & Resolution", icon='OUTPUT')
-            out_col = out_box.column(align=True)
-            out_col.prop(assetify_settings, "bake_folder", text="")
-            
-            r_fmt = out_col.row(align=True)
-            r_fmt.label(text="Format / Res:")
-            r_fmt.prop(assetify_settings, "bake_format", text="")
-            r_fmt.prop(assetify_settings, "bake_resolution", text="")
+                out_col.prop(assetify_settings, "bake_folder", text="")
+                r_fmt = out_col.row(align=True)
+                r_fmt.label(text="Format / Res:")
+                r_fmt.prop(assetify_settings, "bake_format", text="")
+                r_fmt.prop(assetify_settings, "bake_resolution", text="")
 
-            # --- Channel Packing & Multi-Engine Presets Box ---
-            pack_box = col2.box()
-            p_head = pack_box.row(align=True)
-            p_head.prop(assetify_settings, "pack_orm", text="Pack Channels (Engine Preset)", icon='IMAGE_RGB')
-            
-            if assetify_settings.pack_orm:
-                p_sub = pack_box.column(align=True)
-                r_eng = p_sub.row(align=True)
-                r_eng.label(text="Engine Preset:")
-                r_eng.prop(assetify_settings, "orm_format", text="")
+            # --- B. Channel Packing & Engine Presets Submenu ---
+            b_box = col2.box()
+            b_head = b_box.row(align=True)
+            b_icon = "TRIA_DOWN" if assetify_settings.step2_b_packing_expanded else "TRIA_RIGHT"
+            b_head.prop(assetify_settings, "step2_b_packing_expanded", text="", icon=b_icon, emboss=False)
+            pack_badge = assetify_settings.orm_format if assetify_settings.pack_orm else "Disabled"
+            b_head.label(text=f"B. Channel Packing & Presets ({pack_badge})", icon='IMAGE_RGB')
+            if assetify_settings.step2_b_packing_expanded:
+                p_sub = b_box.column(align=False)
+                p_sub.prop(assetify_settings, "pack_orm", text="Pack Channels (Engine Preset)", icon='IMAGE_RGB')
+                if assetify_settings.pack_orm:
+                    r_eng = p_sub.row(align=True)
+                    r_eng.label(text="Engine Preset:")
+                    r_eng.prop(assetify_settings, "orm_format", text="")
 
-                if assetify_settings.orm_format == 'CUSTOM':
-                    m_box = p_sub.box()
-                    m_box.label(text="Custom Channel Matrix Routing", icon='COLOR')
-                    for chan, ch_prop, inv_prop in [
-                        ("R:", "matrix_r", "matrix_invert_r"),
-                        ("G:", "matrix_g", "matrix_invert_g"),
-                        ("B:", "matrix_b", "matrix_invert_b"),
-                        ("A:", "matrix_a", "matrix_invert_a"),
-                    ]:
-                        mr = m_box.row(align=True)
-                        mr.label(text=chan)
-                        mr.prop(assetify_settings, ch_prop, text="")
-                        mr.prop(assetify_settings, inv_prop, text="Inv")
+                    if assetify_settings.orm_format == 'CUSTOM':
+                        m_box = p_sub.box()
+                        m_box.label(text="Custom Channel Matrix Routing", icon='COLOR')
+                        for chan, ch_prop, inv_prop in [
+                            ("R:", "matrix_r", "matrix_invert_r"),
+                            ("G:", "matrix_g", "matrix_invert_g"),
+                            ("B:", "matrix_b", "matrix_invert_b"),
+                            ("A:", "matrix_a", "matrix_invert_a"),
+                        ]:
+                            mr = m_box.row(align=True)
+                            mr.label(text=chan)
+                            mr.prop(assetify_settings, ch_prop, text="")
+                            mr.prop(assetify_settings, inv_prop, text="Inv")
 
-            # --- Extra Map Passes Sub-Box ---
-            extra_box = col2.box()
-            e_head = extra_box.row(align=True)
-            e_head.prop(assetify_settings, "extra_maps_expanded", text="", icon="TRIA_DOWN" if assetify_settings.extra_maps_expanded else "TRIA_RIGHT", emboss=False)
-            e_head.label(text="Extra Map Passes", icon='TEXTURE')
-            if assetify_settings.extra_maps_expanded:
-                e_col = extra_box.column(align=False)
+            # --- C. Extra Map Passes Submenu ---
+            c_box = col2.box()
+            c_head = c_box.row(align=True)
+            c_icon = "TRIA_DOWN" if assetify_settings.step2_c_passes_expanded else "TRIA_RIGHT"
+            c_head.prop(assetify_settings, "step2_c_passes_expanded", text="", icon=c_icon, emboss=False)
+            active_passes = []
+            if assetify_settings.bake_ao: active_passes.append(f"AO ({assetify_settings.ao_bake_samples})")
+            if assetify_settings.bake_alpha: active_passes.append("Alpha")
+            if assetify_settings.bake_emission: active_passes.append("Emit")
+            if assetify_settings.bake_transmission: active_passes.append("Trans")
+            if assetify_settings.bake_direct_light: active_passes.append("Direct")
+            if assetify_settings.bake_indirect_light: active_passes.append("Indirect")
+            passes_badge = ", ".join(active_passes) if active_passes else "Standard"
+            c_head.label(text=f"C. Extra Map Passes ({passes_badge})", icon='TEXTURE')
+            if assetify_settings.step2_c_passes_expanded:
+                e_col = c_box.column(align=False)
 
                 # AO — with inline sample count when enabled
                 r_ao = e_col.row(align=True)
@@ -9553,15 +9655,16 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                     r_indirect.prop(assetify_settings, "indirect_light_bake_samples", text="")
 
                 if assetify_settings.bake_alpha:
-                    extra_box.prop(assetify_settings, "force_transparent_black", text="Force Transparent Black", icon='GHOST_ENABLED')
+                    c_box.prop(assetify_settings, "force_transparent_black", text="Force Transparent Black", icon='GHOST_ENABLED')
 
-            # --- Hardware & Optimization Sub-Box ---
-            hw_box = col2.box()
-            h_head = hw_box.row(align=True)
-            h_head.prop(assetify_settings, "settings_submenu_expanded", text="", icon="TRIA_DOWN" if assetify_settings.settings_submenu_expanded else "TRIA_RIGHT", emboss=False)
-            h_head.label(text="Hardware & Settings", icon='PREFERENCES')
-            if assetify_settings.settings_submenu_expanded:
-                hw_col = hw_box.column(align=True)
+            # --- D. Hardware & UV Settings Submenu ---
+            d_box = col2.box()
+            d_head = d_box.row(align=True)
+            d_icon = "TRIA_DOWN" if assetify_settings.step2_d_hardware_expanded else "TRIA_RIGHT"
+            d_head.prop(assetify_settings, "step2_d_hardware_expanded", text="", icon=d_icon, emboss=False)
+            d_head.label(text=f"D. Hardware & UV Settings ({assetify_settings.platform_target} • {assetify_settings.render_device})", icon='PREFERENCES')
+            if assetify_settings.step2_d_hardware_expanded:
+                hw_col = d_box.column(align=True)
                 r_plat = hw_col.row(align=True)
                 r_plat.label(text="Platform:")
                 r_plat.prop(assetify_settings, "platform_target", text="")
@@ -9589,10 +9692,10 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                     if assetify_settings.use_udim:
                         r_udim.prop(assetify_settings, "udim_tiles", text="Tiles")
 
-            # --- Target Summary Bar ---
-            self.draw_target_summary_bar(col2, assetify_settings, action_label="Bake")
+            # --- E. Target Assets to Bake Submenu ---
+            self.draw_target_selection_submenu(col2, assetify_settings, action_label="Bake", letter_prefix="E", expanded_prop_name="step2_e_targets_expanded")
 
-            # --- Primary Bake Action Button ---
+            # --- Full-Width Execution Button: Bake Textures ---
             bake_row = col2.row(align=True)
             bake_row.scale_y = 1.45
             bake_row.operator("assetify.show_bake_info", text="", icon='INFO', emboss=False)
@@ -9619,55 +9722,68 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
 
             col3 = step3_box.column(align=False)
             
-            # --- Target Summary Bar ---
-            self.draw_target_summary_bar(col3, assetify_settings, action_label="Colliders & LODs")
+            # --- A. Target Assets Submenu ---
+            self.draw_target_selection_submenu(col3, assetify_settings, action_label="Colliders & LODs", letter_prefix="A", expanded_prop_name="step3_a_targets_expanded")
             
-            # --- Collision Section ---
-            c_box = col3.box()
-            c_box.label(text="Compound Convex Collision (UCX)", icon='PHYSICS')
+            # --- B. Compound Collision (UCX) Submenu ---
+            b_box = col3.box()
+            b_head = b_box.row(align=True)
+            b_icon = "TRIA_DOWN" if assetify_settings.step3_b_collision_expanded else "TRIA_RIGHT"
+            b_head.prop(assetify_settings, "step3_b_collision_expanded", text="", icon=b_icon, emboss=False)
             collision_settings = getattr(context.scene, "assetify_collision_settings", None)
-            if collision_settings:
-                c_box.prop(collision_settings, "collision_mode", text="Strategy")
-                if collision_settings.collision_mode in {'AUTO', 'COMPOUND_SLICED'}:
-                    c_box.prop(collision_settings, "max_hulls", text="Max Hulls")
-                c_box.prop(collision_settings, "push_offset", text="Thickness")
-                
-                c_act = c_box.row(align=True)
-                c_act.operator("assetify.generate_collision", text="Generate Collider", icon='MESH_ICOSPHERE')
-                c_act.operator("assetify.clear_collision", text="", icon='TRASH')
-            else:
-                c_act = c_box.row(align=True)
-                c_act.operator("assetify.generate_collision", text="Generate Collider", icon='MESH_ICOSPHERE')
-                c_act.operator("assetify.clear_collision", text="", icon='TRASH')
-
-            # --- LOD Decimation & Nanite Section ---
-            lod_box = col3.box()
-            lod_box.label(text="LOD Decimation & Nanite", icon='MOD_DECIM')
-            lod_box.prop(assetify_settings, "nanite_mode", text="Nanite-Ready Mode (UE5)", icon='LIGHT')
-            
-            if nanite_active:
-                n_info = lod_box.row(align=True)
-                n_info.label(text="Nanite Active: Decimation LODs bypassed", icon='INFO')
-            else:
-                if hasattr(scene, "assetify_lod_settings"):
-                    lod_settings = scene.assetify_lod_settings
-                    for lod_idx, gen_prop, rat_prop in [
-                        ("LOD 1", "generate_lod1", "lod1_ratio"),
-                        ("LOD 2", "generate_lod2", "lod2_ratio"),
-                        ("LOD 3", "generate_lod3", "lod3_ratio"),
-                    ]:
-                        lr = lod_box.row(align=True)
-                        lr.prop(lod_settings, gen_prop, text=lod_idx)
-                        sub = lr.row()
-                        sub.enabled = getattr(lod_settings, gen_prop)
-                        sub.prop(lod_settings, rat_prop, text="Ratio", slider=True)
-
-                    lod_box.prop(lod_settings, "auto_rename_original", text="Auto Rename Original")
-                    l_act = lod_box.row(align=True)
-                    l_act.operator("assetify.generate_lods", text="Generate LODs", icon='MOD_DECIM')
-                    l_act.operator("assetify.clear_lods", text="", icon='TRASH')
+            c_strat = collision_settings.collision_mode.title() if collision_settings else "Auto"
+            hulls_badge = f"{getattr(collision_settings, 'max_hulls', 8)} Hulls" if collision_settings else ""
+            b_head.label(text=f"B. Compound Collision UCX ({c_strat} • {hulls_badge})", icon='PHYSICS')
+            if assetify_settings.step3_b_collision_expanded:
+                if collision_settings:
+                    b_box.prop(collision_settings, "collision_mode", text="Strategy")
+                    if collision_settings.collision_mode in {'AUTO', 'COMPOUND_SLICED'}:
+                        b_box.prop(collision_settings, "max_hulls", text="Max Hulls")
+                    b_box.prop(collision_settings, "push_offset", text="Thickness")
                 else:
-                    lod_box.label(text="LOD settings unavailable", icon='ERROR')
+                    b_box.label(text="Collision settings unavailable", icon='ERROR')
+
+            # --- C. LOD Decimation & Nanite Submenu ---
+            c_box = col3.box()
+            c_head = c_box.row(align=True)
+            c_icon = "TRIA_DOWN" if assetify_settings.step3_c_lods_expanded else "TRIA_RIGHT"
+            c_head.prop(assetify_settings, "step3_c_lods_expanded", text="", icon=c_icon, emboss=False)
+            nanite_active = getattr(assetify_settings, 'nanite_mode', False)
+            lod_badge = "Nanite Ready" if nanite_active else "Decimation LODs"
+            c_head.label(text=f"C. LOD Decimation & Nanite ({lod_badge})", icon='MOD_DECIM')
+            if assetify_settings.step3_c_lods_expanded:
+                c_box.prop(assetify_settings, "nanite_mode", text="Nanite-Ready Mode (UE5)", icon='LIGHT')
+                if nanite_active:
+                    n_info = c_box.row(align=True)
+                    n_info.label(text="Nanite Active: Decimation LODs bypassed", icon='INFO')
+                else:
+                    if hasattr(scene, "assetify_lod_settings"):
+                        lod_settings = scene.assetify_lod_settings
+                        for lod_idx, gen_prop, rat_prop in [
+                            ("LOD 1", "generate_lod1", "lod1_ratio"),
+                            ("LOD 2", "generate_lod2", "lod2_ratio"),
+                            ("LOD 3", "generate_lod3", "lod3_ratio"),
+                        ]:
+                            lr = c_box.row(align=True)
+                            lr.prop(lod_settings, gen_prop, text=lod_idx)
+                            sub = lr.row()
+                            sub.enabled = getattr(lod_settings, gen_prop)
+                            sub.prop(lod_settings, rat_prop, text="Ratio", slider=True)
+
+                        c_box.prop(lod_settings, "auto_rename_original", text="Auto Rename Original")
+                    else:
+                        c_box.label(text="LOD settings unavailable", icon='ERROR')
+
+            # --- Full-Width Execution Buttons: Generate Collision & LODs ---
+            c_act = col3.row(align=True)
+            c_act.scale_y = 1.35
+            c_act.operator("assetify.generate_collision", text="Generate Collision Colliders (UCX)", icon='MESH_ICOSPHERE')
+            c_act.operator("assetify.clear_collision", text="", icon='TRASH')
+
+            l_act = col3.row(align=True)
+            l_act.scale_y = 1.35
+            l_act.operator("assetify.generate_lods", text="Generate LOD Meshes", icon='MOD_DECIM')
+            l_act.operator("assetify.clear_lods", text="", icon='TRASH')
 
             layout.separator(factor=1.5)
 
@@ -9684,69 +9800,87 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
 
             col4 = step4_box.column(align=False)
             
-            # Mode Buttons
-            e_row = col4.row(align=True)
-            e_still = e_row.operator("assetify.switch_export_mode", text="Still", depress=(assetify_settings.export_mode == 'STILL'))
-            e_still.mode = 'STILL'
-            e_anim = e_row.operator("assetify.switch_export_mode", text="Animation", depress=(assetify_settings.export_mode == 'ANIMATION'))
-            e_anim.mode = 'ANIMATION'
+            # --- A. Target Assets to Export Submenu ---
+            self.draw_target_selection_submenu(col4, assetify_settings, action_label="Export", letter_prefix="A", expanded_prop_name="step4_a_targets_expanded")
 
-            # Destination & Format Box
-            ep_box = col4.box()
-            ep_box.label(text="Destination & Format", icon='FILE_FOLDER')
-            ep_box.prop(assetify_settings, "export_fbx_path", text="")
-            
-            r_ep = ep_box.row(align=True)
-            if assetify_settings.export_mode == 'STILL':
-                r_ep.label(text="Still Format:")
-                r_ep.prop(assetify_settings, "export_format", text="")
-            else:
-                r_ep.label(text="Anim Format:")
-                r_ep.prop(assetify_settings, "animation_export_format", text="")
+            # --- B. Destination & Format Submenu ---
+            b_box = col4.box()
+            b_head = b_box.row(align=True)
+            b_icon = "TRIA_DOWN" if assetify_settings.step4_b_destination_expanded else "TRIA_RIGHT"
+            b_head.prop(assetify_settings, "step4_b_destination_expanded", text="", icon=b_icon, emboss=False)
+            b_head.label(text=f"B. Destination & Format ({exp_fmt} • {assetify_settings.export_mode.title()})", icon='FILE_FOLDER')
+            if assetify_settings.step4_b_destination_expanded:
+                e_row = b_box.row(align=True)
+                e_still = e_row.operator("assetify.switch_export_mode", text="Still", depress=(assetify_settings.export_mode == 'STILL'))
+                e_still.mode = 'STILL'
+                e_anim = e_row.operator("assetify.switch_export_mode", text="Animation", depress=(assetify_settings.export_mode == 'ANIMATION'))
+                e_anim.mode = 'ANIMATION'
 
-            # --- Target Summary Bar ---
-            self.draw_target_summary_bar(col4, assetify_settings, action_label="Export")
+                b_box.prop(assetify_settings, "export_fbx_path", text="")
+                r_ep = b_box.row(align=True)
+                if assetify_settings.export_mode == 'STILL':
+                    r_ep.label(text="Still Format:")
+                    r_ep.prop(assetify_settings, "export_format", text="")
+                else:
+                    r_ep.label(text="Anim Format:")
+                    r_ep.prop(assetify_settings, "animation_export_format", text="")
 
-            # Direct Unreal Live Bridge
-            ue_box = col4.box()
-            ue_row = ue_box.row(align=True)
-            ue_row.scale_y = 1.25
-            ue_row.operator("assetify.send_to_unreal", text="Send to Unreal Engine", icon='IMPORT')
-            ue_row.operator("assetify.unreal_help", text="", icon='QUESTION')
+            # --- C. Unreal Engine Live Bridge Submenu ---
+            c_box = col4.box()
+            c_head = c_box.row(align=True)
+            c_icon = "TRIA_DOWN" if assetify_settings.step4_c_unreal_expanded else "TRIA_RIGHT"
+            c_head.prop(assetify_settings, "step4_c_unreal_expanded", text="", icon=c_icon, emboss=False)
+            ue_active = bool(assetify_settings.unreal_project_path)
+            ue_badge = "Configured" if ue_active else "Setup"
+            c_head.label(text=f"C. Unreal Engine Live Bridge ({ue_badge})", icon='IMPORT')
+            if assetify_settings.step4_c_unreal_expanded:
+                c_box.prop(assetify_settings, "unreal_project_path", text="Project (.uproject)")
+                c_box.prop(assetify_settings, "unreal_editor_path", text="Editor (UnrealEditor.exe)")
 
-            # Export Button
+            # --- Full-Width Execution Buttons: Export & Unreal Bridge ---
             exp_row = col4.row(align=True)
-            exp_row.scale_y = 1.2
+            exp_row.scale_y = 1.35
             exp_row.operator("assetify.show_unbaked_assets", text="", icon='INFO', emboss=False)
             exp_col = exp_row.column()
             if assetify_settings.export_mode == 'STILL':
-                lbl = f"Export Selected ({assetify_settings.export_format.upper()})"
+                lbl = f"Export Selected Assets ({assetify_settings.export_format.upper()})"
                 op_name = "assetify.export_selected_assets"
             else:
-                lbl = f"Export Selected Anim ({assetify_settings.animation_export_format.upper()})"
+                lbl = f"Export Selected Animations ({assetify_settings.animation_export_format.upper()})"
                 op_name = "assetify.export_selected_animations"
             exp_col.enabled = self.check_export_button_enabled(assetify_settings)
             exp_col.operator(op_name, text=lbl)
 
-            # Import Box
-            imp_box = col4.box()
-            imp_box.label(text="Import Verified Game Assets", icon='IMPORT')
-            imp_r = imp_box.row(align=True)
-            if assetify_settings.export_mode == 'STILL':
-                imp_r.label(text="Format:")
-                imp_r.prop(assetify_settings, "import_format", text="")
-            else:
-                imp_r.label(text="Format:")
-                imp_r.prop(assetify_settings, "animation_import_format", text="")
+            ue_row = col4.row(align=True)
+            ue_row.scale_y = 1.25
+            ue_row.operator("assetify.send_to_unreal", text="Send Direct to Unreal Engine", icon='IMPORT')
+            ue_row.operator("assetify.unreal_help", text="", icon='QUESTION')
 
-            imp_act = imp_box.row(align=True)
-            imp_act.operator("assetify.show_unimportable_assets", text="", icon='INFO', emboss=False)
-            imp_col = imp_act.column()
-            if assetify_settings.export_mode == 'STILL':
-                lbl_imp = f"Import Selected ({assetify_settings.import_format.upper()})"
-            else:
-                lbl_imp = f"Import Selected Anim ({assetify_settings.animation_import_format.upper()})"
-            imp_col.operator("assetify.import_selected_fbx", text=lbl_imp)
+            # --- D. Verified Game Asset Import Submenu ---
+            d_box = col4.box()
+            d_head = d_box.row(align=True)
+            d_icon = "TRIA_DOWN" if assetify_settings.step4_d_import_expanded else "TRIA_RIGHT"
+            d_head.prop(assetify_settings, "step4_d_import_expanded", text="", icon=d_icon, emboss=False)
+            imp_fmt = assetify_settings.import_format.upper() if assetify_settings.export_mode == 'STILL' else assetify_settings.animation_import_format.upper()
+            d_head.label(text=f"D. Verified Game Asset Import ({imp_fmt})", icon='IMPORT')
+            if assetify_settings.step4_d_import_expanded:
+                imp_r = d_box.row(align=True)
+                if assetify_settings.export_mode == 'STILL':
+                    imp_r.label(text="Format:")
+                    imp_r.prop(assetify_settings, "import_format", text="")
+                else:
+                    imp_r.label(text="Format:")
+                    imp_r.prop(assetify_settings, "animation_import_format", text="")
+
+                imp_act = d_box.row(align=True)
+                imp_act.scale_y = 1.25
+                imp_act.operator("assetify.show_unimportable_assets", text="", icon='INFO', emboss=False)
+                imp_col = imp_act.column()
+                if assetify_settings.export_mode == 'STILL':
+                    lbl_imp = f"Import Selected Assets ({assetify_settings.import_format.upper()})"
+                else:
+                    lbl_imp = f"Import Selected Anim ({assetify_settings.animation_import_format.upper()})"
+                imp_col.operator("assetify.import_selected_fbx", text=lbl_imp)
 
             layout.separator(factor=1.5)
 
@@ -9759,22 +9893,51 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             mu_head.label(text="Mesh & Pivot Utilities", icon="TOOL_SETTINGS")
 
             mu_col = mu_box.column(align=False)
-            mu_col.operator("assetify.set_pivot_bottom", text="Set Pivot to Bottom", icon='TRANSFORM_ORIGINS')
             
+            # --- A. Pivot Alignment Submenu ---
+            a_box = mu_col.box()
+            a_head = a_box.row(align=True)
+            a_icon = "TRIA_DOWN" if assetify_settings.utils_a_pivot_expanded else "TRIA_RIGHT"
+            a_head.prop(assetify_settings, "utils_a_pivot_expanded", text="", icon=a_icon, emboss=False)
+            a_head.label(text="A. Pivot Alignment", icon='TRANSFORM_ORIGINS')
+            if assetify_settings.utils_a_pivot_expanded:
+                a_box.label(text="Sets the object origin to the bottom center of the bounding box.")
+            a_btn = a_box.row(align=True)
+            a_btn.scale_y = 1.25
+            a_btn.operator("assetify.set_pivot_bottom", text="Set Pivot to Bottom", icon='TRANSFORM_ORIGINS')
+
+            # --- B. Mesh Geometry Submenu ---
             assets_selected = any(asset.include_in_send for asset in assetify_settings.baked_assets)
             collections_selected = any(c.include_in_send for c in assetify_settings.baked_collections)
             is_enabled = assets_selected if assetify_settings.asset_mode == 'ASSET' else collections_selected
 
-            r_mesh = mu_col.row(align=True)
-            r_mesh.enabled = is_enabled
-            r_mesh.operator("assetify.separate_by_material", text="Separate by Material", icon='OUTLINER_OB_MESH')
-            r_mesh.operator("assetify.join_assets", text="Join Assets", icon='OBJECT_DATA')
+            b_box = mu_col.box()
+            b_head = b_box.row(align=True)
+            b_icon = "TRIA_DOWN" if assetify_settings.utils_b_geometry_expanded else "TRIA_RIGHT"
+            b_head.prop(assetify_settings, "utils_b_geometry_expanded", text="", icon=b_icon, emboss=False)
+            b_head.label(text="B. Mesh Geometry Utilities", icon='OBJECT_DATA')
+            if assetify_settings.utils_b_geometry_expanded:
+                b_box.label(text="Split assets by material slot or merge into a single asset.")
+            b_btns = b_box.row(align=True)
+            b_btns.scale_y = 1.25
+            b_btns.enabled = is_enabled
+            b_btns.operator("assetify.separate_by_material", text="Separate by Material", icon='OUTLINER_OB_MESH')
+            b_btns.operator("assetify.join_assets", text="Join Assets", icon='OBJECT_DATA')
 
+            # --- C. Collection Swap Submenu ---
             if assetify_settings.asset_mode == 'COLLECTION':
-                r_swap = mu_col.row(align=True)
-                r_swap.enabled = collections_selected
-                r_swap.operator("assetify.show_swap_info", text="", icon='INFO', emboss=False)
-                r_swap.operator("assetify.swap_collections", text="Swap Original & Game Assets")
+                c_box = mu_col.box()
+                c_head = c_box.row(align=True)
+                c_icon = "TRIA_DOWN" if assetify_settings.utils_c_swap_expanded else "TRIA_RIGHT"
+                c_head.prop(assetify_settings, "utils_c_swap_expanded", text="", icon=c_icon, emboss=False)
+                c_head.label(text="C. Collection Swap Utilities", icon='ARROW_LEFTRIGHT')
+                if assetify_settings.utils_c_swap_expanded:
+                    c_box.label(text="Quickly swap between original collections and baked game collections.")
+                c_btn = c_box.row(align=True)
+                c_btn.scale_y = 1.25
+                c_btn.enabled = collections_selected
+                c_btn.operator("assetify.show_swap_info", text="", icon='INFO', emboss=False)
+                c_btn.operator("assetify.swap_collections", text="Swap Original & Game Assets")
 
             layout.separator(factor=1.5)
 
