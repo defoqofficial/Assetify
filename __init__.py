@@ -9336,25 +9336,31 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         badge_0 = f"0: Assets ({q_total})" if q_total > 0 else "0: Assets"
 
         stepper_box = layout.box()
-        st_row = stepper_box.row(align=True)
-        st_row.scale_y = 1.25
         
-        op0 = st_row.operator("assetify.focus_step", text=badge_0, depress=(cur_step == '0'))
+        # Row 1: Assets & Setup (2 columns)
+        st_row1 = stepper_box.row(align=True)
+        st_row1.scale_y = 1.25
+        op0 = st_row1.operator("assetify.focus_step", text=badge_0, depress=(cur_step == '0'))
         op0.step = '0'
-        op1 = st_row.operator("assetify.focus_step", text="1: Setup", depress=(cur_step == '1'))
+        op1 = st_row1.operator("assetify.focus_step", text="1: Setup", depress=(cur_step == '1'))
         op1.step = '1'
-        op2 = st_row.operator("assetify.focus_step", text="2: Bake", depress=(cur_step == '2'))
+
+        # Row 2: Bake, Proxies, Export (3 columns)
+        st_row2 = stepper_box.row(align=True)
+        st_row2.scale_y = 1.25
+        op2 = st_row2.operator("assetify.focus_step", text="2: Bake", depress=(cur_step == '2'))
         op2.step = '2'
-        op3 = st_row.operator("assetify.focus_step", text="3: Proxies", depress=(cur_step == '3'))
+        op3 = st_row2.operator("assetify.focus_step", text="3: Proxies", depress=(cur_step == '3'))
         op3.step = '3'
-        op4 = st_row.operator("assetify.focus_step", text="4: Export", depress=(cur_step == '4'))
+        op4 = st_row2.operator("assetify.focus_step", text="4: Export", depress=(cur_step == '4'))
         op4.step = '4'
 
-        st_row2 = stepper_box.row(align=True)
-        st_row2.scale_y = 1.15
-        op_u = st_row2.operator("assetify.focus_step", text="Mesh Utilities", icon='TOOL_SETTINGS', depress=(cur_step == 'UTILS'))
+        # Row 3: Utilities & Full View
+        st_row3 = stepper_box.row(align=True)
+        st_row3.scale_y = 1.15
+        op_u = st_row3.operator("assetify.focus_step", text="Mesh Utilities", icon='TOOL_SETTINGS', depress=(cur_step == 'UTILS'))
         op_u.step = 'UTILS'
-        op_all = st_row2.operator("assetify.focus_step", text="View All Steps", icon='FULLSCREEN_ENTER', depress=(cur_step == 'ALL'))
+        op_all = st_row3.operator("assetify.focus_step", text="View All Steps", icon='FULLSCREEN_ENTER', depress=(cur_step == 'ALL'))
         op_all.step = 'ALL'
 
         layout.separator(factor=1.5)
