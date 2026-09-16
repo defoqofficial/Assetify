@@ -3791,6 +3791,30 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
         default=True, 
         description="Bake Ambient Occlusion (AO) map"
     )
+
+    ao_bake_samples: bpy.props.IntProperty(
+        name="AO Samples",
+        description="Number of Cycles samples for Ambient Occlusion baking. Higher = better quality, slower bake",
+        default=128,
+        min=1,
+        max=4096
+    )
+
+    direct_light_bake_samples: bpy.props.IntProperty(
+        name="Direct Light Samples",
+        description="Number of Cycles samples for Direct Light baking",
+        default=64,
+        min=1,
+        max=4096
+    )
+
+    indirect_light_bake_samples: bpy.props.IntProperty(
+        name="Indirect Light Samples",
+        description="Number of Cycles samples for Indirect Light baking",
+        default=64,
+        min=1,
+        max=4096
+    )
     
     pack_orm: bpy.props.BoolProperty(
         name="Pack ORM (UE5/glTF)", 
@@ -5597,16 +5621,24 @@ def debug_print_image_assignments(obj, map_type):
 def set_bake_samples(assetify_settings, map_type, is_unlit=False):
     """
     Sets scene.cycles.samples appropriately.
-    If fast unlit baking is enabled and the pass is unlit, sets samples to 1.
-    Otherwise uses assetify_settings.bake_samples.
+    - AO / Occlusion maps always use ao_bake_samples (never 1).
+    - Direct Light / Indirect Light maps use their own sample counts.
+    - All other unlit passes (Roughness, Metallic, Emission, Alpha…) always use 1 sample.
+    - Lit passes (Normal with lighting, BaseColor with direct/indirect) use bake_samples.
     Returns previous_samples so it can be restored in a finally block.
     """
     scene = bpy.context.scene
     prev_samples = None
     if hasattr(scene, 'cycles'):
         prev_samples = scene.cycles.samples
-        is_fast_unlit = getattr(assetify_settings, 'use_fast_unlit_baking', True)
-        if is_fast_unlit and is_unlit:
+        if map_type == "Occlusion":
+            samples = max(1, getattr(assetify_settings, 'ao_bake_samples', 128))
+        elif map_type == "DirectLight":
+            samples = max(1, getattr(assetify_settings, 'direct_light_bake_samples', 64))
+        elif map_type == "IndirectLight":
+            samples = max(1, getattr(assetify_settings, 'indirect_light_bake_samples', 64))
+        elif is_unlit:
+            # Fast 1-sample baking for unlit data passes — always on
             samples = 1
         else:
             samples = max(1, getattr(assetify_settings, 'bake_samples', 2))
@@ -5837,10 +5869,23 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
         bpy.context.scene.cycles.bake_type = 'AO'
 
     # EXECUTE BAKE
+    # Determine effective map_type for sample selection
+    _has_direct = assetify_settings.bake_direct_light
+    _has_indirect = assetify_settings.bake_indirect_light
+    if map_type == "BaseColor" and _has_direct and not _has_indirect:
+        _sample_map_type = "DirectLight"
+    elif map_type == "BaseColor" and _has_indirect and not _has_direct:
+        _sample_map_type = "IndirectLight"
+    elif map_type == "BaseColor" and _has_direct and _has_indirect:
+        # Both enabled: use the higher of the two sample counts
+        _sample_map_type = "DirectLight"  # set_bake_samples will pick direct_light_bake_samples
+    else:
+        _sample_map_type = map_type
+
     is_unlit = (map_type in ("Roughness", "Normal")) or (
-        map_type == "BaseColor" and not assetify_settings.bake_direct_light and not assetify_settings.bake_indirect_light
+        map_type == "BaseColor" and not _has_direct and not _has_indirect
     )
-    prev_samples = set_bake_samples(assetify_settings, map_type, is_unlit=is_unlit)
+    prev_samples = set_bake_samples(assetify_settings, _sample_map_type, is_unlit=is_unlit)
     try:
         bpy.ops.object.bake(type=bpy.context.scene.cycles.bake_type)
     except Exception as e:
@@ -9450,9 +9495,10 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             r_smp.label(text="Cycles Samples:")
             r_smp.prop(assetify_settings, "bake_samples", text="")
 
-            # 1-Sample Fast Unlit Baking Toggle
-            r_fast = out_box.row(align=True)
-            r_fast.prop(assetify_settings, "use_fast_unlit_baking", text="1-Sample Fast Unlit Baking")
+
+            # Info row: fast unlit baking is always on (no toggle needed)
+            r_info = out_box.row(align=True)
+            r_info.label(text="Unlit passes always use 1-sample (fast)", icon='CHECKMARK')
 
             # --- Channel Packing & Multi-Engine Presets Box ---
             pack_box = col2.box()
@@ -9485,13 +9531,36 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             e_head.prop(assetify_settings, "extra_maps_expanded", text="", icon="TRIA_DOWN" if assetify_settings.extra_maps_expanded else "TRIA_RIGHT", emboss=False)
             e_head.label(text="Extra Map Passes", icon='TEXTURE')
             if assetify_settings.extra_maps_expanded:
-                e_grid = extra_box.grid_flow(row_major=True, columns=2, even_columns=True, even_rows=True, align=True)
-                e_grid.prop(assetify_settings, "bake_ao", text="Ambient Occlusion")
+                e_col = extra_box.column(align=False)
+
+                # AO — with inline sample count when enabled
+                r_ao = e_col.row(align=True)
+                r_ao.prop(assetify_settings, "bake_ao", text="Ambient Occlusion")
+                if assetify_settings.bake_ao:
+                    r_ao.label(text="Samples:")
+                    r_ao.prop(assetify_settings, "ao_bake_samples", text="")
+
+                # Alpha & Emission & Transmission in a simple grid
+                e_grid = e_col.grid_flow(row_major=True, columns=2, even_columns=True, even_rows=True, align=True)
                 e_grid.prop(assetify_settings, "bake_alpha", text="Alpha")
                 e_grid.prop(assetify_settings, "bake_emission", text="Emission")
                 e_grid.prop(assetify_settings, "bake_transmission", text="Transmission")
-                e_grid.prop(assetify_settings, "bake_direct_light", text="Direct Light")
-                e_grid.prop(assetify_settings, "bake_indirect_light", text="Indirect Light")
+                e_grid.label(text="")  # spacer to keep grid even
+
+                # Direct Light — with inline sample count when enabled
+                r_direct = e_col.row(align=True)
+                r_direct.prop(assetify_settings, "bake_direct_light", text="Direct Light (on BaseColor)")
+                if assetify_settings.bake_direct_light:
+                    r_direct.label(text="Samples:")
+                    r_direct.prop(assetify_settings, "direct_light_bake_samples", text="")
+
+                # Indirect Light — with inline sample count when enabled
+                r_indirect = e_col.row(align=True)
+                r_indirect.prop(assetify_settings, "bake_indirect_light", text="Indirect Light (on BaseColor)")
+                if assetify_settings.bake_indirect_light:
+                    r_indirect.label(text="Samples:")
+                    r_indirect.prop(assetify_settings, "indirect_light_bake_samples", text="")
+
                 if assetify_settings.bake_alpha:
                     extra_box.prop(assetify_settings, "force_transparent_black", text="Force Transparent Black", icon='GHOST_ENABLED')
 
