@@ -5239,8 +5239,9 @@ def realize_geometry_node_instances(obj, skip_conversion=False):
     else:
         debug_print(f"Skipping mesh conversion for object {obj.name}.")
 
-    # Ensure the object is still selected after conversion
-    obj = bpy.context.active_object
+    # NOTE: Do NOT reassign obj from bpy.context.active_object here —
+    # bpy.ops.object.convert can leave active_object as None.
+    # Keep the original obj reference which is still valid.
 
     # Remove any empty material slots
     remove_empty_material_slots(obj)
@@ -5248,7 +5249,8 @@ def realize_geometry_node_instances(obj, skip_conversion=False):
     # Revert changes to the Geometry Node tree
     for cleanup in cleanup_functions:
         cleanup()
-    debug_print(f"All changes reverted for geometry nodes on {obj.name}.")
+    if obj is not None:
+        debug_print(f"All changes reverted for geometry nodes on {obj.name}.")
 
     return {'FINISHED'}
     
