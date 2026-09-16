@@ -5086,6 +5086,9 @@ def remove_empty_material_slots(obj):
     """
     Removes any empty material slots from the object's material slots.
     """
+    # Guard: obj may be None or have no data (e.g., during modal processing)
+    if obj is None or not hasattr(obj, "data") or obj.data is None:
+        return
     # Access the object's material slots directly
     materials = obj.data.materials
 
