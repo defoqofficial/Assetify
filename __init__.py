@@ -3453,7 +3453,7 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
     show_asset_list_menu: bpy.props.BoolProperty(
         name="Show Asset List Menu",
         description="Toggle the visibility of the Asset List menu",
-        default=False
+        default=True
     )
     
     show_bake_mode_menu: bpy.props.BoolProperty(
@@ -3561,19 +3561,19 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
         default=True,
     )
     
-        # Properties to control fold-out menus
+    # Properties to control fold-out menus
     bake_menu_expanded: bpy.props.BoolProperty(
         name="Bake Settings Expanded",
         description="Toggle the visibility of Bake Settings",
         default=True  # Expanded by default
     )
     
-    lod_menu_expanded: bpy.props.BoolProperty(name="Expand LOD Menu", default=False)
+    lod_menu_expanded: bpy.props.BoolProperty(name="Expand LOD Menu", default=True)
 
     export_menu_expanded: bpy.props.BoolProperty(
         name="Export Settings Expanded",
         description="Toggle the visibility of Export Settings",
-        default=False  # Collapsed by default
+        default=True  # Expanded by default
     )
     
     use_tiling: bpy.props.BoolProperty(
@@ -3725,17 +3725,9 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
         description="Name of the main collection to track game-ready assets",
         default=""
     )    
-    
-    export_menu_expanded: bpy.props.BoolProperty(
-        name="Export Settings Expanded",
-        description="Toggle the visibility of Export Settings",
-        default=False
-    )
-    
-    # ADD THIS NEW PROPERTY:
     utilities_menu_expanded: bpy.props.BoolProperty(
         name="Utilities Menu Expanded",
-        default=False
+        default=True
     )
 
     # Use a Python list to store the main collection assets
@@ -9140,7 +9132,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
 
             # 1-Sample Fast Unlit Baking Toggle
             r_fast = out_box.row(align=True)
-            r_fast.prop(assetify_settings, "use_fast_unlit_baking", text="⚡ 1-Sample Fast Unlit Baking", icon='LIGHTNING' if assetify_settings.use_fast_unlit_baking else 'BLANK1')
+            r_fast.prop(assetify_settings, "use_fast_unlit_baking", text="1-Sample Fast Unlit Baking")
 
             # --- Channel Packing & Multi-Engine Presets Box ---
             pack_box = col2.box()
