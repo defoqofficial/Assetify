@@ -3760,14 +3760,89 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
     )
 
     orm_format: bpy.props.EnumProperty(
-        name="ORM Format",
-        description="Preset format for packing channels",
+        name="Channel Preset",
+        description="Target engine channel packing preset or custom matrix",
         items=[
-            ('AORM', "AORM (Unreal/Godot)", "R=AO, G=Roughness, B=Metallic, A=1.0"),
+            ('AORM', "Unreal Engine (AORM)", "R=AO, G=Roughness, B=Metallic, A=1.0"),
+            ('UNITY_HDRP', "Unity HDRP / URP (Mask Map)", "R=Metallic, G=AO, B=Detail (0.0), A=Smoothness (1-Roughness)"),
+            ('UNITY_STANDARD', "Unity Standard (Metallic/Gloss)", "R=Metallic, G=AO, B=1.0, A=Smoothness (1-Roughness)"),
+            ('GODOT', "Godot 4 (ORM)", "R=AO, G=Roughness, B=Metallic, A=1.0"),
+            ('GLTF_WEB', "glTF 2.0 / Web", "R=AO, G=Roughness, B=Metallic, A=1.0"),
             ('RMA', "RMA", "R=Roughness, G=Metallic, B=AO, A=1.0"),
-            ('UNITY_MASK', "Unity Mask Map", "R=Metallic, G=AO, B=1.0, A=Smoothness (1-Roughness)"),
+            ('CUSTOM', "Custom Matrix", "Freely route any pass to R, G, B, A channels"),
         ],
         default='AORM'
+    )
+
+    # --- Custom Channel Matrix Routing ---
+    matrix_r: bpy.props.EnumProperty(
+        name="R", items=[
+            ('AO', "Ambient Occlusion", "AO pass"),
+            ('ROUGHNESS', "Roughness", "Roughness pass"),
+            ('METALLIC', "Metallic", "Metallic pass"),
+            ('EMISSION', "Emission", "Emission pass"),
+            ('ALPHA', "Alpha", "Alpha pass"),
+            ('WHITE', "White (1.0)", "Constant 1.0"),
+            ('BLACK', "Black (0.0)", "Constant 0.0"),
+        ], default='AO'
+    )
+    matrix_invert_r: bpy.props.BoolProperty(name="Invert R", default=False)
+
+    matrix_g: bpy.props.EnumProperty(
+        name="G", items=[
+            ('AO', "Ambient Occlusion", "AO pass"),
+            ('ROUGHNESS', "Roughness", "Roughness pass"),
+            ('METALLIC', "Metallic", "Metallic pass"),
+            ('EMISSION', "Emission", "Emission pass"),
+            ('ALPHA', "Alpha", "Alpha pass"),
+            ('WHITE', "White (1.0)", "Constant 1.0"),
+            ('BLACK', "Black (0.0)", "Constant 0.0"),
+        ], default='ROUGHNESS'
+    )
+    matrix_invert_g: bpy.props.BoolProperty(name="Invert G", default=False)
+
+    matrix_b: bpy.props.EnumProperty(
+        name="B", items=[
+            ('AO', "Ambient Occlusion", "AO pass"),
+            ('ROUGHNESS', "Roughness", "Roughness pass"),
+            ('METALLIC', "Metallic", "Metallic pass"),
+            ('EMISSION', "Emission", "Emission pass"),
+            ('ALPHA', "Alpha", "Alpha pass"),
+            ('WHITE', "White (1.0)", "Constant 1.0"),
+            ('BLACK', "Black (0.0)", "Constant 0.0"),
+        ], default='METALLIC'
+    )
+    matrix_invert_b: bpy.props.BoolProperty(name="Invert B", default=False)
+
+    matrix_a: bpy.props.EnumProperty(
+        name="A", items=[
+            ('AO', "Ambient Occlusion", "AO pass"),
+            ('ROUGHNESS', "Roughness", "Roughness pass"),
+            ('METALLIC', "Metallic", "Metallic pass"),
+            ('EMISSION', "Emission", "Emission pass"),
+            ('ALPHA', "Alpha", "Alpha pass"),
+            ('WHITE', "White (1.0)", "Constant 1.0"),
+            ('BLACK', "Black (0.0)", "Constant 0.0"),
+        ], default='WHITE'
+    )
+    matrix_invert_a: bpy.props.BoolProperty(name="Invert A", default=False)
+
+    # --- Batch Pipeline Settings ---
+    batch_pipeline_active: bpy.props.BoolProperty(default=False)
+    batch_generate_collision: bpy.props.BoolProperty(
+        name="Auto Collision",
+        description="Automatically generate compound convex collision after baking in batch mode",
+        default=True
+    )
+    batch_generate_lods: bpy.props.BoolProperty(
+        name="Auto LODs",
+        description="Automatically generate LODs after baking in batch mode (skipped if Nanite active)",
+        default=True
+    )
+    batch_auto_export: bpy.props.BoolProperty(
+        name="Auto Export",
+        description="Automatically export game-ready assets (FBX/OBJ/glTF) upon batch completion",
+        default=False
     )
 
     nanite_mode: bpy.props.BoolProperty(
@@ -4223,8 +4298,12 @@ def perform_orm_packing(obj, context):
             suffix = "ORM"
             if format_type == 'RMA':
                 suffix = "RMA"
-            elif format_type == 'UNITY_MASK':
+            elif format_type in {'UNITY_MASK', 'UNITY_HDRP'}:
                 suffix = "MaskMap"
+            elif format_type == 'UNITY_STANDARD':
+                suffix = "MetallicGloss"
+            elif format_type == 'CUSTOM':
+                suffix = "CustomPacked"
 
             # Determine output name
             if is_anim: 
@@ -4647,6 +4726,31 @@ class OBJECT_OT_bake_textures_modal(bpy.types.Operator):
                 
                 switch_to_solid_shading_and_back()
                 context.window_manager.event_timer_remove(self._timer)
+
+                # --- BATCH PIPELINE CHAINING ---
+                if getattr(assetify_settings, 'batch_pipeline_active', False):
+                    assetify_settings.batch_pipeline_active = False
+                    try:
+                        # 1. Generate Compound Collision
+                        if getattr(assetify_settings, 'batch_generate_collision', True):
+                            print("[Assetify Batch] Automatically generating collision...")
+                            bpy.ops.assetify.generate_collision()
+
+                        # 2. Generate LODs (if not Nanite mode)
+                        if getattr(assetify_settings, 'batch_generate_lods', True) and not getattr(assetify_settings, 'nanite_mode', False):
+                            print("[Assetify Batch] Automatically generating LODs...")
+                            bpy.ops.assetify.generate_lods()
+
+                        # 3. Export Game-Ready Assets (if configured)
+                        if getattr(assetify_settings, 'batch_auto_export', False):
+                            print("[Assetify Batch] Automatically exporting game-ready assets...")
+                            bpy.ops.assetify.export_selected_assets()
+                            
+                        self.report({'INFO'}, "[Assetify Batch] Full pipeline completed successfully!")
+                    except Exception as e:
+                        print(f"[Assetify Batch Error]: {e}")
+                        self.report({'WARNING'}, f"Batch post-processing encountered an issue: {e}")
+
                 return {'FINISHED'}
 
         return {'PASS_THROUGH'}
@@ -6051,11 +6155,20 @@ def pack_metallic_roughness(metallic_image, roughness_image, output_image_name="
 def pack_orm_textures(obj, ao_image, roughness_image, metallic_image, output_image_name="Temp_ORM_Packer", use_float=False, filepath=None, file_format='PNG', format_type=None):
     """
     Combines AO, Roughness, and Metallic into one image using instant NumPy channel packing.
-    Supports AORM, RMA, and Unity Mask Map presets.
+    Supports multi-engine presets (Unreal, Unity HDRP/Standard, Godot, glTF) and Custom Matrix.
     """
+    settings = getattr(bpy.context.scene, 'assetify_bake_settings', None)
     if format_type is None:
-        settings = getattr(bpy.context.scene, 'assetify_bake_settings', None)
         format_type = getattr(settings, 'orm_format', 'AORM') if settings else 'AORM'
+
+    custom_mapping = None
+    if format_type == 'CUSTOM' and settings:
+        custom_mapping = {
+            'R': (settings.matrix_r, settings.matrix_invert_r),
+            'G': (settings.matrix_g, settings.matrix_invert_g),
+            'B': (settings.matrix_b, settings.matrix_invert_b),
+            'A': (settings.matrix_a, settings.matrix_invert_a)
+        }
 
     ref_image = roughness_image or metallic_image or ao_image
     w, h = (ref_image.size[0], ref_image.size[1]) if ref_image else (2048, 2048)
@@ -6067,6 +6180,7 @@ def pack_orm_textures(obj, ao_image, roughness_image, metallic_image, output_ima
         output_path=filepath,
         image_name=output_image_name,
         format_type=format_type,
+        custom_mapping=custom_mapping,
         width=w,
         height=h,
         file_format=file_format
@@ -6939,8 +7053,12 @@ def apply_baked_textures(obj, save_dir, platform="UE5", asset_name_override=None
         suffix = "ORM"
         if orm_fmt == "RMA":
             suffix = "RMA"
-        elif orm_fmt == "UNITY_MASK":
+        elif orm_fmt in {"UNITY_MASK", "UNITY_HDRP"}:
             suffix = "MaskMap"
+        elif orm_fmt == "UNITY_STANDARD":
+            suffix = "MetallicGloss"
+        elif orm_fmt == "CUSTOM":
+            suffix = "CustomPacked"
 
         img_orm = load_texture(suffix, 'Non-Color')
         if not img_orm and suffix != "ORM":
@@ -6957,16 +7075,42 @@ def apply_baked_textures(obj, save_dir, platform="UE5", asset_name_override=None
                 ao_socket = sep.outputs['Blue']
                 node_tree.links.new(sep.outputs['Red'], bsdf_node.inputs['Roughness'])
                 node_tree.links.new(sep.outputs['Green'], bsdf_node.inputs['Metallic'])
-            elif orm_fmt == "UNITY_MASK":
-                # Unity Mask: Red=Metallic, Green=AO, Blue=Detail, Alpha=Smoothness
+            elif orm_fmt in {"UNITY_MASK", "UNITY_HDRP", "UNITY_STANDARD"}:
+                # Unity Mask/Standard: Red=Metallic, Green=AO, Alpha=Smoothness
                 ao_socket = sep.outputs['Green']
                 node_tree.links.new(sep.outputs['Red'], bsdf_node.inputs['Metallic'])
                 inv_node = node_tree.nodes.new('ShaderNodeInvert')
                 inv_node.location = (-150, node_orm.location.y)
                 node_tree.links.new(node_orm.outputs['Alpha'], inv_node.inputs['Color'])
                 node_tree.links.new(inv_node.outputs['Color'], bsdf_node.inputs['Roughness'])
+            elif orm_fmt == "CUSTOM":
+                # Dynamic mapping for custom channel matrix
+                ch_sockets = [
+                    (sep.outputs['Red'], assetify_settings.matrix_r, assetify_settings.matrix_invert_r),
+                    (sep.outputs['Green'], assetify_settings.matrix_g, assetify_settings.matrix_invert_g),
+                    (sep.outputs['Blue'], assetify_settings.matrix_b, assetify_settings.matrix_invert_b),
+                    (node_orm.outputs['Alpha'], assetify_settings.matrix_a, assetify_settings.matrix_invert_a),
+                ]
+                for sock, pass_type, is_inv in ch_sockets:
+                    out_sock = sock
+                    if is_inv:
+                        inv = node_tree.nodes.new('ShaderNodeInvert')
+                        inv.location = (-150, node_orm.location.y)
+                        node_tree.links.new(sock, inv.inputs['Color'])
+                        out_sock = inv.outputs['Color']
+
+                    if pass_type == 'AO':
+                        ao_socket = out_sock
+                    elif pass_type == 'ROUGHNESS' and 'Roughness' in bsdf_node.inputs:
+                        node_tree.links.new(out_sock, bsdf_node.inputs['Roughness'])
+                    elif pass_type == 'METALLIC' and 'Metallic' in bsdf_node.inputs:
+                        node_tree.links.new(out_sock, bsdf_node.inputs['Metallic'])
+                    elif pass_type == 'ALPHA' and 'Alpha' in bsdf_node.inputs:
+                        node_tree.links.new(out_sock, bsdf_node.inputs['Alpha'])
+                    elif pass_type == 'EMISSION' and 'Emission Color' in bsdf_node.inputs:
+                        node_tree.links.new(out_sock, bsdf_node.inputs['Emission Color'])
             else:
-                # AORM Mapping: Red=AO, Green=Roughness, Blue=Metallic
+                # Default / AORM / UNREAL / GODOT / GLTF_WEB: Red=AO, Green=Roughness, Blue=Metallic
                 ao_socket = sep.outputs['Red'] 
                 node_tree.links.new(sep.outputs['Green'], bsdf_node.inputs['Roughness'])
                 node_tree.links.new(sep.outputs['Blue'], bsdf_node.inputs['Metallic'])
@@ -8670,6 +8814,142 @@ class ASSETIFY_OT_show_apply_frame_attributes_info(bpy.types.Operator):
         # No additional actions; the popup is only informational
         return {'FINISHED'}
 
+class ASSETIFY_OT_viewport_compare(bpy.types.Operator):
+    """Switch or compare Viewport visibility between Original High-Poly and Baked Game-Ready assets"""
+    bl_idname = "assetify.viewport_compare"
+    bl_label = "Viewport Compare"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: bpy.props.EnumProperty(
+        items=[
+            ('ORIGINAL', "Original", "Show original high-poly assets, hide baked"),
+            ('BAKED', "Baked", "Show baked game-ready assets, hide original"),
+            ('SIDE_BY_SIDE', "Side by Side", "Compare original and baked side-by-side with spatial offset"),
+            ('TOGGLE', "Toggle", "Quickly toggle between Original and Baked"),
+        ],
+        default='TOGGLE'
+    )
+
+    def execute(self, context):
+        scene = context.scene
+        current_mode = getattr(scene, "assetify_viewport_mode", "BAKED")
+        
+        target_mode = self.mode
+        if target_mode == 'TOGGLE':
+            target_mode = 'ORIGINAL' if current_mode == 'BAKED' else 'BAKED'
+
+        game_objects = []
+        orig_objects = []
+
+        for obj in scene.objects:
+            if "_gameasset" in obj.name:
+                game_objects.append(obj)
+                base_name = obj.name.replace("_gameasset", "")
+                orig = bpy.data.objects.get(base_name)
+                if not orig:
+                    orig = bpy.data.objects.get(f"{base_name}_ORIGINAL_HIDDEN")
+                if orig and orig not in orig_objects:
+                    orig_objects.append(orig)
+
+        for col in bpy.data.collections:
+            if col.name.endswith("_GameReady"):
+                orig_col_name = col.name[:-10]
+                orig_col = bpy.data.collections.get(orig_col_name)
+                if orig_col:
+                    for o in col.all_objects:
+                        if o not in game_objects:
+                            game_objects.append(o)
+                    for o in orig_col.all_objects:
+                        if o not in orig_objects:
+                            orig_objects.append(o)
+
+        if not game_objects and not orig_objects:
+            self.report({'INFO'}, "No baked game assets found to compare.")
+            return {'CANCELLED'}
+
+        if target_mode == 'ORIGINAL':
+            for gobj in game_objects:
+                if "_assetify_orig_x" in gobj:
+                    gobj.location.x = gobj["_assetify_orig_x"]
+                    del gobj["_assetify_orig_x"]
+                gobj.hide_set(True)
+                gobj.hide_viewport = True
+            for oobj in orig_objects:
+                oobj.hide_set(False)
+                oobj.hide_viewport = False
+            scene.assetify_viewport_mode = 'ORIGINAL'
+            self.report({'INFO'}, "Viewport: Showing Original High-Poly Assets.")
+
+        elif target_mode == 'BAKED':
+            for gobj in game_objects:
+                if "_assetify_orig_x" in gobj:
+                    gobj.location.x = gobj["_assetify_orig_x"]
+                    del gobj["_assetify_orig_x"]
+                gobj.hide_set(False)
+                gobj.hide_viewport = False
+            for oobj in orig_objects:
+                oobj.hide_set(True)
+                oobj.hide_viewport = True
+            scene.assetify_viewport_mode = 'BAKED'
+            self.report({'INFO'}, "Viewport: Showing Baked Game-Ready Assets.")
+
+        elif target_mode == 'SIDE_BY_SIDE':
+            for gobj in game_objects:
+                gobj.hide_set(False)
+                gobj.hide_viewport = False
+                base_name = gobj.name.replace("_gameasset", "")
+                orig = bpy.data.objects.get(base_name) or bpy.data.objects.get(f"{base_name}_ORIGINAL_HIDDEN")
+                if "_assetify_orig_x" not in gobj:
+                    gobj["_assetify_orig_x"] = gobj.location.x
+                dims_x = (orig.dimensions.x if orig else gobj.dimensions.x) * 1.3
+                offset = max(dims_x, 2.0)
+                gobj.location.x = gobj["_assetify_orig_x"] + offset
+                
+            for oobj in orig_objects:
+                oobj.hide_set(False)
+                oobj.hide_viewport = False
+            scene.assetify_viewport_mode = 'SIDE_BY_SIDE'
+            self.report({'INFO'}, "Viewport: Side-by-Side Comparison active.")
+
+        return {'FINISHED'}
+
+class ASSETIFY_OT_batch_pipeline(bpy.types.Operator):
+    """Run full automated pipeline on selected assets: Setup, Unwrap, Bake, Channel Pack, Collision, LODs, and Export"""
+    bl_idname = "assetify.batch_pipeline"
+    bl_label = "Run Assetify Batch Pipeline"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        bake_settings = scene.assetify_bake_settings
+
+        # If user selected meshes in the viewport, ensure they are registered in baked_assets
+        selected_meshes = [o for o in context.selected_objects if o.type == 'MESH']
+        if selected_meshes and bake_settings.asset_mode == 'ASSET':
+            for obj in selected_meshes:
+                existing = [a for a in bake_settings.baked_assets if a.name == obj.name]
+                if not existing:
+                    new_asset = bake_settings.baked_assets.add()
+                    new_asset.name = obj.name
+                    new_asset.include_in_send = True
+                    new_asset.is_game_asset = False
+                else:
+                    existing[0].include_in_send = True
+
+        has_items = False
+        if bake_settings.asset_mode == 'ASSET':
+            has_items = any(a.include_in_send for a in bake_settings.baked_assets)
+        elif bake_settings.asset_mode == 'COLLECTION':
+            has_items = any(c.include_in_send for c in bake_settings.baked_collections)
+
+        if not has_items:
+            self.report({'WARNING'}, "No assets selected or marked for batch processing.")
+            return {'CANCELLED'}
+
+        bake_settings.batch_pipeline_active = True
+        bpy.ops.object.bake_textures_modal('INVOKE_DEFAULT')
+        return {'FINISHED'}
+
 class ASSETIFY_PT_tools_panel(bpy.types.Panel):
     """Creates a Panel in the 3D Viewport Tool Shelf"""
     bl_label = "Assetify"
@@ -8694,6 +8974,33 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         all_collections_assigned = all(
             item.collection is not None for item in assetify_settings.asset_collections
         )
+
+        # --- VIEWPORT COMPARE TOOLBAR ---
+        vp_box = layout.box()
+        vp_row = vp_box.row(align=True)
+        vp_row.label(text="Compare:", icon='HIDE_OFF')
+        current_vp_mode = getattr(scene, "assetify_viewport_mode", "BAKED")
+        
+        op = vp_row.operator("assetify.viewport_compare", text="Original", depress=(current_vp_mode == 'ORIGINAL'))
+        op.mode = 'ORIGINAL'
+        op = vp_row.operator("assetify.viewport_compare", text="Baked", depress=(current_vp_mode == 'BAKED'))
+        op.mode = 'BAKED'
+        op = vp_row.operator("assetify.viewport_compare", text="Split", icon='ARROW_LEFTRIGHT', depress=(current_vp_mode == 'SIDE_BY_SIDE'))
+        op.mode = 'SIDE_BY_SIDE'
+
+        # --- ONE-CLICK BATCH PIPELINE ---
+        batch_box = layout.box()
+        b_header = batch_box.row(align=True)
+        b_header.label(text="Assetify Batch Pipeline", icon='AUTO')
+        
+        b_btn_row = batch_box.row(align=True)
+        b_btn_row.scale_y = 1.3
+        b_btn_row.operator("assetify.batch_pipeline", text="Run Assetify Full Batch", icon='PLAY')
+        
+        b_opts = batch_box.row(align=True)
+        b_opts.prop(assetify_settings, "batch_generate_collision", text="Collision")
+        b_opts.prop(assetify_settings, "batch_generate_lods", text="LODs")
+        b_opts.prop(assetify_settings, "batch_auto_export", text="Export")
 
         # --- PROCESS ASSETS SECTION ---
         box = layout.box()
@@ -9106,8 +9413,31 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 
                 if assetify_settings.pack_orm:
                     row = col_sub.row(align=True)
-                    row.label(text="ORM Preset")
+                    row.label(text="Engine Preset")
                     row.prop(assetify_settings, "orm_format", text="")
+                    if assetify_settings.orm_format == 'CUSTOM':
+                        matrix_box = col_sub.box()
+                        matrix_box.label(text="Custom Channel Matrix", icon='COLOR')
+                        
+                        r_row = matrix_box.row(align=True)
+                        r_row.label(text="R:")
+                        r_row.prop(assetify_settings, "matrix_r", text="")
+                        r_row.prop(assetify_settings, "matrix_invert_r", text="Inv")
+                        
+                        g_row = matrix_box.row(align=True)
+                        g_row.label(text="G:")
+                        g_row.prop(assetify_settings, "matrix_g", text="")
+                        g_row.prop(assetify_settings, "matrix_invert_g", text="Inv")
+                        
+                        b_row = matrix_box.row(align=True)
+                        b_row.label(text="B:")
+                        b_row.prop(assetify_settings, "matrix_b", text="")
+                        b_row.prop(assetify_settings, "matrix_invert_b", text="Inv")
+                        
+                        a_row = matrix_box.row(align=True)
+                        a_row.label(text="A:")
+                        a_row.prop(assetify_settings, "matrix_a", text="")
+                        a_row.prop(assetify_settings, "matrix_invert_a", text="Inv")
 
                 # ==========================
                 # ROW 6: NANITE READY (UE5)
@@ -9641,6 +9971,8 @@ classes = (
     ASSETIFY_OT_remove_asset_collection,
     ASSETIFY_OT_show_custom_attributes_info,
     ASSETIFY_OT_UnrealHelp,
+    ASSETIFY_OT_viewport_compare,
+    ASSETIFY_OT_batch_pipeline,
     op_send_to_unreal.ASSETIFY_OT_SendToUnreal,
     op_send_to_unreal.ASSETIFY_OT_TransferFinished,
 )
@@ -9745,6 +10077,17 @@ def register():
         if not hasattr(bpy.types.WindowManager, "confirm_export"):
             bpy.types.WindowManager.confirm_export = bpy.props.BoolProperty(name="Confirm Export", default=False)
             print("[INFO] confirm_export added.")
+        if not hasattr(bpy.types.Scene, "assetify_viewport_mode"):
+            bpy.types.Scene.assetify_viewport_mode = bpy.props.EnumProperty(
+                name="Viewport Compare Mode",
+                items=[
+                    ('ORIGINAL', "Original", "Show high-poly original assets"),
+                    ('BAKED', "Baked", "Show low-poly baked game assets"),
+                    ('SIDE_BY_SIDE', "Side by Side", "Compare original and baked side by side"),
+                ],
+                default='BAKED'
+            )
+            print("[INFO] assetify_viewport_mode added.")
     except Exception as e:
         print(f"[ERROR] Failed to add properties: {e}")
 
@@ -9823,6 +10166,8 @@ def unregister():
         del bpy.types.WindowManager.unbaked_assets
     if hasattr(bpy.types.WindowManager, "confirm_export"):
         del bpy.types.WindowManager.confirm_export
+    if hasattr(bpy.types.Scene, "assetify_viewport_mode"):
+        del bpy.types.Scene.assetify_viewport_mode
 
     # Remove handlers safely
     if load_post_handler in bpy.app.handlers.load_post:

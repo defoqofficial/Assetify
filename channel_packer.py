@@ -1,4 +1,4 @@
-﻿import bpy
+import bpy
 import numpy as np
 import os
 
@@ -101,23 +101,80 @@ def pack_channels(
         
     return packed_img
 
-def pack_orm_texture(
-    ao_source,
-    roughness_source,
-    metallic_source,
-    alpha_source=None,
+def pack_custom_matrix(
+    sources_dict,
+    mapping,
     output_path=None,
-    image_name="AORM",
-    format_type="AORM",
+    image_name="CustomPacked",
     width=2048,
     height=2048,
     file_format="PNG"
 ):
     """
-    Helper function specifically for PBR game engine ORM packing.
-    format_type can be 'AORM', 'RMA', or 'UNITY_MASK'
+    Packs arbitrary passes into RGBA based on mapping dict:
+    mapping = {
+        'R': (pass_name, invert_bool),
+        'G': (pass_name, invert_bool),
+        'B': (pass_name, invert_bool),
+        'A': (pass_name, invert_bool)
+    }
     """
-    if format_type == "RMA":
+    total_pixels = width * height
+    channel_arrays = []
+    
+    for ch in ['R', 'G', 'B', 'A']:
+        pass_name, invert = mapping.get(ch, ('WHITE', False))
+        if pass_name == 'WHITE':
+            vals = np.full(total_pixels, 1.0, dtype=np.float32)
+        elif pass_name == 'BLACK':
+            vals = np.full(total_pixels, 0.0, dtype=np.float32)
+        else:
+            img = sources_dict.get(pass_name)
+            default_val = 1.0 if pass_name in {'AO', 'ROUGHNESS'} else 0.0
+            vals = load_image_pixels(img, width, height, default_val=default_val)
+            
+        if invert:
+            vals = 1.0 - vals
+        channel_arrays.append(vals)
+        
+    return pack_channels(
+        r_source=channel_arrays[0],
+        g_source=channel_arrays[1],
+        b_source=channel_arrays[2],
+        a_source=channel_arrays[3],
+        output_path=output_path,
+        image_name=image_name,
+        width=width,
+        height=height,
+        file_format=file_format
+    )
+
+def pack_orm_texture(
+    ao_source,
+    roughness_source,
+    metallic_source,
+    alpha_source=None,
+    emission_source=None,
+    output_path=None,
+    image_name="AORM",
+    format_type="AORM",
+    custom_mapping=None,
+    width=2048,
+    height=2048,
+    file_format="PNG"
+):
+    """
+    Helper function for PBR game engine ORM and channel-packed textures.
+    Supports presets:
+      - 'AORM' / 'UNREAL' / 'GODOT' / 'GLTF_WEB': R=AO, G=Roughness, B=Metallic, A=1.0
+      - 'RMA': R=Roughness, G=Metallic, B=AO, A=1.0
+      - 'UNITY_MASK' / 'UNITY_HDRP': R=Metallic, G=AO, B=Detail (0.0), A=Smoothness (1-Roughness)
+      - 'UNITY_STANDARD': R=Metallic, G=AO, B=1.0, A=Smoothness (1-Roughness)
+      - 'CUSTOM': Evaluates custom_mapping dictionary
+    """
+    format_upper = format_type.upper() if isinstance(format_type, str) else "AORM"
+
+    if format_upper in {"RMA"}:
         return pack_channels(
             r_source=roughness_source,
             g_source=metallic_source,
@@ -133,11 +190,10 @@ def pack_orm_texture(
             a_default=1.0,
             file_format=file_format
         )
-    elif format_type == "UNITY_MASK":
-        # Unity: R=Metallic, G=AO, B=Detail (default 0), A=Smoothness (1 - Roughness)
+    elif format_upper in {"UNITY_MASK", "UNITY_HDRP"}:
+        # Unity HDRP / URP: R=Metallic, G=AO, B=Detail (default 0.0), A=Smoothness (1 - Roughness)
         rough_vals = load_image_pixels(roughness_source, width, height, default_val=1.0)
         smooth_vals = 1.0 - rough_vals
-        
         return pack_channels(
             r_source=metallic_source,
             g_source=ao_source,
@@ -153,7 +209,44 @@ def pack_orm_texture(
             a_default=0.0,
             file_format=file_format
         )
-    else: # Default: AORM / ORM (AO in R, Roughness in G, Metallic in B)
+    elif format_upper == "UNITY_STANDARD":
+        # Unity Standard Metallic/Gloss: R=Metallic, G=AO, B=1.0, A=Smoothness (1 - Roughness)
+        rough_vals = load_image_pixels(roughness_source, width, height, default_val=1.0)
+        smooth_vals = 1.0 - rough_vals
+        return pack_channels(
+            r_source=metallic_source,
+            g_source=ao_source,
+            b_source=None,
+            a_source=smooth_vals,
+            output_path=output_path,
+            image_name=image_name,
+            width=width,
+            height=height,
+            r_default=0.0,
+            g_default=1.0,
+            b_default=1.0,
+            a_default=0.0,
+            file_format=file_format
+        )
+    elif format_upper == "CUSTOM" and custom_mapping:
+        sources_dict = {
+            'AO': ao_source,
+            'ROUGHNESS': roughness_source,
+            'METALLIC': metallic_source,
+            'ALPHA': alpha_source,
+            'EMISSION': emission_source
+        }
+        return pack_custom_matrix(
+            sources_dict=sources_dict,
+            mapping=custom_mapping,
+            output_path=output_path,
+            image_name=image_name,
+            width=width,
+            height=height,
+            file_format=file_format
+        )
+    else:
+        # Default / AORM / UNREAL / GODOT / GLTF_WEB: R=AO, G=Roughness, B=Metallic, A=1.0
         return pack_channels(
             r_source=ao_source,
             g_source=roughness_source,
