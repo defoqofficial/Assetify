@@ -9491,15 +9491,6 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             r_fmt.prop(assetify_settings, "bake_format", text="")
             r_fmt.prop(assetify_settings, "bake_resolution", text="")
 
-            r_smp = out_col.row(align=True)
-            r_smp.label(text="Cycles Samples:")
-            r_smp.prop(assetify_settings, "bake_samples", text="")
-
-
-            # Info row: fast unlit baking is always on (no toggle needed)
-            r_info = out_box.row(align=True)
-            r_info.label(text="Unlit passes always use 1-sample (fast)", icon='CHECKMARK')
-
             # --- Channel Packing & Multi-Engine Presets Box ---
             pack_box = col2.box()
             p_head = pack_box.row(align=True)
