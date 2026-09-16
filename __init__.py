@@ -1734,6 +1734,17 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
     bl_label = "Convert Selected to Game-Ready"
     bl_options = {'REGISTER', 'UNDO'}
 
+    source: bpy.props.EnumProperty(
+        name="Source",
+        description="Source of collections to convert into game-ready assets",
+        items=[
+            ('DROPDOWN', "From Dropdown", "Process collection chosen in the dropdown"),
+            ('SELECTED', "From Selection", "Process collections from selected objects or Outliner"),
+            ('LIST', "From List", "Process collections from the asset_collections list"),
+        ],
+        default='DROPDOWN'
+    )
+
     # Variables for modal operation
     _timer = None
     _collections_to_process = []
@@ -1760,17 +1771,48 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
 
     def execute(self, context):
         assetify_settings = context.scene.assetify_bake_settings
-        asset_collections = assetify_settings.asset_collections
 
         # Ensure viewport shading is set to solid
         set_viewport_shading_to_solid(context)
 
-        if not asset_collections:
-            self.report({'WARNING'}, "No asset collections selected.")
-            return {'CANCELLED'}
+        # Collect target collections based on source mode
+        colls_to_process = []
+        if self.source == 'DROPDOWN':
+            if assetify_settings.source_collection:
+                colls_to_process = [assetify_settings.source_collection]
+            else:
+                self.report({'WARNING'}, "Please select a collection from the dropdown to process.")
+                return {'CANCELLED'}
+        elif self.source == 'SELECTED':
+            found = set()
+            # 1. Selected IDs in Outliner
+            if hasattr(context, "selected_ids"):
+                for id_block in context.selected_ids:
+                    if isinstance(id_block, bpy.types.Collection) and id_block != context.scene.collection and not id_block.name.endswith("_GameReady"):
+                        found.add(id_block)
+            # 2. Collections of selected objects in 3D Viewport
+            for obj in context.selected_objects:
+                for coll in obj.users_collection:
+                    if coll != context.scene.collection and not coll.name.endswith("_GameReady"):
+                        found.add(coll)
+            # 3. Active collection fallback
+            if not found and context.collection and context.collection != context.scene.collection and not context.collection.name.endswith("_GameReady"):
+                found.add(context.collection)
+
+            colls_to_process = list(found)
+            if not colls_to_process:
+                self.report({'WARNING'}, "No scene collections or objects in collections selected.")
+                return {'CANCELLED'}
+        else:  # 'LIST'
+            colls_to_process = [item.collection for item in assetify_settings.asset_collections if item.collection]
+            if not colls_to_process:
+                self.report({'WARNING'}, "No asset collections assigned.")
+                return {'CANCELLED'}
+
+        self._collections_to_process = colls_to_process
 
         # Continue with the regular game-ready conversion
-        self.report({'INFO'}, "Running Game Ready Conversion...")
+        self.report({'INFO'}, f"Processing {len(colls_to_process)} collection(s) to Game-Ready...")
         return self.run_still_process(context)
 
     def run_still_process(self, context):
@@ -1791,8 +1833,7 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
 
         # Collect assets and create game-ready collections
         assetify_settings = context.scene.assetify_bake_settings
-        for item in assetify_settings.asset_collections:
-            collection = item.collection
+        for collection in self._collections_to_process:
             if collection:
                 self.main_collections.add(collection)
                 # Create game-ready collection for main collection
@@ -1862,7 +1903,7 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
                 
                 assetify_settings.skip_save_check = False
                 assetify_settings.active_pipeline_step = '1'
-                assetify_settings.step1_d_queue_expanded = True
+                assetify_settings.step1_b_queue_expanded = True
                 
                 return {'FINISHED'}
 
@@ -3702,6 +3743,12 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
         type=bpy.types.Collection
     )
 
+    source_collection: bpy.props.PointerProperty(
+        name="Source Collection",
+        description="Select a scene collection to process directly into game-ready assets",
+        type=bpy.types.Collection
+    )
+
     assets_baked: bpy.props.BoolProperty(
         name="Assets Baked",
         description="Indicates if the assets have been set and baked",
@@ -3935,9 +3982,8 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
     # --- Submenu Expansion States (A-Z Sequential Submenus, Collapsed by Default) ---
     # Step 1: Setup
     step1_a_mode_expanded: bpy.props.BoolProperty(name="A. Pipeline Mode", default=False)
-    step1_b_collections_expanded: bpy.props.BoolProperty(name="B. Input Collections", default=False)
+    step1_b_queue_expanded: bpy.props.BoolProperty(name="B. Asset Queue", default=False)
     step1_c_advanced_expanded: bpy.props.BoolProperty(name="C. Advanced Setup", default=False)
-    step1_d_queue_expanded: bpy.props.BoolProperty(name="D. Target Assets / Processed Queue", default=False)
 
     # Step 2: Bake
     step2_a_output_expanded: bpy.props.BoolProperty(name="A. Output & Resolution", default=False)
@@ -9216,7 +9262,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         if total > 0:
             layout.label(text=f"({selected}/{total} Active)")
 
-    def draw_target_selection_submenu(self, layout, assetify_settings, action_label="Bake", letter_prefix="A", expanded_prop_name="show_quick_target_select"):
+    def draw_target_selection_submenu(self, layout, assetify_settings, action_label="Bake", letter_prefix="A", expanded_prop_name="show_quick_target_select", show_intake=False):
         """Draws the complete target asset selection as an A-Z lettered submenu collapsed by default."""
         if assetify_settings.asset_mode == 'ASSET':
             total = len(assetify_settings.baked_assets)
@@ -9234,24 +9280,50 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         status_icon = 'CHECKBOX_HLT' if active > 0 else 'CHECKBOX_DEHLT'
         badge = f"{active} of {total} Selected" if total > 0 else "0 in Queue"
         if action_label in {"", "Queue", "Process"}:
-            label_text = f"{letter_prefix}. Target Assets / Processed Queue ({badge})"
+            label_text = f"{letter_prefix}. Asset Queue ({badge})"
         else:
             label_text = f"{letter_prefix}. Target Assets to {action_label} ({badge})"
         t_head.label(text=label_text, icon=status_icon)
 
         if is_expanded:
-            if total == 0:
-                sub = t_box.column(align=True)
-                if action_label in {"", "Queue", "Process"}:
-                    sub.label(text="No assets in processed queue yet.", icon='INFO')
-                    sub.label(text="Assign collections above and click 'Process Assets'.")
+            sub = t_box.column(align=False)
+
+            if show_intake:
+                in_box = sub.box()
+                in_head = in_box.row(align=True)
+                in_head.label(text="Intake: Process Collection to Queue", icon='COLLECTION_NEW')
+
+                # Row 1: Dropdown + Process button
+                r_pick = in_box.row(align=True)
+                r_pick.prop_search(assetify_settings, "source_collection", bpy.data, "collections", text="", icon='OUTLINER_COLLECTION')
+                if assetify_settings.bake_mode == 'ANIMATION':
+                    proc_txt = "Process Animation"
+                    proc_icon = 'FORWARD'
                 else:
-                    sub.label(text=f"No assets in queue to {action_label.lower()}.", icon='INFO')
-                    op_go = sub.row().operator("assetify.focus_step", text="Go to Step 1: Setup →", icon='GEOMETRY_SET')
+                    proc_txt = "Process Collection"
+                    proc_icon = 'FORWARD'
+                op_add = r_pick.operator("object.convert_to_game_ready", text=proc_txt, icon=proc_icon)
+                op_add.source = 'DROPDOWN'
+                op_add.enabled = (assetify_settings.source_collection is not None)
+
+                # Row 2: Selection button
+                r_sel = in_box.row(align=True)
+                op_sel = r_sel.operator("object.convert_to_game_ready", text="Process Selected in Viewport / Outliner", icon='RESTRICT_SELECT_OFF')
+                op_sel.source = 'SELECTED'
+
+                sub.separator(factor=0.5)
+
+            if total == 0:
+                hint_box = sub.box()
+                hint_col = hint_box.column(align=True)
+                if show_intake:
+                    hint_col.label(text="No assets in queue yet.", icon='INFO')
+                    hint_col.label(text="Select a collection above and click 'Process Collection'.")
+                else:
+                    hint_col.label(text=f"No assets in queue to {action_label.lower()}.", icon='INFO')
+                    op_go = hint_col.row().operator("assetify.focus_step", text="Go to Step 1: Setup →", icon='GEOMETRY_SET')
                     op_go.step = '1'
                 return
-
-            sub = t_box.column(align=False)
 
             # Mode Switcher (Asset Mode vs Collection Mode)
             sw_row = sub.row(align=True)
@@ -9331,12 +9403,6 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         assetify_settings = scene.assetify_bake_settings
         
         addon_updater_ops.check_for_update_background()
-        
-        # Ensure has_asset_collections and all_collections_assigned are defined before use
-        has_asset_collections = len(assetify_settings.asset_collections) > 0
-        all_collections_assigned = all(
-            item.collection is not None for item in assetify_settings.asset_collections
-        )
 
         # =========================================================================
         # HEADER TOOLBAR: VIEWPORT COMPARE
@@ -9385,7 +9451,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         layout.separator(factor=1.5)
 
         # =========================================================================
-        # STEP 1: SETUP & INPUTS
+        # STEP 1: SETUP & ASSETS
         # =========================================================================
         if cur_step in {'1', 'ALL'}:
             if assetify_settings.asset_mode == 'ASSET':
@@ -9393,12 +9459,11 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             else:
                 total_assets = count_top_level_collections(assetify_settings.baked_collections)
 
-            coll_count = len(assetify_settings.asset_collections)
-            badge_step1 = f"({coll_count} In • {total_assets} Ready)" if total_assets > 0 else (f"({coll_count} Assigned)" if coll_count > 0 else "(Empty)")
+            badge_step1 = f"({total_assets} Ready)" if total_assets > 0 else "(Empty Queue)"
             
             step1_box = layout.box()
             s1_head = step1_box.row(align=True)
-            s1_head.label(text=f"Step 1: Setup & Inputs  {badge_step1}", icon="GEOMETRY_SET")
+            s1_head.label(text=f"Step 1: Setup & Assets  {badge_step1}", icon="GEOMETRY_SET")
 
             col1 = step1_box.column(align=False)
             
@@ -9415,34 +9480,15 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 ab = mode_row.operator("assetify.switch_bake_mode", text="Animation", depress=(assetify_settings.bake_mode == 'ANIMATION'))
                 ab.mode = 'ANIMATION'
 
-            # --- B. Input Collections Submenu ---
-            b_box = col1.box()
-            b_head = b_box.row(align=True)
-            b_icon = "TRIA_DOWN" if assetify_settings.step1_b_collections_expanded else "TRIA_RIGHT"
-            b_head.prop(assetify_settings, "step1_b_collections_expanded", text="", icon=b_icon, emboss=False)
-            coll_badge = f"{coll_count} Assigned" if coll_count > 0 else "Empty"
-            b_head.label(text=f"B. Input Collections ({coll_badge})", icon='OUTLINER_COLLECTION')
-            if assetify_settings.step1_b_collections_expanded:
-                if coll_count == 0:
-                    empty_row = b_box.row(align=True)
-                    empty_row.scale_y = 1.2
-                    empty_row.operator("assetify.add_asset_collection", text="+ Add Collection to Process", icon='ADD')
-                else:
-                    c_row = b_box.row()
-                    split = c_row.split(factor=0.82)
-                    c_left = split.column()
-                    c_left.template_list(
-                        "ASSETIFY_UL_asset_collections",
-                        "assetify_step1_in",
-                        assetify_settings,
-                        "asset_collections",
-                        assetify_settings,
-                        "active_asset_collection_index",
-                        rows=min(max(coll_count, 1), 4)
-                    )
-                    c_btns = split.column(align=True)
-                    c_btns.operator("assetify.add_asset_collection", icon='ADD', text="")
-                    c_btns.operator("assetify.remove_asset_collection", icon='REMOVE', text="")
+            # --- B. Asset Queue Submenu (Intake Bar + Full Queue) ---
+            self.draw_target_selection_submenu(
+                col1,
+                assetify_settings,
+                action_label="Queue",
+                letter_prefix="B",
+                expanded_prop_name="step1_b_queue_expanded",
+                show_intake=True
+            )
 
             # --- C. Advanced Setup (Mossify & Custom Attributes) ---
             c_box = col1.box()
@@ -9484,25 +9530,15 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                     ca_btns.operator("assetify.add_custom_attribute", icon='ADD', text="")
                     ca_btns.operator("assetify.remove_custom_attribute", icon='REMOVE', text="")
 
-            # --- D. Target Assets / Processed Queue Submenu ---
-            self.draw_target_selection_submenu(col1, assetify_settings, action_label="Process", letter_prefix="D", expanded_prop_name="step1_d_queue_expanded")
-
-            # --- Full-Width Execution Button: Process Assets ---
-            btn_row = col1.row(align=True)
-            btn_row.scale_y = 1.35
-            btn_row.enabled = has_asset_collections and all_collections_assigned
-            if assetify_settings.bake_mode == 'ANIMATION':
-                fmt = getattr(scene.assetify_animation_settings, "file_format", "FBX") if hasattr(scene, "assetify_animation_settings") else "FBX"
-                btn_row.operator("object.convert_to_game_ready", text=f"Process Animation ({fmt})", icon='FORWARD')
-            else:
-                btn_row.operator("object.convert_to_game_ready", text="Process Assets → Add to Queue", icon='GEOMETRY_SET')
-
-            # Proceed to Step 2 if assets exist
+            # --- Full-Width Progression Button: Proceed to Step 2 ---
+            nxt_row = col1.row(align=True)
+            nxt_row.scale_y = 1.35
             if total_assets > 0:
-                nxt_row = col1.row(align=True)
-                nxt_row.scale_y = 1.25
                 op_b = nxt_row.operator("assetify.focus_step", text="Proceed to Step 2: Bake Textures →", icon='NODE_TEXTURE')
                 op_b.step = '2'
+            else:
+                nxt_row.enabled = False
+                nxt_row.operator("assetify.focus_step", text="Process a Collection Above to Begin →", icon='INFO')
 
             layout.separator(factor=1.5)
 
