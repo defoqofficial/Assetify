@@ -495,6 +495,19 @@ def validate_bake_directory(context):
     print(f"[DEBUG] Validated bake directory: {bake_directory}")
     return bake_directory
 
+def _get_action_fcurves(action):
+    """Retrieve all fcurves from an Action, supporting both legacy and Blender 5.x+ layered actions."""
+    if hasattr(action, "fcurves"):
+        return list(action.fcurves)
+    fcurves = []
+    if hasattr(action, "layers"):
+        for layer in action.layers:
+            for strip in layer.strips:
+                if hasattr(strip, "channelbags"):
+                    for cb in strip.channelbags:
+                        fcurves.extend(cb.fcurves)
+    return fcurves
+
 class ANIMATION_OT_apply_bake_to_keyframes(bpy.types.Operator):
     """Apply baked Geometry Node data to keyframes using Shape Keys"""
     bl_idname = "animation.apply_bake_to_keyframes"
@@ -615,7 +628,7 @@ class ANIMATION_OT_apply_bake_to_keyframes(bpy.types.Operator):
         # Set keyframe interpolation to CONSTANT
         if obj.data.shape_keys and obj.data.shape_keys.animation_data and obj.data.shape_keys.animation_data.action:
             action = obj.data.shape_keys.animation_data.action
-            for fcurve in action.fcurves:
+            for fcurve in _get_action_fcurves(action):
                 for kp in fcurve.keyframe_points:
                     kp.interpolation = 'CONSTANT'
 

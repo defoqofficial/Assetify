@@ -2,7 +2,7 @@ bl_info = {
     "name": "Assetify",
     "description": "Convert ANYTHING into game-ready assets with baked textures.",
     "author": "Nino Defoq",
-    "version": (3, 0, 1),
+    "version": (3, 1, 0),
     "blender": (4, 0, 0),
     "location": "3D View > Tool Shelf > Assetify",
     "warning": "",
@@ -9678,26 +9678,6 @@ def unregister():
         print(f"[INFO] animation_processor was not previously registered: {e}")
 
     print("[INFO] Unregistering Assetify addon...")
-
-    # Remove PointerProperty from Scene
-    if hasattr(bpy.types.Scene, "assetify_animation_settings"):
-        del bpy.types.Scene.assetify_animation_settings
-        print("[INFO] assetify_animation_settings removed from bpy.types.Scene.")
-
-    # Unregister classes
-    try:
-        bpy.utils.unregister_class(animation_processor.ASSETIFY_OT_process_animation)
-        bpy.utils.unregister_class(animation_processor.ANIMATION_OT_bake_geometry_assets)
-        bpy.utils.unregister_class(animation_processor.ANIMATION_OT_apply_bake_to_keyframes)
-        print("[INFO] Animation operators unregistered successfully.")
-    except Exception as e:
-        print(f"[ERROR] Failed to unregister animation operators: {e}")
-
-    try:
-        bpy.utils.unregister_class(animation_processor.AssetifyAnimationSettings)
-        print("[INFO] AssetifyAnimationSettings unregistered successfully.")
-    except Exception as e:
-        print(f"[ERROR] Failed to unregister AssetifyAnimationSettings: {e}")
         
     try:
         lod_manager.unregister()

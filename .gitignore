@@ -1,0 +1,6 @@
+﻿__pycache__/
+*.pyc
+*.pyo
+assetify_updater/
+.vscode/
+*.blend1

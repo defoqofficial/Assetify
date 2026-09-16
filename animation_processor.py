@@ -43,35 +43,6 @@ class AssetifyAnimationSettings(bpy.types.PropertyGroup):
         if self.file_format not in available_formats:
             self.file_format = available_formats[0] if available_formats else ''
 
-class AssetifyAnimationSettings(bpy.types.PropertyGroup):
-    animation_type: bpy.props.EnumProperty(
-        name="Animation Type",
-        description="Choose the type of animation to process",
-        items=[
-            ('RIGGED', "Rigged Animations", "Process rigged (armature-based) animations"),
-            ('PHYSICS', "Physics Animations", "Process physics-based animations"),
-            ('GEOMETRY_NODES', "Geometry Node Animations", "Process geometry node-driven animations"),
-            ('SHAPE_KEYS', "Shape Key Animations", "Process shape key-based animations"),
-            ('KEYFRAMES', "Keyframe Animations", "Process standard keyframe animations"),
-            ('PARTICLES', "Particle Animations", "Process particle-based animations"),
-        ],
-        default='RIGGED',
-        update=lambda self, context: self.update_file_format(context)  # Call update_file_format when animation_type changes
-    )
-
-    file_format: bpy.props.EnumProperty(
-        name="Export Format",
-        description="Choose the export file format",
-        items=get_available_formats,
-        default=None  # Avoid setting an invalid default
-    )
-
-    def update_file_format(self, context):
-        """Ensure the selected file format is valid for the animation type."""
-        available_formats = [item[0] for item in get_available_formats(self, context)]
-        if self.file_format not in available_formats:
-            self.file_format = available_formats[0] if available_formats else ''
-
 def get_skip_conditions():
     """
     Returns a list of conditions to determine if conversion should be skipped.
@@ -168,7 +139,7 @@ def register():
         default=False
     )
 
-    # Register AssetifyAnimationSettings first
+    # Register AssetifyAnimationSettings
     try:
         bpy.utils.register_class(AssetifyAnimationSettings)
         print("[INFO] AssetifyAnimationSettings registered successfully.")
@@ -187,20 +158,12 @@ def register():
     except Exception as e:
         print(f"[ERROR] Failed to initialize assetify_animation_settings: {e}")
 
-    # Register other classes
-    try:
-        bpy.utils.register_class(ASSETIFY_OT_process_animation)
-        print("[INFO] ASSETIFY_OT_process_animation registered successfully.")
-    except Exception as e:
-        print(f"[ERROR] Failed to register ASSETIFY_OT_process_animation: {e}")
-
-    # Safely register additional animation operators if needed
+    # Register animation operators defined in this module
     try:
         bpy.utils.register_class(ANIMATION_OT_bake_geometry_assets)
-        bpy.utils.register_class(ANIMATION_OT_apply_bake_to_keyframes)
-        print("[INFO] Additional animation operators registered successfully.")
+        print("[INFO] ANIMATION_OT_bake_geometry_assets registered successfully.")
     except Exception as e:
-        print(f"[ERROR] Failed to register additional animation operators: {e}")
+        print(f"[ERROR] Failed to register ANIMATION_OT_bake_geometry_assets: {e}")
 
 def unregister():
     print("[INFO] Unregistering AssetifyAnimationSettings and related classes...")
@@ -216,25 +179,12 @@ def unregister():
         except Exception as e:
             print(f"[ERROR] Failed to remove assetify_animation_settings: {e}")
 
-    # Unregister anim_geonode classes
-    try:
-        bpy.utils.unregister_class(ANIMATION_OT_apply_bake_to_keyframes)
-        print("[INFO] ANIMATION_OT_apply_bake_to_keyframes unregistered.")
-    except Exception as e:
-        print(f"[INFO] ANIMATION_OT_apply_bake_to_keyframes was not registered: {e}")
-
+    # Unregister animation operators
     try:
         bpy.utils.unregister_class(ANIMATION_OT_bake_geometry_assets)
         print("[INFO] ANIMATION_OT_bake_geometry_assets unregistered.")
     except Exception as e:
         print(f"[INFO] ANIMATION_OT_bake_geometry_assets was not registered: {e}")
-
-    # Unregister other classes
-    try:
-        bpy.utils.unregister_class(ASSETIFY_OT_process_animation)
-        print("[INFO] ASSETIFY_OT_process_animation unregistered.")
-    except Exception as e:
-        print(f"[INFO] ASSETIFY_OT_process_animation was not registered: {e}")
 
     try:
         bpy.utils.unregister_class(AssetifyAnimationSettings)
