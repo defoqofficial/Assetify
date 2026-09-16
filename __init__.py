@@ -8942,13 +8942,163 @@ class ASSETIFY_OT_batch_pipeline(bpy.types.Operator):
         bpy.ops.object.bake_textures_modal('INVOKE_DEFAULT')
         return {'FINISHED'}
 
+class ASSETIFY_OT_toggle_select_assets(bpy.types.Operator):
+    """Select all, deselect all, or invert asset selection for bake/export"""
+    bl_idname = "assetify.toggle_select_assets"
+    bl_label = "Toggle Selection"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    action: bpy.props.EnumProperty(
+        items=[
+            ('SELECT', "Select All", "Select all items in the list"),
+            ('DESELECT', "Deselect All", "Deselect all items in the list"),
+            ('INVERT', "Invert", "Invert selection of all items"),
+        ],
+        default='SELECT'
+    )
+
+    def execute(self, context):
+        settings = context.scene.assetify_bake_settings
+        items = settings.baked_assets if settings.asset_mode == 'ASSET' else settings.baked_collections
+        for item in items:
+            if self.action == 'SELECT':
+                item.include_in_send = True
+            elif self.action == 'DESELECT':
+                item.include_in_send = False
+            elif self.action == 'INVERT':
+                item.include_in_send = not item.include_in_send
+        return {'FINISHED'}
+
+class ASSETIFY_PT_asset_queue_panel(bpy.types.Panel):
+    """Dedicated Asset Queue & Selection Panel permanently docked at the top"""
+    bl_label = "Assetify — Asset Queue"
+    bl_idname = "ASSETIFY_PT_asset_queue_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Assetify"
+    bl_order = 1
+
+    def draw_header(self, context):
+        layout = self.layout
+        settings = getattr(context.scene, "assetify_bake_settings", None)
+        if not settings:
+            return
+        if settings.asset_mode == 'ASSET':
+            total = len(settings.baked_assets)
+            selected = sum(1 for a in settings.baked_assets if a.include_in_send)
+        else:
+            total = count_top_level_collections(settings.baked_collections)
+            selected = sum(1 for c in settings.baked_collections if c.include_in_send and get_collection_level(c.name) == 0)
+        badge = f"({selected}/{total})" if total > 0 else "(Empty)"
+        layout.label(text=badge)
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        assetify_settings = scene.assetify_bake_settings
+
+        # Mode Selection Row (Asset vs Collection)
+        sw_row = layout.row(align=True)
+        sw_row.operator("assetify.switch_mode", text="Asset Mode", icon='OBJECT_DATA', depress=(assetify_settings.asset_mode == 'ASSET')).mode = 'ASSET'
+        sw_row.operator("assetify.switch_mode", text="Collection Mode", icon='OUTLINER_COLLECTION', depress=(assetify_settings.asset_mode == 'COLLECTION')).mode = 'COLLECTION'
+
+        if assetify_settings.asset_mode == 'ASSET':
+            total = len(assetify_settings.baked_assets)
+            selected = sum(1 for a in assetify_settings.baked_assets if a.include_in_send)
+            baked_count = sum(1 for a in assetify_settings.baked_assets if a.is_baked)
+            
+            # Selection helpers (All, None, Invert) & Status
+            sel_row = layout.row(align=True)
+            op = sel_row.operator("assetify.toggle_select_assets", text="All")
+            op.action = 'SELECT'
+            op = sel_row.operator("assetify.toggle_select_assets", text="None")
+            op.action = 'DESELECT'
+            op = sel_row.operator("assetify.toggle_select_assets", text="Invert")
+            op.action = 'INVERT'
+            sel_row.label(text=f"{selected}/{total} active")
+
+            # Header row with column labels
+            header = layout.row(align=True)
+            split = header.split(factor=0.15)
+            split.label(text="", icon='CHECKMARK')
+            split = split.split(factor=0.4 / 0.85)
+            split.label(text="Asset Name")
+            remaining = split.split(factor=0.5)
+            remaining.label(text="Bake", icon='NODE_TEXTURE')
+            remaining.label(text="File", icon='FILE_TICK')
+
+            # List template
+            num_rows = max(min(total, 8), 3)
+            layout.template_list(
+                "ASSETIFY_UL_baked_assets",
+                "",
+                assetify_settings,
+                "baked_assets",
+                assetify_settings,
+                "active_baked_asset_index",
+                rows=num_rows
+            )
+
+            # Action buttons
+            act_row = layout.row(align=True)
+            act_row.operator("assetify.refresh_asset_collection_list", text="Refresh", icon='FILE_REFRESH')
+            del_row = act_row.row()
+            del_row.enabled = selected > 0
+            del_row.operator("assetify.delete_selected_assets", text="Delete Selected", icon='TRASH')
+
+        else:
+            total = count_top_level_collections(assetify_settings.baked_collections)
+            selected = sum(1 for c in assetify_settings.baked_collections if c.include_in_send and get_collection_level(c.name) == 0)
+            baked_count = sum(1 for c in assetify_settings.baked_collections if c.is_baked and get_collection_level(c.name) == 0)
+
+            # Selection helpers (All, None, Invert) & Status
+            sel_row = layout.row(align=True)
+            op = sel_row.operator("assetify.toggle_select_assets", text="All")
+            op.action = 'SELECT'
+            op = sel_row.operator("assetify.toggle_select_assets", text="None")
+            op.action = 'DESELECT'
+            op = sel_row.operator("assetify.toggle_select_assets", text="Invert")
+            op.action = 'INVERT'
+            sel_row.label(text=f"{selected}/{total} active")
+
+            # Header row with column labels
+            header = layout.row(align=True)
+            split = header.split(factor=0.15)
+            split.label(text="", icon='CHECKMARK')
+            split = split.split(factor=0.4 / 0.9)
+            split.label(text="Collection Name")
+            remaining = split.split(factor=0.33)
+            remaining.label(text="Swap", icon='ARROW_LEFTRIGHT')
+            remaining = remaining.split(factor=0.5)
+            remaining.label(text="Bake", icon='NODE_TEXTURE')
+            remaining.label(text="File", icon='FILE_TICK')
+
+            num_rows = max(min(total, 8), 3)
+            layout.template_list(
+                "ASSETIFY_UL_collection_list",
+                "",
+                assetify_settings,
+                "baked_collections",
+                assetify_settings,
+                "active_baked_collection_index",
+                rows=num_rows
+            )
+
+            # Action buttons
+            act_row = layout.row(align=True)
+            act_row.operator("assetify.refresh_asset_collection_list", text="Refresh", icon='FILE_REFRESH')
+            del_row = act_row.row()
+            del_row.enabled = selected > 0
+            del_row.operator("assetify.delete_selected_collections", text="Delete Selected", icon='TRASH')
+
 class ASSETIFY_PT_tools_panel(bpy.types.Panel):
     """Creates a Panel in the 3D Viewport Tool Shelf"""
-    bl_label = "Assetify"
+    bl_label = "Assetify — Workflow Pipeline"
     bl_idname = "ASSETIFY_PT_tools_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Assetify"
+    bl_order = 2
 
     def draw(self, context):
         layout = self.layout
@@ -9370,7 +9520,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             imp_col.operator("assetify.import_selected_fbx", text=lbl_imp)
 
         # =========================================================================
-        # ASSET MANAGER & UTILITIES (COLLAPSIBLE DRAWER)
+        # UTILITIES & TOOLS (COLLAPSIBLE DRAWER)
         # =========================================================================
         drawer_box = layout.box()
         dr_head = drawer_box.row(align=True)
@@ -9381,44 +9531,10 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             icon="TRIA_DOWN" if assetify_settings.utilities_menu_expanded else "TRIA_RIGHT",
             emboss=False
         )
-        dr_head.label(text="Asset Manager & Utilities", icon='TOOL_SETTINGS')
+        dr_head.label(text="Mesh Utilities & Community", icon='TOOL_SETTINGS')
 
         if assetify_settings.utilities_menu_expanded:
             d_col = drawer_box.column(align=False)
-            
-            # --- Processed Asset List Sub-Box ---
-            al_box = d_col.box()
-            al_head = al_box.row(align=True)
-            al_head.prop(
-                assetify_settings,
-                "show_asset_list_menu",
-                text="",
-                icon="TRIA_DOWN" if assetify_settings.show_asset_list_menu else "TRIA_RIGHT",
-                emboss=False
-            )
-            al_head.label(text="Processed Asset Library", icon='ALIGN_JUSTIFY')
-            
-            if assetify_settings.show_asset_list_menu:
-                al_sw = al_box.row(align=True)
-                al_sw.operator("assetify.switch_mode", text="Asset", depress=(assetify_settings.asset_mode == 'ASSET')).mode = 'ASSET'
-                al_sw.operator("assetify.switch_mode", text="Collection", depress=(assetify_settings.asset_mode == 'COLLECTION')).mode = 'COLLECTION'
-                
-                if assetify_settings.asset_mode == 'ASSET':
-                    num_rows = max(min(len(assetify_settings.baked_assets), 5), 1)
-                    al_box.template_list("ASSETIFY_UL_baked_assets", "", assetify_settings, "baked_assets", assetify_settings, "active_baked_asset_index", rows=num_rows)
-                    r_al_act = al_box.row(align=True)
-                    r_al_act.operator("assetify.refresh_asset_collection_list", text="Refresh List", icon='FILE_REFRESH')
-                    del_row = r_al_act.row()
-                    del_row.enabled = any(a.include_in_send for a in assetify_settings.baked_assets)
-                    del_row.operator("assetify.delete_selected_assets", text="Delete Selected", icon='TRASH')
-                else:
-                    num_collection_rows = max(min(count_top_level_collections(assetify_settings.baked_collections), 5), 1)
-                    al_box.template_list("ASSETIFY_UL_collection_list", "", assetify_settings, "baked_collections", assetify_settings, "active_baked_collection_index", rows=num_collection_rows)
-                    r_cl_act = al_box.row(align=True)
-                    r_cl_act.operator("assetify.refresh_asset_collection_list", text="Refresh List", icon='FILE_REFRESH')
-                    del_row = r_cl_act.row()
-                    del_row.enabled = any(c.include_in_send for c in assetify_settings.baked_collections)
-                    del_row.operator("assetify.delete_selected_collections", text="Delete Selected", icon='TRASH')
 
             # --- Mesh & Transform Utilities Sub-Box ---
             mu_box = d_col.box()
@@ -9745,6 +9861,8 @@ classes = (
     OBJECT_OT_ApplyCustomGeometryNodes,
     OBJECT_OT_bake_textures_modal,
     OBJECT_OT_convert_to_game_ready,
+    ASSETIFY_OT_toggle_select_assets,
+    ASSETIFY_PT_asset_queue_panel,
     ASSETIFY_PT_tools_panel,
     ASSETIFY_UL_custom_attributes,
     ASSETIFY_UL_asset_collections,
