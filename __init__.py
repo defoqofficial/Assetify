@@ -9663,39 +9663,40 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             layout.separator(factor=1.5)
 
         # =========================================================================
-        # UTILITIES & TOOLS (COLLAPSIBLE DRAWER)
+        # UTILITIES & TOOLS
         # =========================================================================
         if cur_step in {'UTILS', 'ALL'}:
-            drawer_box = layout.box()
-            dr_head = drawer_box.row(align=True)
-            dr_head.label(text="Mesh Utilities & Community", icon="TOOL_SETTINGS")
+            mu_box = layout.box()
+            mu_head = mu_box.row(align=True)
+            mu_head.label(text="Mesh & Pivot Utilities", icon="TOOL_SETTINGS")
 
-            d_col = drawer_box.column(align=False)
-
-            # --- Mesh & Transform Utilities Sub-Box ---
-            mu_box = d_col.box()
-            mu_box.label(text="Mesh & Pivot Utilities", icon='MODIFIER')
-            mu_box.operator("assetify.set_pivot_bottom", text="Set Pivot to Bottom", icon='TRANSFORM_ORIGINS')
+            mu_col = mu_box.column(align=False)
+            mu_col.operator("assetify.set_pivot_bottom", text="Set Pivot to Bottom", icon='TRANSFORM_ORIGINS')
             
             assets_selected = any(asset.include_in_send for asset in assetify_settings.baked_assets)
             collections_selected = any(c.include_in_send for c in assetify_settings.baked_collections)
             is_enabled = assets_selected if assetify_settings.asset_mode == 'ASSET' else collections_selected
 
-            r_mesh = mu_box.row(align=True)
+            r_mesh = mu_col.row(align=True)
             r_mesh.enabled = is_enabled
             r_mesh.operator("assetify.separate_by_material", text="Separate by Material", icon='OUTLINER_OB_MESH')
             r_mesh.operator("assetify.join_assets", text="Join Assets", icon='OBJECT_DATA')
 
             if assetify_settings.asset_mode == 'COLLECTION':
-                r_swap = mu_box.row(align=True)
+                r_swap = mu_col.row(align=True)
                 r_swap.enabled = collections_selected
                 r_swap.operator("assetify.show_swap_info", text="", icon='INFO', emboss=False)
                 r_swap.operator("assetify.swap_collections", text="Swap Original & Game Assets")
 
-            # --- Social Links & Community Sub-Box ---
-            soc_box = d_col.box()
-            soc_box.label(text="Community & Support", icon='HELP')
-            self.draw_social_links(soc_box)
+            layout.separator(factor=1.5)
+
+        # =========================================================================
+        # COMMUNITY & SUPPORT (ALWAYS VISIBLE FOOTER)
+        # =========================================================================
+        soc_box = layout.box()
+        s_head = soc_box.row(align=True)
+        s_head.label(text="Community & Support", icon='HELP')
+        self.draw_social_links(soc_box)
     
     def check_import_button_enabled(self, assetify_settings):
         """Returns True if the Import button should be enabled based on include_in_send and file existence."""
