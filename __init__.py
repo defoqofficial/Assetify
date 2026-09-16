@@ -2733,7 +2733,7 @@ def add_custom_attributes_to_geometry(obj, custom_object):
     assetify_settings = bpy.context.scene.assetify_bake_settings
 
     # Ensure we're in object mode
-    if bpy.context.active_object.mode != 'OBJECT':
+    if bpy.context.active_object is not None and bpy.context.active_object.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
 
     # Perform UV unwrapping regardless of custom attribute settings
@@ -2989,7 +2989,7 @@ def update_assetify_bake_settings():
 def customize_color(obj, custom_object):
 
     # Ensure we're in object mode
-    if bpy.context.active_object.mode != 'OBJECT':
+    if bpy.context.active_object is not None and bpy.context.active_object.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
 
     # Get the active object
