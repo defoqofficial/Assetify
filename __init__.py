@@ -9297,55 +9297,6 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 c_btns.operator("assetify.add_asset_collection", icon='ADD', text="")
                 c_btns.operator("assetify.remove_asset_collection", icon='REMOVE', text="")
 
-                add_row = c_box.row(align=True)
-                add_row.operator("assetify.add_asset_collection", text="+ Add Another Collection", icon='ADD')
-
-            # Advanced Setup (Mossify / Custom Attributes) - Collapsible & Optional
-            adv_active = assetify_settings.use_mossify or assetify_settings.enable_custom_attributes
-            adv_badge = " (Active)" if adv_active else ""
-            
-            adv_box = col1.box()
-            adv_head = adv_box.row(align=True)
-            adv_head.prop(
-                assetify_settings,
-                "show_advanced_setup",
-                text=f"  Advanced: Mossify & Custom Attributes{adv_badge}",
-                icon="TRIA_DOWN" if assetify_settings.show_advanced_setup else "TRIA_RIGHT",
-                toggle=True
-            )
-
-            if assetify_settings.show_advanced_setup:
-                opt_box = adv_box.column(align=False)
-                r_moss = opt_box.row(align=True)
-                r_moss.operator("assetify.show_mossify_mode_info", text="", icon='INFO', emboss=False)
-                r_moss.prop(assetify_settings, "use_mossify", text="Mossify Mode")
-
-                if not assetify_settings.use_mossify:
-                    r_attr = opt_box.row(align=True)
-                    r_attr.operator("assetify.show_custom_attributes_info", text="", icon='INFO', emboss=False)
-                    r_attr.prop(assetify_settings, "enable_custom_attributes", text="Enable Custom Attributes")
-
-                if assetify_settings.use_mossify or assetify_settings.enable_custom_attributes:
-                    opt_box.prop_search(scene, "custom_object", bpy.data, "objects", text="Emitter", icon='OUTLINER_OB_EMPTY')
-
-                if not assetify_settings.use_mossify and assetify_settings.enable_custom_attributes:
-                    ca_count = len(assetify_settings.custom_attributes)
-                    ca_box = opt_box.box()
-                    ca_box.label(text="Custom Attributes:", icon='SPREADSHEET')
-                    r_ca = ca_box.row()
-                    r_ca.template_list(
-                        "ASSETIFY_UL_custom_attributes",
-                        "",
-                        assetify_settings,
-                        "custom_attributes",
-                        assetify_settings,
-                        "active_custom_attribute_index",
-                        rows=min(max(ca_count, 1), 4)
-                    )
-                    ca_btns = r_ca.column(align=True)
-                    ca_btns.operator("assetify.add_custom_attribute", icon='ADD', text="")
-                    ca_btns.operator("assetify.remove_custom_attribute", icon='REMOVE', text="")
-
             # Process / Convert Action Button
             btn_row = col1.row(align=True)
             btn_row.scale_y = 1.3
@@ -9355,23 +9306,6 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 btn_row.operator("object.convert_to_game_ready", text=f"Process Animation ({fmt})", icon='FORWARD')
             else:
                 btn_row.operator("object.convert_to_game_ready", text="Process Assets → Add to Queue", icon='GEOMETRY_SET')
-
-            # --- One-Click Batch Pipeline ---
-            col1.separator(factor=0.8)
-            batch_box = col1.box()
-            b_header = batch_box.row(align=True)
-            b_header.label(text="One-Click Batch Pipeline", icon='AUTO')
-            
-            b_btn_row = batch_box.row(align=True)
-            b_btn_row.scale_y = 1.25
-            b_btn_row.operator("assetify.batch_pipeline", text="Run Assetify Full Batch", icon='PLAY')
-            
-            b_opts = batch_box.row(align=True)
-            b_opts.prop(assetify_settings, "batch_generate_collision", text="Collision")
-            b_opts.prop(assetify_settings, "batch_generate_lods", text="LODs")
-            b_opts.prop(assetify_settings, "batch_auto_export", text="Export")
-
-            col1.separator(factor=1.0)
 
             # --- Processed Asset Queue Sub-Box ---
             q_box = col1.box()
