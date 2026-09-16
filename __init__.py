@@ -3476,6 +3476,12 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
         default='1'
     )
     
+    show_quick_target_select: bpy.props.BoolProperty(
+        name="Show Quick Target Select",
+        description="Toggle the quick asset selection dropdown in pipeline steps",
+        default=False
+    )
+    
     show_bake_mode_menu: bpy.props.BoolProperty(
         name="Show Bake Mode Menu",
         description="Toggle visibility of the bake mode settings menu",
@@ -9038,10 +9044,10 @@ class ASSETIFY_OT_focus_step(bpy.types.Operator):
             settings.utilities_menu_expanded = True
         return {'FINISHED'}
 
-class ASSETIFY_PT_asset_queue_panel(bpy.types.Panel):
-    """Dedicated Asset Queue & Input Panel permanently docked at the top"""
-    bl_label = "Assetify — Asset Queue & Input"
-    bl_idname = "ASSETIFY_PT_asset_queue_panel"
+class ASSETIFY_PT_tools_panel(bpy.types.Panel):
+    """Main Assetify Panel in the 3D Viewport Sidebar"""
+    bl_label = "Assetify"
+    bl_idname = "ASSETIFY_PT_tools_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Assetify"
@@ -9052,187 +9058,79 @@ class ASSETIFY_PT_asset_queue_panel(bpy.types.Panel):
         settings = getattr(context.scene, "assetify_bake_settings", None)
         if not settings:
             return
-        coll_in = len(settings.asset_collections)
         if settings.asset_mode == 'ASSET':
             total = len(settings.baked_assets)
             selected = sum(1 for a in settings.baked_assets if a.include_in_send)
         else:
             total = count_top_level_collections(settings.baked_collections)
             selected = sum(1 for c in settings.baked_collections if c.include_in_send and get_collection_level(c.name) == 0)
-        badge = f"({coll_in} In → {selected}/{total} Ready)" if (coll_in > 0 or total > 0) else "(Empty)"
-        layout.label(text=badge)
+        if total > 0:
+            layout.label(text=f"({selected}/{total} Active)")
 
-    def draw(self, context):
-        layout = self.layout
-        scene = context.scene
-        assetify_settings = scene.assetify_bake_settings
+    def draw_target_summary_bar(self, layout, assetify_settings, action_label="Bake"):
+        """Draws a compact, smart target summary bar with quick selection dropdown."""
+        if assetify_settings.asset_mode == 'ASSET':
+            total = len(assetify_settings.baked_assets)
+            active = sum(1 for a in assetify_settings.baked_assets if a.include_in_send)
+        else:
+            total = count_top_level_collections(assetify_settings.baked_collections)
+            active = sum(1 for c in assetify_settings.baked_collections if c.include_in_send and get_collection_level(c.name) == 0)
 
-        # =========================================================================
-        # 1. INPUT COLLECTIONS TO PIPELINE
-        # =========================================================================
-        in_box = layout.box()
-        in_head = in_box.row(align=True)
-        is_in_open = assetify_settings.show_input_collections
-        coll_count = len(assetify_settings.asset_collections)
-        badge_in = f"({coll_count} Ready)" if coll_count > 0 else "(0 Added)"
-        in_head.prop(
+        t_box = layout.box()
+        if total == 0:
+            r = t_box.row(align=True)
+            r.label(text=f"No assets in queue to {action_label.lower()} (Process in Step 1)", icon='ERROR')
+            op_go = r.operator("assetify.focus_step", text="Go to Step 1", icon='GEOMETRY_SET')
+            op_go.step = '1'
+            return
+
+        r = t_box.row(align=True)
+        status_icon = 'CHECKBOX_HLT' if active > 0 else 'CHECKBOX_DEHLT'
+        r.label(text=f"Target: {active} of {total} Selected for {action_label}", icon=status_icon)
+        r.prop(
             assetify_settings,
-            "show_input_collections",
-            text=f"  Input Collections to Pipeline  {badge_in}",
-            icon="TRIA_DOWN" if is_in_open else "TRIA_RIGHT",
+            "show_quick_target_select",
+            text="Quick Select",
+            icon="TRIA_DOWN" if assetify_settings.show_quick_target_select else "TRIA_RIGHT",
             toggle=True
         )
 
-        if is_in_open:
-            col_in = in_box.column(align=False)
+        if assetify_settings.show_quick_target_select:
+            sub = t_box.column(align=False)
             
-            if coll_count == 0:
-                empty_row = col_in.row(align=True)
-                empty_row.scale_y = 1.25
-                empty_row.operator("assetify.add_asset_collection", text="+ Add Collection to Process", icon='ADD')
-            else:
-                c_row = col_in.row()
-                split = c_row.split(factor=0.82)
-                c_left = split.column()
-                c_left.template_list(
-                    "ASSETIFY_UL_asset_collections",
-                    "assetify_queue_in",
+            sel_row = sub.row(align=True)
+            op = sel_row.operator("assetify.toggle_select_assets", text="All")
+            op.action = 'SELECT'
+            op = sel_row.operator("assetify.toggle_select_assets", text="None")
+            op.action = 'DESELECT'
+            op = sel_row.operator("assetify.toggle_select_assets", text="Invert")
+            op.action = 'INVERT'
+            
+            num_rows = min(max(total, 1), 4)
+            if assetify_settings.asset_mode == 'ASSET':
+                sub.template_list(
+                    "ASSETIFY_UL_baked_assets",
+                    "target_bar_assets",
                     assetify_settings,
-                    "asset_collections",
+                    "baked_assets",
                     assetify_settings,
-                    "active_asset_collection_index",
-                    rows=min(max(coll_count, 1), 4)
+                    "active_baked_asset_index",
+                    rows=num_rows
                 )
-                c_btns = split.column(align=True)
-                c_btns.operator("assetify.add_asset_collection", icon='ADD', text="")
-                c_btns.operator("assetify.remove_asset_collection", icon='REMOVE', text="")
-
-                add_row = col_in.row(align=True)
-                add_row.operator("assetify.add_asset_collection", text="+ Add Another Collection", icon='ADD')
-
-            has_asset_collections = coll_count > 0
-            all_collections_assigned = all(
-                item.collection is not None for item in assetify_settings.asset_collections
-            ) if has_asset_collections else False
-
-            proc_row = col_in.row(align=True)
-            proc_row.scale_y = 1.3
-            proc_row.enabled = has_asset_collections and all_collections_assigned
-            if assetify_settings.bake_mode == 'ANIMATION':
-                fmt = getattr(scene.assetify_animation_settings, "file_format", "FBX") if hasattr(scene, "assetify_animation_settings") else "FBX"
-                proc_row.operator("object.convert_to_game_ready", text=f"Process Animation ({fmt})", icon='FORWARD')
             else:
-                proc_row.operator("object.convert_to_game_ready", text="Process Assets → Add to Queue", icon='GEOMETRY_SET')
-
-        layout.separator(factor=1.5)
-
-        # =========================================================================
-        # 2. PROCESSED ASSET QUEUE
-        # =========================================================================
-        q_box = layout.box()
-        
-        # Mode Selection Row (Asset vs Collection)
-        sw_row = q_box.row(align=True)
-        sw_row.operator("assetify.switch_mode", text="Asset Mode", icon='OBJECT_DATA', depress=(assetify_settings.asset_mode == 'ASSET')).mode = 'ASSET'
-        sw_row.operator("assetify.switch_mode", text="Collection Mode", icon='OUTLINER_COLLECTION', depress=(assetify_settings.asset_mode == 'COLLECTION')).mode = 'COLLECTION'
-
-        if assetify_settings.asset_mode == 'ASSET':
-            total = len(assetify_settings.baked_assets)
-            selected = sum(1 for a in assetify_settings.baked_assets if a.include_in_send)
+                sub.template_list(
+                    "ASSETIFY_UL_collection_list",
+                    "target_bar_colls",
+                    assetify_settings,
+                    "baked_collections",
+                    assetify_settings,
+                    "active_baked_collection_index",
+                    rows=num_rows
+                )
             
-            # Selection helpers (All, None, Invert) & Status
-            sel_row = q_box.row(align=True)
-            op = sel_row.operator("assetify.toggle_select_assets", text="All")
-            op.action = 'SELECT'
-            op = sel_row.operator("assetify.toggle_select_assets", text="None")
-            op.action = 'DESELECT'
-            op = sel_row.operator("assetify.toggle_select_assets", text="Invert")
-            op.action = 'INVERT'
-            sel_row.label(text=f"{selected}/{total} active")
-
-            # Header row with column labels
-            header = q_box.row(align=True)
-            split = header.split(factor=0.15)
-            split.label(text="", icon='CHECKMARK')
-            split = split.split(factor=0.4 / 0.85)
-            split.label(text="Asset Name")
-            remaining = split.split(factor=0.5)
-            remaining.label(text="Bake", icon='NODE_TEXTURE')
-            remaining.label(text="File", icon='FILE_TICK')
-
-            # List template
-            num_rows = max(min(total, 6), 3)
-            q_box.template_list(
-                "ASSETIFY_UL_baked_assets",
-                "",
-                assetify_settings,
-                "baked_assets",
-                assetify_settings,
-                "active_baked_asset_index",
-                rows=num_rows
-            )
-
-            # Action buttons
-            act_row = q_box.row(align=True)
-            act_row.operator("assetify.refresh_asset_collection_list", text="Refresh", icon='FILE_REFRESH')
-            del_col = act_row.column()
-            del_col.alert = True
-            del_col.enabled = selected > 0
-            del_col.operator("assetify.delete_selected_assets", text="Delete Selected", icon='TRASH')
-
-        else:
-            total = count_top_level_collections(assetify_settings.baked_collections)
-            selected = sum(1 for c in assetify_settings.baked_collections if c.include_in_send and get_collection_level(c.name) == 0)
-
-            # Selection helpers (All, None, Invert) & Status
-            sel_row = q_box.row(align=True)
-            op = sel_row.operator("assetify.toggle_select_assets", text="All")
-            op.action = 'SELECT'
-            op = sel_row.operator("assetify.toggle_select_assets", text="None")
-            op.action = 'DESELECT'
-            op = sel_row.operator("assetify.toggle_select_assets", text="Invert")
-            op.action = 'INVERT'
-            sel_row.label(text=f"{selected}/{total} active")
-
-            # Header row with column labels
-            header = q_box.row(align=True)
-            split = header.split(factor=0.15)
-            split.label(text="", icon='CHECKMARK')
-            split = split.split(factor=0.4 / 0.9)
-            split.label(text="Collection Name")
-            remaining = split.split(factor=0.33)
-            remaining.label(text="Swap", icon='ARROW_LEFTRIGHT')
-            remaining = remaining.split(factor=0.5)
-            remaining.label(text="Bake", icon='NODE_TEXTURE')
-            remaining.label(text="File", icon='FILE_TICK')
-
-            num_rows = max(min(total, 6), 3)
-            q_box.template_list(
-                "ASSETIFY_UL_collection_list",
-                "",
-                assetify_settings,
-                "baked_collections",
-                assetify_settings,
-                "active_baked_collection_index",
-                rows=num_rows
-            )
-
-            # Action buttons
-            act_row = q_box.row(align=True)
-            act_row.operator("assetify.refresh_asset_collection_list", text="Refresh", icon='FILE_REFRESH')
-            del_col = act_row.column()
-            del_col.alert = True
-            del_col.enabled = selected > 0
-            del_col.operator("assetify.delete_selected_collections", text="Delete Selected", icon='TRASH')
-
-class ASSETIFY_PT_tools_panel(bpy.types.Panel):
-    """Creates a Panel in the 3D Viewport Tool Shelf"""
-    bl_label = "Assetify — Workflow Pipeline"
-    bl_idname = "ASSETIFY_PT_tools_panel"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "Assetify"
-    bl_order = 2
+            m_row = sub.row(align=True)
+            op_m = m_row.operator("assetify.focus_step", text="Manage Full Queue in Step 1", icon='GEOMETRY_SET')
+            op_m.step = '1'
 
     def draw(self, context):
         layout = self.layout
@@ -9306,15 +9204,27 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         layout.separator(factor=1.5)
 
         # =========================================================================
-        # STEP 1: SETUP & INPUT
+        # STEP 1: SETUP & ASSETS
         # =========================================================================
         if cur_step in {'1', 'ALL'}:
+            if assetify_settings.asset_mode == 'ASSET':
+                total_assets = len(assetify_settings.baked_assets)
+                active_assets = sum(1 for a in assetify_settings.baked_assets if a.include_in_send)
+            else:
+                total_assets = count_top_level_collections(assetify_settings.baked_collections)
+                active_assets = sum(1 for c in assetify_settings.baked_collections if c.include_in_send and get_collection_level(c.name) == 0)
+
             coll_count = len(assetify_settings.asset_collections)
-            badge_step1 = f"({coll_count} Colls)" if coll_count > 0 else "(Empty)"
+            if total_assets > 0:
+                badge_step1 = f"({total_assets} Assets • {active_assets} Active)"
+            elif coll_count > 0:
+                badge_step1 = f"({coll_count} In • 0 Ready)"
+            else:
+                badge_step1 = "(Empty)"
             
             step1_box = layout.box()
             s1_head = step1_box.row(align=True)
-            s1_head.label(text=f"Step 1: Setup & Generators  {badge_step1}", icon="GEOMETRY_SET")
+            s1_head.label(text=f"Step 1: Setup & Assets  {badge_step1}", icon="GEOMETRY_SET")
 
             col1 = step1_box.column(align=False)
             
@@ -9327,22 +9237,30 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
 
             # Asset Collections List
             c_box = col1.box()
-            c_box.label(text="Asset Collections:", icon='OUTLINER_COLLECTION')
-            c_row = c_box.row()
-            split = c_row.split(factor=0.82)
-            c_left = split.column()
-            c_left.template_list(
-                "ASSETIFY_UL_asset_collections",
-                "assetify_step1_in",
-                assetify_settings,
-                "asset_collections",
-                assetify_settings,
-                "active_asset_collection_index",
-                rows=min(max(coll_count, 1), 5)
-            )
-            c_btns = split.column(align=True)
-            c_btns.operator("assetify.add_asset_collection", icon='ADD', text="")
-            c_btns.operator("assetify.remove_asset_collection", icon='REMOVE', text="")
+            c_box.label(text="Input Collections to Process:", icon='OUTLINER_COLLECTION')
+            if coll_count == 0:
+                empty_row = c_box.row(align=True)
+                empty_row.scale_y = 1.2
+                empty_row.operator("assetify.add_asset_collection", text="+ Add Collection to Process", icon='ADD')
+            else:
+                c_row = c_box.row()
+                split = c_row.split(factor=0.82)
+                c_left = split.column()
+                c_left.template_list(
+                    "ASSETIFY_UL_asset_collections",
+                    "assetify_step1_in",
+                    assetify_settings,
+                    "asset_collections",
+                    assetify_settings,
+                    "active_asset_collection_index",
+                    rows=min(max(coll_count, 1), 4)
+                )
+                c_btns = split.column(align=True)
+                c_btns.operator("assetify.add_asset_collection", icon='ADD', text="")
+                c_btns.operator("assetify.remove_asset_collection", icon='REMOVE', text="")
+
+                add_row = c_box.row(align=True)
+                add_row.operator("assetify.add_asset_collection", text="+ Add Another Collection", icon='ADD')
 
             # Setup Options (Mossify / Custom Attributes)
             opt_box = col1.box()
@@ -9388,7 +9306,91 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 fmt = getattr(scene.assetify_animation_settings, "file_format", "FBX") if hasattr(scene, "assetify_animation_settings") else "FBX"
                 btn_row.operator("object.convert_to_game_ready", text=f"Process Animation ({fmt})", icon='FORWARD')
             else:
-                btn_row.operator("object.convert_to_game_ready", text="Process Assets", icon='GEOMETRY_SET')
+                btn_row.operator("object.convert_to_game_ready", text="Process Assets → Add to Queue", icon='GEOMETRY_SET')
+
+            col1.separator(factor=1.0)
+
+            # --- Processed Asset Queue Sub-Box ---
+            q_box = col1.box()
+            q_head = q_box.row(align=True)
+            q_head.label(text=f"Processed Asset Queue ({active_assets}/{total_assets} Active)", icon='OUTLINER_OB_MESH')
+
+            if total_assets == 0:
+                hint_col = q_box.column(align=True)
+                hint_col.label(text="No processed assets in queue yet.", icon='INFO')
+                hint_col.label(text="Add collections above and click 'Process Assets'.")
+            else:
+                # Mode Switcher (Asset Mode vs Collection Mode)
+                sw_row = q_box.row(align=True)
+                sw_row.operator("assetify.switch_mode", text="Asset Mode", icon='OBJECT_DATA', depress=(assetify_settings.asset_mode == 'ASSET')).mode = 'ASSET'
+                sw_row.operator("assetify.switch_mode", text="Collection Mode", icon='OUTLINER_COLLECTION', depress=(assetify_settings.asset_mode == 'COLLECTION')).mode = 'COLLECTION'
+
+                # Selection Controls
+                sel_row = q_box.row(align=True)
+                op = sel_row.operator("assetify.toggle_select_assets", text="All")
+                op.action = 'SELECT'
+                op = sel_row.operator("assetify.toggle_select_assets", text="None")
+                op.action = 'DESELECT'
+                op = sel_row.operator("assetify.toggle_select_assets", text="Invert")
+                op.action = 'INVERT'
+                sel_row.label(text=f"{active_assets}/{total_assets} active")
+
+                if assetify_settings.asset_mode == 'ASSET':
+                    header = q_box.row(align=True)
+                    split = header.split(factor=0.15)
+                    split.label(text="", icon='CHECKMARK')
+                    split = split.split(factor=0.4 / 0.85)
+                    split.label(text="Asset Name")
+                    remaining = split.split(factor=0.5)
+                    remaining.label(text="Bake", icon='NODE_TEXTURE')
+                    remaining.label(text="File", icon='FILE_TICK')
+
+                    num_rows = max(min(total_assets, 6), 3)
+                    q_box.template_list(
+                        "ASSETIFY_UL_baked_assets",
+                        "",
+                        assetify_settings,
+                        "baked_assets",
+                        assetify_settings,
+                        "active_baked_asset_index",
+                        rows=num_rows
+                    )
+
+                    act_row = q_box.row(align=True)
+                    act_row.operator("assetify.refresh_asset_collection_list", text="Refresh", icon='FILE_REFRESH')
+                    del_col = act_row.column()
+                    del_col.alert = True
+                    del_col.enabled = active_assets > 0
+                    del_col.operator("assetify.delete_selected_assets", text="Delete Selected", icon='TRASH')
+                else:
+                    header = q_box.row(align=True)
+                    split = header.split(factor=0.15)
+                    split.label(text="", icon='CHECKMARK')
+                    split = split.split(factor=0.4 / 0.9)
+                    split.label(text="Collection Name")
+                    remaining = split.split(factor=0.33)
+                    remaining.label(text="Swap", icon='ARROW_LEFTRIGHT')
+                    remaining = remaining.split(factor=0.5)
+                    remaining.label(text="Bake", icon='NODE_TEXTURE')
+                    remaining.label(text="File", icon='FILE_TICK')
+
+                    num_rows = max(min(total_assets, 6), 3)
+                    q_box.template_list(
+                        "ASSETIFY_UL_collection_list",
+                        "",
+                        assetify_settings,
+                        "baked_collections",
+                        assetify_settings,
+                        "active_baked_collection_index",
+                        rows=num_rows
+                    )
+
+                    act_row = q_box.row(align=True)
+                    act_row.operator("assetify.refresh_asset_collection_list", text="Refresh", icon='FILE_REFRESH')
+                    del_col = act_row.column()
+                    del_col.alert = True
+                    del_col.enabled = active_assets > 0
+                    del_col.operator("assetify.delete_selected_collections", text="Delete Selected", icon='TRASH')
 
             layout.separator(factor=1.5)
 
@@ -9510,6 +9512,9 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                     if assetify_settings.use_udim:
                         r_udim.prop(assetify_settings, "udim_tiles", text="Tiles")
 
+            # --- Target Summary Bar ---
+            self.draw_target_summary_bar(col2, assetify_settings, action_label="Bake")
+
             # --- Primary Bake Action Button ---
             bake_row = col2.row(align=True)
             bake_row.scale_y = 1.45
@@ -9536,6 +9541,9 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             s3_head.label(text=f"Step 3: Colliders & LODs  {badge_step3}", icon="MOD_DECIM")
 
             col3 = step3_box.column(align=False)
+            
+            # --- Target Summary Bar ---
+            self.draw_target_summary_bar(col3, assetify_settings, action_label="Colliders & LODs")
             
             # --- Collision Section ---
             c_box = col3.box()
@@ -9618,6 +9626,9 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             else:
                 r_ep.label(text="Anim Format:")
                 r_ep.prop(assetify_settings, "animation_export_format", text="")
+
+            # --- Target Summary Bar ---
+            self.draw_target_summary_bar(col4, assetify_settings, action_label="Export")
 
             # Direct Unreal Live Bridge
             ue_box = col4.box()
@@ -10000,7 +10011,6 @@ classes = (
     OBJECT_OT_convert_to_game_ready,
     ASSETIFY_OT_toggle_select_assets,
     ASSETIFY_OT_focus_step,
-    ASSETIFY_PT_asset_queue_panel,
     ASSETIFY_PT_tools_panel,
     ASSETIFY_UL_custom_attributes,
     ASSETIFY_UL_asset_collections,
