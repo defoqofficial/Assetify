@@ -330,6 +330,44 @@ class AddonUpdaterUpdateNow(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class AddonUpdaterUpdateDev(bpy.types.Operator):
+    """Update addon directly from the dev branch on GitHub"""
+    bl_label = "Update from Dev Branch"
+    bl_idname = updater.addon + ".updater_update_dev"
+    bl_description = "Update addon directly to the latest commit on the dev branch from GitHub"
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    clean_install: bpy.props.BoolProperty(
+        name="Clean install",
+        description="Completely clear the addon folder before installing update",
+        default=False,
+        options={'HIDDEN'}
+    )
+
+    def execute(self, context):
+        if updater.invalid_updater:
+            return {'CANCELLED'}
+        try:
+            res = updater.run_update(
+                force=True,
+                revert_tag="Dev",
+                callback=post_update_callback,
+                clean=self.clean_install
+            )
+            if res == 0:
+                self.report({'INFO'}, "Successfully updated from dev branch! Restart Blender to reload.")
+                return {'FINISHED'}
+            else:
+                self.report({'WARNING'}, f"Update failed: {res}")
+                return {'CANCELLED'}
+        except Exception as expt:
+            updater._error = "Error trying to run update"
+            updater._error_msg = str(expt)
+            updater.print_trace()
+            self.report({'ERROR'}, f"Failed to update from dev branch: {expt}")
+            return {'CANCELLED'}
+
+
 class AddonUpdaterUpdateTarget(bpy.types.Operator):
     bl_label = updater.addon + " version target"
     bl_idname = updater.addon + ".updater_update_target"
@@ -1082,6 +1120,9 @@ def update_settings_ui(self, context, element=None):
         col = row.column(align=True)
         if updater.include_branches and len(updater.include_branch_list) > 0:
             branch = updater.include_branch_list[0]
+            col.operator(AddonUpdaterUpdateDev.bl_idname,
+                         text="Update directly to {} branch".format(branch),
+                         icon='URL')
             col.operator(AddonUpdaterUpdateTarget.bl_idname,
                          text="Install {} / old version".format(branch))
         else:
@@ -1323,6 +1364,7 @@ classes = (
     AddonUpdaterInstallPopup,
     AddonUpdaterCheckNow,
     AddonUpdaterUpdateNow,
+    AddonUpdaterUpdateDev,
     AddonUpdaterUpdateTarget,
     AddonUpdaterInstallManually,
     AddonUpdaterUpdatedSuccessful,
@@ -1405,7 +1447,7 @@ def register(bl_info):
     # update. If a pattern file is not found in new update, no action is taken
     # NOTE: This does NOT delete anything proactively, rather only defines what
     # is allowed to be overwritten during an update execution.
-    updater.overwrite_patterns = ["*.png", "*.jpg", "README.md", "LICENSE.txt"]
+    updater.overwrite_patterns = ["*.png", "*.jpg", "README.md", "LICENSE.txt", "*.toml"]
     # updater.overwrite_patterns = []
     # other examples:
     # ["*"] means ALL files/folders will be overwritten by update, was the
@@ -1460,7 +1502,8 @@ def register(bl_info):
     # Note: updater.include_branch_list defaults to ['master'] branch if set to
     # none. Example targeting another multiple branches allowed to pull from:
     # updater.include_branch_list = ['master', 'dev']
-    updater.include_branch_list = None  # None is the equivalent = ['master']
+    updater.include_branch_list = ['dev']  # Target dev branch on GitHub
+
 
     # Only allow manual install, thus prompting the user to open
     # the addon's web page to download, specifically: updater.website

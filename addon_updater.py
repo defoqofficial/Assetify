@@ -1340,20 +1340,23 @@ class SingletonUpdater:
 
     def set_tag(self, name):
         """Assign the tag name and url to update to"""
+        if len(self._tags) == 0:
+            self.get_tags()
+
         tg = None
         for tag in self._tags:
-            if name == tag["name"]:
+            if name.lower() == str(tag["name"]).lower():
                 tg = tag
                 break
         if tg:
             new_version = self.version_tuple_from_text(self.tag_latest)
             self._update_version = new_version
             self._update_link = self.select_link(self, tg)
-        elif self._include_branches and name in self._include_branch_list:
+        elif self._include_branches and (name in self._include_branch_list or name.lower() in [b.lower() for b in self._include_branch_list]):
             # scenario if reverting to a specific branch name instead of tag
             tg = name
-            link = self.form_branch_url(tg)
-            self._update_version = name  # this will break things
+            link = self.form_branch_url(name.lower())
+            self._update_version = name
             self._update_link = link
         if not tg:
             raise ValueError("Version tag not found: " + name)
