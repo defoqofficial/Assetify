@@ -1,0 +1,23 @@
+schema_version = "1.0.0"
+id = "assetify"
+version = "3.1.0"
+name = "Assetify"
+tagline = "Convert anything into game-ready assets with baked textures"
+maintainer = "Nino Defoq"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = [
+    "SPDX:GPL-3.0-or-later",
+]
+tags = [
+    "Game Engine",
+    "Pipeline",
+    "Bake",
+    "Import-Export",
+]
+
+[permissions]
+files = "Read and write textures and exported game assets"
+network = "Check for updates and connect to Unreal Engine"

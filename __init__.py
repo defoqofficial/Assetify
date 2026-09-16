@@ -7931,6 +7931,29 @@ class OBJECT_OT_export_collection_as_fbx(bpy.types.Operator):
         bpy.ops.object.select_all(action='DESELECT')
         obj.select_set(True)
 
+        # Select associated collision objects (UCX_, UBX_, USP_, UCP_)
+        collision_prefixes = ["UCX_", "UBX_", "USP_", "UCP_"]
+        target_names = {obj.name, sanitized_name, obj.name.replace('_gameasset', '')}
+        base_names = set(target_names)
+        for t in list(target_names):
+            base_names.add(re.sub(r'_LOD\d+$', '', t))
+
+        for scene_obj in bpy.context.scene.objects:
+            if scene_obj == obj:
+                continue
+            c_name = scene_obj.name
+            if "." in c_name:
+                c_name = c_name.split(".")[0]
+            for prefix in collision_prefixes:
+                matched = False
+                for b_name in base_names:
+                    if c_name == f"{prefix}{b_name}" or c_name.startswith(f"{prefix}{b_name}_"):
+                        scene_obj.select_set(True)
+                        matched = True
+                        break
+                if matched:
+                    break
+
         if export_format == 'FBX':
             bpy.ops.export_scene.fbx(
                 filepath=export_file_path,
@@ -9218,9 +9241,21 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 row.operator("assetify.generate_lods", text="Generate LODs", icon='MOD_DECIM')
                 row.operator("assetify.clear_lods", text="", icon='TRASH')
                 
-                row = box.row(align=True)
-                row.operator("assetify.generate_collision", text="Generate Collider", icon='MESH_ICOSPHERE')
-                row.operator("assetify.clear_collision", text="", icon='TRASH')
+                collision_settings = getattr(context.scene, "assetify_collision_settings", None)
+                if collision_settings:
+                    col_box = box.box()
+                    col_box.label(text="Collision Hull Settings", icon='PHYSICS')
+                    col_box.prop(collision_settings, "collision_mode", text="Mode")
+                    if collision_settings.collision_mode in {'AUTO', 'COMPOUND_SLICED'}:
+                        col_box.prop(collision_settings, "max_hulls", text="Max Hulls")
+                    col_box.prop(collision_settings, "push_offset", text="Thickness")
+                    row = col_box.row(align=True)
+                    row.operator("assetify.generate_collision", text="Generate Collider", icon='MESH_ICOSPHERE')
+                    row.operator("assetify.clear_collision", text="", icon='TRASH')
+                else:
+                    row = box.row(align=True)
+                    row.operator("assetify.generate_collision", text="Generate Collider", icon='MESH_ICOSPHERE')
+                    row.operator("assetify.clear_collision", text="", icon='TRASH')
             else:
                 box.label(text="Error: LOD settings missing", icon="ERROR")
        

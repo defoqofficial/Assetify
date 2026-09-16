@@ -54,19 +54,30 @@ def focus_unreal_window():
         print(f"Could not switch focus: {e}")
 
 # =================================================================================
-#  HELPER: FIND LODS ONLY
+#  HELPER: FIND LODS AND COLLISION OBJECTS
 # =================================================================================
 def get_lod_group(base_obj, clean_name):
-    """Finds only _LODx objects related to the base object"""
+    """Finds _LODx and collision objects (UCX_, UBX_, USP_, UCP_) related to the base object"""
     related = [base_obj]
+    collision_prefixes = ["UCX_", "UBX_", "USP_", "UCP_"]
     for candidate in bpy.context.scene.objects:
-        if candidate == base_obj: continue
+        if candidate == base_obj:
+            continue
         
         c_name = candidate.name
-        if "." in c_name: c_name = c_name.split(".")[0]
+        if "." in c_name:
+            c_name = c_name.split(".")[0]
         
         if f"{clean_name}_LOD" in c_name:
-            related.append(candidate)
+            if candidate not in related:
+                related.append(candidate)
+            continue
+
+        for prefix in collision_prefixes:
+            if c_name == f"{prefix}{clean_name}" or c_name.startswith(f"{prefix}{clean_name}_"):
+                if candidate not in related:
+                    related.append(candidate)
+                break
     return related
 
 # =================================================================================
@@ -362,13 +373,19 @@ class ASSETIFY_OT_SendToUnreal(bpy.types.Operator):
                 clean_name = obj.name
                 if "." in clean_name: clean_name = clean_name.split(".")[0]
                 clean_name = re.split(r'_LOD\d+', clean_name)[0]
+                for prefix in ["UCX_", "UBX_", "USP_", "UCP_"]:
+                    if clean_name.startswith(prefix):
+                        clean_name = clean_name[len(prefix):]
+                        clean_name = re.sub(r'_\d+$', '', clean_name)
+                        break
                 
-                if clean_name not in asset_groups: asset_groups[clean_name] = []
-                asset_groups[clean_name].append(obj)
+                if clean_name not in asset_groups:
+                    asset_groups[clean_name] = get_lod_group(obj, clean_name)
 
             total_assets = len(asset_groups)
             wm.progress_begin(0, total_assets)
             
+            collision_prefixes = ("UCX_", "UBX_", "USP_", "UCP_")
             for i, (base_name, members) in enumerate(asset_groups.items()):
                 wm.progress_update(i)
                 
@@ -376,7 +393,10 @@ class ASSETIFY_OT_SendToUnreal(bpy.types.Operator):
                 root_empty = bpy.data.objects.new(root_name, None)
                 bpy.context.collection.objects.link(root_empty)
                 
-                main_mesh = next((m for m in members if "_LOD0" in m.name), members[0])
+                lod_or_base = [m for m in members if not m.name.startswith(collision_prefixes)]
+                if not lod_or_base:
+                    lod_or_base = members
+                main_mesh = next((m for m in lod_or_base if "_LOD0" in m.name), lod_or_base[0])
                 root_empty.location = main_mesh.location
                 root_empty.rotation_euler = main_mesh.rotation_euler
                 root_empty.scale = main_mesh.scale
@@ -394,8 +414,9 @@ class ASSETIFY_OT_SendToUnreal(bpy.types.Operator):
                         "matrix": member.matrix_world.copy(),
                         "name": member.name
                     }
-                    member.parent = root_empty
-                    member.matrix_world = saved_state[member]["matrix"]
+                    if not member.name.startswith(collision_prefixes):
+                        member.parent = root_empty
+                        member.matrix_world = saved_state[member]["matrix"]
                     
                     if "." in member.name:
                         member.name = member.name.split(".")[0]
