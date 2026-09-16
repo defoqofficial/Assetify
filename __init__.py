@@ -8891,36 +8891,83 @@ class ASSETIFY_OT_viewport_compare(bpy.types.Operator):
             self.report({'INFO'}, "No baked game assets found to compare.")
             return {'CANCELLED'}
 
+        # --- Safe visibility helpers ---
+        def set_collection_excluded(coll, excluded):
+            """Un-exclude or exclude a collection in every view layer so objects become accessible."""
+            if not coll:
+                return
+            for vl in scene.view_layers:
+                lc = find_layer_collection(vl.layer_collection, coll)
+                if lc:
+                    try:
+                        lc.exclude = excluded
+                    except Exception:
+                        pass
+
+        def safe_hide_set(obj, hide):
+            """Set viewport + hide_set safely; hide_set only works if object is in the active view layer."""
+            if not obj:
+                return
+            try:
+                obj.hide_viewport = hide
+            except Exception:
+                pass
+            try:
+                if obj.name in context.view_layer.objects:
+                    obj.hide_set(hide)
+            except Exception:
+                pass
+
+        # Collect the relevant collections so we can un-exclude them before touching objects
+        orig_collections = set()
+        game_collections = set()
+        for col in bpy.data.collections:
+            if col.name.endswith("_GameReady"):
+                game_collections.add(col)
+                orig_col = bpy.data.collections.get(col.name[:-10])
+                if orig_col:
+                    orig_collections.add(orig_col)
+
         if target_mode == 'ORIGINAL':
+            # Un-exclude all relevant collections first so objects are accessible
+            for col in orig_collections:
+                set_collection_excluded(col, False)
+            for col in game_collections:
+                set_collection_excluded(col, False)
             for gobj in game_objects:
                 if "_assetify_orig_x" in gobj:
                     gobj.location.x = gobj["_assetify_orig_x"]
                     del gobj["_assetify_orig_x"]
-                gobj.hide_set(True)
-                gobj.hide_viewport = True
+                safe_hide_set(gobj, True)
             for oobj in orig_objects:
-                oobj.hide_set(False)
-                oobj.hide_viewport = False
+                safe_hide_set(oobj, False)
             scene.assetify_viewport_mode = 'ORIGINAL'
             self.report({'INFO'}, "Viewport: Showing Original High-Poly Assets.")
 
         elif target_mode == 'BAKED':
+            # Un-exclude all relevant collections first so objects are accessible
+            for col in orig_collections:
+                set_collection_excluded(col, False)
+            for col in game_collections:
+                set_collection_excluded(col, False)
             for gobj in game_objects:
                 if "_assetify_orig_x" in gobj:
                     gobj.location.x = gobj["_assetify_orig_x"]
                     del gobj["_assetify_orig_x"]
-                gobj.hide_set(False)
-                gobj.hide_viewport = False
+                safe_hide_set(gobj, False)
             for oobj in orig_objects:
-                oobj.hide_set(True)
-                oobj.hide_viewport = True
+                safe_hide_set(oobj, True)
             scene.assetify_viewport_mode = 'BAKED'
             self.report({'INFO'}, "Viewport: Showing Baked Game-Ready Assets.")
 
         elif target_mode == 'SIDE_BY_SIDE':
+            # Un-exclude all collections so everything is accessible
+            for col in orig_collections:
+                set_collection_excluded(col, False)
+            for col in game_collections:
+                set_collection_excluded(col, False)
             for gobj in game_objects:
-                gobj.hide_set(False)
-                gobj.hide_viewport = False
+                safe_hide_set(gobj, False)
                 base_name = gobj.name.replace("_gameasset", "")
                 orig = bpy.data.objects.get(base_name) or bpy.data.objects.get(f"{base_name}_ORIGINAL_HIDDEN")
                 if "_assetify_orig_x" not in gobj:
@@ -8930,8 +8977,7 @@ class ASSETIFY_OT_viewport_compare(bpy.types.Operator):
                 gobj.location.x = gobj["_assetify_orig_x"] + offset
                 
             for oobj in orig_objects:
-                oobj.hide_set(False)
-                oobj.hide_viewport = False
+                safe_hide_set(oobj, False)
             scene.assetify_viewport_mode = 'SIDE_BY_SIDE'
             self.report({'INFO'}, "Viewport: Side-by-Side Comparison active.")
 
