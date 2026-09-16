@@ -34,6 +34,7 @@ from . import anim_cloth
 from . import lod_manager
 from . import collision
 from . import op_send_to_unreal
+from . import channel_packer
 import bpy.utils.previews
 import numpy
 import uuid
@@ -3740,6 +3741,12 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
     # Use a Python list to store the main collection assets
     main_collection_assets = []
     
+    use_fast_unlit_baking: bpy.props.BoolProperty(
+        name="1-Sample Fast Baking",
+        description="Use 1 sample for unlit passes (Roughness, Metallic, Emission, Diffuse Color) for massive baking speedup",
+        default=True
+    )
+
     bake_ao: bpy.props.BoolProperty(
         name="Ambient Occlusion", 
         default=True, 
@@ -3749,7 +3756,24 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
     pack_orm: bpy.props.BoolProperty(
         name="Pack ORM (UE5/glTF)", 
         default=False, 
-        description="Combine AO (Red), Roughness (Green), and Metallic (Blue) into a single image."
+        description="Combine AO, Roughness, and Metallic into a single channel-packed image."
+    )
+
+    orm_format: bpy.props.EnumProperty(
+        name="ORM Format",
+        description="Preset format for packing channels",
+        items=[
+            ('AORM', "AORM (Unreal/Godot)", "R=AO, G=Roughness, B=Metallic, A=1.0"),
+            ('RMA', "RMA", "R=Roughness, G=Metallic, B=AO, A=1.0"),
+            ('UNITY_MASK', "Unity Mask Map", "R=Metallic, G=AO, B=1.0, A=Smoothness (1-Roughness)"),
+        ],
+        default='AORM'
+    )
+
+    nanite_mode: bpy.props.BoolProperty(
+        name="Nanite Ready",
+        description="Prepare for Unreal Engine 5 Nanite: preserve full geometry, skip decimation LODs, and auto-enable Nanite in UE5",
+        default=False
     )
     
     use_udim: bpy.props.BoolProperty(
@@ -4195,16 +4219,23 @@ def perform_orm_packing(obj, context):
         img_met = load_temp(path_met)
 
         if img_ao or img_rgh or img_met:
+            format_type = getattr(settings, 'orm_format', 'AORM')
+            suffix = "ORM"
+            if format_type == 'RMA':
+                suffix = "RMA"
+            elif format_type == 'UNITY_MASK':
+                suffix = "MaskMap"
+
             # Determine output name
             if is_anim: 
                 save_name = f"{base_name}.{tile_id}{ext}" if tile_id else f"{base_name}{ext}"
             else: 
-                save_name = f"{obj.name}_ORM.{tile_id}{ext}" if tile_id else f"{obj.name}_ORM{ext}"
+                save_name = f"{obj.name}_{suffix}.{tile_id}{ext}" if tile_id else f"{obj.name}_{suffix}{ext}"
             
             full_save_path = os.path.join(target_dir, save_name)
 
             # Pack textures (Pass use_float=is_exr)
-            pack_orm_textures(obj, img_ao, img_rgh, img_met, "Temp_ORM_Packer", use_float=is_exr, filepath=full_save_path, file_format=file_format)
+            pack_orm_textures(obj, img_ao, img_rgh, img_met, "Temp_ORM_Packer", use_float=is_exr, filepath=full_save_path, file_format=file_format, format_type=format_type)
         
         # Cleanup loaded source images from memory
         for img in [img_ao, img_rgh, img_met]:
@@ -5415,6 +5446,32 @@ def debug_print_image_assignments(obj, map_type):
     
     debug_print(f"--- End of Image Assignments ---\n")
 
+def set_bake_samples(assetify_settings, map_type, is_unlit=False):
+    """
+    Sets scene.cycles.samples appropriately.
+    If fast unlit baking is enabled and the pass is unlit, sets samples to 1.
+    Otherwise uses assetify_settings.bake_samples.
+    Returns previous_samples so it can be restored in a finally block.
+    """
+    scene = bpy.context.scene
+    prev_samples = None
+    if hasattr(scene, 'cycles'):
+        prev_samples = scene.cycles.samples
+        is_fast_unlit = getattr(assetify_settings, 'use_fast_unlit_baking', True)
+        if is_fast_unlit and is_unlit:
+            samples = 1
+        else:
+            samples = max(1, getattr(assetify_settings, 'bake_samples', 2))
+        scene.cycles.samples = samples
+        print(f"[Assetify] {map_type} baking with {samples} sample(s).")
+    return prev_samples
+
+def restore_bake_samples(prev_samples):
+    """Restores scene.cycles.samples if it was previously saved."""
+    scene = bpy.context.scene
+    if prev_samples is not None and hasattr(scene, 'cycles'):
+        scene.cycles.samples = prev_samples
+
 def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"):
     """
     Bakes maps. 
@@ -5632,10 +5689,16 @@ def bake_and_save(obj, bake_type, map_type, resolution, save_dir, platform="UE5"
         bpy.context.scene.cycles.bake_type = 'AO'
 
     # EXECUTE BAKE
+    is_unlit = (map_type in ("Roughness", "Normal")) or (
+        map_type == "BaseColor" and not assetify_settings.bake_direct_light and not assetify_settings.bake_indirect_light
+    )
+    prev_samples = set_bake_samples(assetify_settings, map_type, is_unlit=is_unlit)
     try:
         bpy.ops.object.bake(type=bpy.context.scene.cycles.bake_type)
     except Exception as e:
         print(f"[ERROR] Bake failed for {map_type}: {e}")
+    finally:
+        restore_bake_samples(prev_samples)
     
     # SAVE IMAGE
     try:
@@ -5891,12 +5954,14 @@ def bake_metallic_as_emission(obj, resolution, save_dir, platform):
     bpy.context.scene.render.bake.use_pass_indirect = False
     bpy.context.scene.render.bake.use_pass_color = True
 
+    prev_samples = set_bake_samples(assetify_settings, "Metallic (EMIT)", is_unlit=True)
     try:
         print(f"[Assetify] Baking Metallic (EMIT) for {obj.name}...")
         bpy.ops.object.bake(type='EMIT')
     except Exception as e:
         print(f"[ERROR] Metallic Bake Error: {e}")
     finally:
+        restore_bake_samples(prev_samples)
         # Restore previous bake setting to avoid breaking subsequent maps
         bpy.context.scene.render.bake.use_selected_to_active = prev_sel_to_act
         
@@ -5983,84 +6048,29 @@ def pack_metallic_roughness(metallic_image, roughness_image, output_image_name="
 
     return dst_image
 
-def pack_orm_textures(obj, ao_image, roughness_image, metallic_image, output_image_name, use_float=False, filepath=None, file_format='PNG'):
+def pack_orm_textures(obj, ao_image, roughness_image, metallic_image, output_image_name="Temp_ORM_Packer", use_float=False, filepath=None, file_format='PNG', format_type=None):
     """
-    Combines AO, Roughness, and Metallic into one image (ORM).
-    Supports 32-bit Float buffers for OpenEXR.
+    Combines AO, Roughness, and Metallic into one image using instant NumPy channel packing.
+    Supports AORM, RMA, and Unity Mask Map presets.
     """
-    import numpy as np
+    if format_type is None:
+        settings = getattr(bpy.context.scene, 'assetify_bake_settings', None)
+        format_type = getattr(settings, 'orm_format', 'AORM') if settings else 'AORM'
 
-    # 1. Determine Dimensions from whichever image exists
     ref_image = roughness_image or metallic_image or ao_image
-    if not ref_image:
-        return None
-        
-    w, h = ref_image.size
-    
-    # 2. Prepare Target Array (Float32 for precision)
-    # RGBA = 4 channels
-    dst_array = np.zeros(w * h * 4, dtype=np.float32)
-    
-    # 3. Load AO (Red)
-    if ao_image:
-        try:
-            # Resize check could be added here, but assuming bake ensured matching sizes
-            ao_pixels = np.empty(w * h * 4, dtype=np.float32)
-            ao_image.pixels.foreach_get(ao_pixels)
-            dst_array[0::4] = ao_pixels[0::4] # Copy Red channel
-        except Exception as e: 
-            print(f"Error packing AO: {e}")
-            dst_array[0::4] = 1.0 # Default white
-    else: 
-        dst_array[0::4] = 1.0
+    w, h = (ref_image.size[0], ref_image.size[1]) if ref_image else (2048, 2048)
 
-    # 4. Load Roughness (Green)
-    if roughness_image:
-        try:
-            rgh_pixels = np.empty(w * h * 4, dtype=np.float32)
-            roughness_image.pixels.foreach_get(rgh_pixels)
-            # Roughness maps are usually B&W, so any channel works. We take Red index 0.
-            dst_array[1::4] = rgh_pixels[0::4] 
-        except: dst_array[1::4] = 0.5
-    else: dst_array[1::4] = 0.5
-
-    # 5. Load Metallic (Blue)
-    if metallic_image:
-        try:
-            met_pixels = np.empty(w * h * 4, dtype=np.float32)
-            metallic_image.pixels.foreach_get(met_pixels)
-            dst_array[2::4] = met_pixels[0::4]
-        except: dst_array[2::4] = 0.0
-    else: dst_array[2::4] = 0.0
-
-    # 6. Alpha (Full Opaque)
-    dst_array[3::4] = 1.0
-
-    # 7. Create Output Image
-    if output_image_name in bpy.data.images:
-        bpy.data.images.remove(bpy.data.images[output_image_name])
-
-    # Create image with correct bit depth
-    dst_image = bpy.data.images.new(output_image_name, w, h, alpha=False, float_buffer=use_float)
-    
-    # Fill pixels
-    dst_image.pixels.foreach_set(dst_array)
-    
-    # 8. Save immediately if filepath is provided
-    if filepath:
-        try:
-            dst_image.filepath_raw = filepath
-            dst_image.file_format = file_format
-            dst_image.save()
-            print(f"[Assetify] Saved ORM map: {filepath}")
-        except Exception as e:
-            print(f"[ERROR] Failed to save ORM map: {e}")
-        
-        # Cleanup memory immediately
-        bpy.data.images.remove(dst_image)
-        return None
-    
-    return dst_image
+    return channel_packer.pack_orm_texture(
+        ao_source=ao_image,
+        roughness_source=roughness_image,
+        metallic_source=metallic_image,
+        output_path=filepath,
+        image_name=output_image_name,
+        format_type=format_type,
+        width=w,
+        height=h,
+        file_format=file_format
+    )
 
 
 def bake_metallic_map(obj, image):
@@ -6266,11 +6276,14 @@ def bake_emission_strength_map(obj, resolution, save_dir, platform):
         
     # Set bake type and perform the bake.
     bpy.context.scene.cycles.bake_type = 'EMIT'
+    prev_samples = set_bake_samples(assetify_settings, "Emission Strength", is_unlit=True)
     try:
         bpy.ops.object.bake(type='EMIT')
         print(f"[DEBUG] Successfully baked Emission Strength map for {obj.name}.")
     except RuntimeError as e:
         print(f"[ERROR] Baking error for {obj.name}: {e}")
+    finally:
+        restore_bake_samples(prev_samples)
     
     # Save the baked image.
     try:
@@ -6421,11 +6434,14 @@ def bake_emission_color_map(obj, resolution, save_dir, platform):
             print(f"[ERROR] Linking error in {mat.name}: {e}")
     
     bpy.context.scene.cycles.bake_type = 'EMIT'
+    prev_samples = set_bake_samples(assetify_settings, "Emission Color", is_unlit=True)
     try:
         bpy.ops.object.bake(type='EMIT')
         print(f"[DEBUG] Successfully baked Emission Color map for {obj.name}")
     except RuntimeError as e:
         print(f"[ERROR] Baking error for {obj.name}: {e}")
+    finally:
+        restore_bake_samples(prev_samples)
     
     try:
         image.filepath_raw = texture_file_path
@@ -6601,11 +6617,14 @@ def bake_transmission_map(obj, resolution, save_dir, platform):
         added_nodes.setdefault(mat.name, []).append(tex_node)
     
     bpy.context.scene.cycles.bake_type = 'EMIT'
+    prev_samples = set_bake_samples(assetify_settings, "Transmission", is_unlit=True)
     try:
         bpy.ops.object.bake(type='EMIT')
         print(f"[DEBUG] Successfully baked Transmission map for {obj.name}.")
     except RuntimeError as e:
         print(f"[ERROR] Baking error for {obj.name}: {e}")
+    finally:
+        restore_bake_samples(prev_samples)
     
     try:
         image.filepath_raw = texture_file_path
@@ -6773,11 +6792,14 @@ def bake_alpha_map(obj, resolution, save_dir):
         added_nodes.setdefault(mat.name, []).append(tex_node)
     
     bpy.context.scene.cycles.bake_type = 'EMIT'
+    prev_samples = set_bake_samples(assetify_settings, "Alpha", is_unlit=True)
     try:
         bpy.ops.object.bake(type='EMIT')
         print(f"[DEBUG] Successfully baked Alpha map for {obj.name}.")
     except RuntimeError as e:
         print(f"[ERROR] Baking error for {obj.name}: {e}")
+    finally:
+        restore_bake_samples(prev_samples)
     
     try:
         image.filepath_raw = texture_file_path
@@ -6913,17 +6935,41 @@ def apply_baked_textures(obj, save_dir, platform="UE5", asset_name_override=None
     ao_socket = None # This will hold the AO output socket (Red channel or Mono image)
 
     if assetify_settings.pack_orm:
-        img_orm = load_texture("ORM", 'Non-Color')
+        orm_fmt = getattr(assetify_settings, 'orm_format', 'AORM')
+        suffix = "ORM"
+        if orm_fmt == "RMA":
+            suffix = "RMA"
+        elif orm_fmt == "UNITY_MASK":
+            suffix = "MaskMap"
+
+        img_orm = load_texture(suffix, 'Non-Color')
+        if not img_orm and suffix != "ORM":
+            img_orm = load_texture("ORM", 'Non-Color')
+
         if img_orm:
-            node_orm = create_tex_node(img_orm, "ORM")
+            node_orm = create_tex_node(img_orm, suffix)
             sep = node_tree.nodes.new('ShaderNodeSeparateColor')
             sep.location = (-300, node_orm.location.y)
             node_tree.links.new(node_orm.outputs['Color'], sep.inputs['Color'])
             
-            # ORM Mapping: Red=AO, Green=Roughness, Blue=Metallic
-            ao_socket = sep.outputs['Red'] 
-            node_tree.links.new(sep.outputs['Green'], bsdf_node.inputs['Roughness'])
-            node_tree.links.new(sep.outputs['Blue'], bsdf_node.inputs['Metallic'])
+            if orm_fmt == "RMA":
+                # RMA Mapping: Red=Roughness, Green=Metallic, Blue=AO
+                ao_socket = sep.outputs['Blue']
+                node_tree.links.new(sep.outputs['Red'], bsdf_node.inputs['Roughness'])
+                node_tree.links.new(sep.outputs['Green'], bsdf_node.inputs['Metallic'])
+            elif orm_fmt == "UNITY_MASK":
+                # Unity Mask: Red=Metallic, Green=AO, Blue=Detail, Alpha=Smoothness
+                ao_socket = sep.outputs['Green']
+                node_tree.links.new(sep.outputs['Red'], bsdf_node.inputs['Metallic'])
+                inv_node = node_tree.nodes.new('ShaderNodeInvert')
+                inv_node.location = (-150, node_orm.location.y)
+                node_tree.links.new(node_orm.outputs['Alpha'], inv_node.inputs['Color'])
+                node_tree.links.new(inv_node.outputs['Color'], bsdf_node.inputs['Roughness'])
+            else:
+                # AORM Mapping: Red=AO, Green=Roughness, Blue=Metallic
+                ao_socket = sep.outputs['Red'] 
+                node_tree.links.new(sep.outputs['Green'], bsdf_node.inputs['Roughness'])
+                node_tree.links.new(sep.outputs['Blue'], bsdf_node.inputs['Metallic'])
             current_y -= spacing
     else:
         # Standard Maps
@@ -8974,6 +9020,13 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 row.label(text="Samples")
                 row.prop(assetify_settings, "bake_samples", text="")
 
+                row = col_sub.row(align=True)
+                split = row.split(factor=DECORATOR_WIDTH, align=True)
+                c_left = split.column(align=False)
+                c_left.prop(assetify_settings, "use_fast_unlit_baking", text="")
+                c_right = split.column(align=True)
+                c_right.label(text="1-Sample Fast Baking")
+
                 # Pipeline & Format
                 box_pipe = col.box()
                 box_pipe.label(text="Pipeline", icon='NODE')
@@ -9027,6 +9080,21 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 
                 c_right = split.column(align=True)
                 c_right.label(text="Pack ORM (UE5/glTF)")
+                
+                if assetify_settings.pack_orm:
+                    row = col_sub.row(align=True)
+                    row.label(text="ORM Preset")
+                    row.prop(assetify_settings, "orm_format", text="")
+
+                # ==========================
+                # ROW 6: NANITE READY (UE5)
+                # ==========================
+                row = col_sub.row(align=True)
+                split = row.split(factor=DECORATOR_WIDTH, align=True)
+                c_left = split.column(align=False)
+                c_left.prop(assetify_settings, "nanite_mode", text="")
+                c_right = split.column(align=True)
+                c_right.label(text="Nanite-Ready (UE5)")
                 
                 # Small separator to push the numeric settings slightly down
                 col_sub.separator(factor=1)
@@ -9118,6 +9186,9 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         row.label(text="LOD & Collider Manager", icon='MOD_DECIM')
 
         if assetify_settings.lod_menu_expanded:
+            if getattr(assetify_settings, 'nanite_mode', False):
+                n_box = box.box()
+                n_box.label(text="Nanite Mode Active: Decimation LODs bypassed", icon='INFO')
             if hasattr(scene, "assetify_lod_settings"):
                 lod_settings = scene.assetify_lod_settings
 
@@ -9544,6 +9615,7 @@ def register():
 
     # Reload dependent modules
     importlib.reload(animation_processor)
+    importlib.reload(channel_packer)
     
     animation_processor.register()
     bpy.types.Scene.assetify_animation_settings = bpy.props.PointerProperty(type=animation_processor.AssetifyAnimationSettings)

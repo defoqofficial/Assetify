@@ -64,6 +64,11 @@ class AssetifyGenerateLODs(bpy.types.Operator):
         lod_settings = scene.assetify_lod_settings
         bake_settings = scene.assetify_bake_settings
 
+        # Check Nanite Mode
+        if getattr(bake_settings, "nanite_mode", False):
+            self.report({'INFO'}, "[Assetify] Nanite Ready mode active: Skipping decimation LODs (Nanite handles LODs dynamically).")
+            return {'FINISHED'}
+
         objects_to_process = []
 
         # --- 1. COLLECT OBJECTS ---

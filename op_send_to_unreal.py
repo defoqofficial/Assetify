@@ -173,7 +173,7 @@ def create_and_assign_material(asset_name, game_path, imported_textures, static_
         return material
     except: return None
 
-def import_process(file_path, texture_paths, game_path, actor_name):
+def import_process(file_path, texture_paths, game_path, actor_name, enable_nanite=False):
     tasks = []
     
     mesh_task = unreal.AssetImportTask()
@@ -261,6 +261,15 @@ def import_process(file_path, texture_paths, game_path, actor_name):
             imported_textures.append(tex_obj)
 
     if static_mesh:
+        if enable_nanite:
+            try:
+                nanite_settings = static_mesh.get_editor_property('nanite_settings')
+                nanite_settings.set_editor_property('enabled', True)
+                static_mesh.set_editor_property('nanite_settings', nanite_settings)
+                unreal.EditorAssetLibrary.save_asset(static_mesh.get_path_name())
+                print(f"[Assetify] Nanite enabled on {{actor_name}}")
+            except Exception as e:
+                print(f"[Assetify] Warning: Could not enable Nanite on {{actor_name}}: {{e}}")
         if 'create_and_assign_material' in globals():
             create_and_assign_material(actor_name, game_path, imported_textures, static_mesh)
 
@@ -278,7 +287,7 @@ def import_process(file_path, texture_paths, game_path, actor_name):
         except Exception as e:
             unreal.log_error(f"Failed to spawn actor: {{e}}")
 
-import_process(r"{file_path}", {texture_list_string}, r"{game_path}", "{obj_name}")
+import_process(r"{file_path}", {texture_list_string}, r"{game_path}", "{obj_name}", {enable_nanite})
 """
 
 # =================================================================================
@@ -451,11 +460,13 @@ class ASSETIFY_OT_SendToUnreal(bpy.types.Operator):
                 dynamic_game_path = f"/Game/Assetify_Imports/{base_name}"
                 clean_file_path = full_path.replace("\\", "/")
                 
+                is_nanite = getattr(assetify_settings, 'nanite_mode', False)
                 script_to_run = UNREAL_PAYLOAD.format(
                     file_path=clean_file_path, 
                     texture_list_string=str(texture_files),
                     game_path=dynamic_game_path, 
-                    obj_name=base_name
+                    obj_name=base_name,
+                    enable_nanite="True" if is_nanite else "False"
                 )
 
                 remote_exec.run_command(script_to_run, exec_mode='ExecuteFile')
