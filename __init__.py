@@ -1887,8 +1887,14 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
         print(f"Created new game-ready collection: {game_ready_collection.name}")
 
         # Process each object in the collection
+        collision_prefixes = ("UCX_", "UBX_", "USP_", "UCP_")
+        import re as _re
+        lod_pattern = _re.compile(r'_LOD\d+$')
         for obj in collection.objects:
             if obj.type in {'MESH', 'CURVE', 'FONT'}:
+                # Skip collision meshes and LOD variants
+                if obj.name.startswith(collision_prefixes) or lod_pattern.search(obj.name):
+                    continue
                 if obj.particle_systems:
                     print(f"Applying particle systems on {obj.name}")
                     obj = apply_particle_systems(obj)
@@ -2157,8 +2163,17 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
             print(f"Created game-ready subcollection: {game_ready_collection.name}")
 
         # Collect assets
+        collision_prefixes = ("UCX_", "UBX_", "USP_", "UCP_")
+        import re as _re
+        lod_pattern = _re.compile(r'_LOD\d+$')
         for obj in collection.objects:
             if obj.type in {'MESH', 'CURVE', 'FONT'}:
+                # Skip collision meshes (already handled in Step 3)
+                if obj.name.startswith(collision_prefixes):
+                    continue
+                # Skip LOD variants (already handled in Step 3)
+                if lod_pattern.search(obj.name):
+                    continue
                 self._assets_to_process.append({'object': obj, 'original_collection': collection})
 
                 # Update asset count for the collection
