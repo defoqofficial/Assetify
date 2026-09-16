@@ -9392,95 +9392,79 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 op_go1 = hint_col.row().operator("assetify.focus_step", text="Go to Step 1: Setup →", icon='GEOMETRY_SET')
                 op_go1.step = '1'
             else:
-                # --- A. Asset Mode & Filtering Submenu ---
-                a_box = col0.box()
-                a_head = a_box.row(align=True)
-                a_icon = "TRIA_DOWN" if assetify_settings.step0_a_mode_expanded else "TRIA_RIGHT"
-                a_head.prop(assetify_settings, "step0_a_mode_expanded", text="", icon=a_icon, emboss=False)
-                a_head.label(text=f"A. Asset Mode & Filtering ({assetify_settings.asset_mode.title()} Mode)", icon='VIEWZOOM')
-                if assetify_settings.step0_a_mode_expanded:
-                    sw_row = a_box.row(align=True)
-                    sw_row.operator("assetify.switch_mode", text="Asset Mode", icon='OBJECT_DATA', depress=(assetify_settings.asset_mode == 'ASSET')).mode = 'ASSET'
-                    sw_row.operator("assetify.switch_mode", text="Collection Mode", icon='OUTLINER_COLLECTION', depress=(assetify_settings.asset_mode == 'COLLECTION')).mode = 'COLLECTION'
+                # Mode Switcher (Asset Mode vs Collection Mode)
+                sw_row = col0.row(align=True)
+                sw_row.operator("assetify.switch_mode", text="Asset Mode", icon='OBJECT_DATA', depress=(assetify_settings.asset_mode == 'ASSET')).mode = 'ASSET'
+                sw_row.operator("assetify.switch_mode", text="Collection Mode", icon='OUTLINER_COLLECTION', depress=(assetify_settings.asset_mode == 'COLLECTION')).mode = 'COLLECTION'
 
-                # --- B. Batch Selection Controls Submenu ---
-                b_box = col0.box()
-                b_head = b_box.row(align=True)
-                b_icon = "TRIA_DOWN" if assetify_settings.step0_b_select_expanded else "TRIA_RIGHT"
-                b_head.prop(assetify_settings, "step0_b_select_expanded", text="", icon=b_icon, emboss=False)
-                b_head.label(text=f"B. Batch Selection Controls ({active_assets}/{total_assets} Active)", icon='CHECKBOX_HLT')
-                if assetify_settings.step0_b_select_expanded:
-                    sel_row = b_box.row(align=True)
-                    op = sel_row.operator("assetify.toggle_select_assets", text="Select All")
-                    op.action = 'SELECT'
-                    op = sel_row.operator("assetify.toggle_select_assets", text="Select None")
-                    op.action = 'DESELECT'
-                    op = sel_row.operator("assetify.toggle_select_assets", text="Invert")
-                    op.action = 'INVERT'
+                # Selection Controls
+                sel_row = col0.row(align=True)
+                op = sel_row.operator("assetify.toggle_select_assets", text="All")
+                op.action = 'SELECT'
+                op = sel_row.operator("assetify.toggle_select_assets", text="None")
+                op.action = 'DESELECT'
+                op = sel_row.operator("assetify.toggle_select_assets", text="Invert")
+                op.action = 'INVERT'
+                sel_row.label(text=f"{active_assets}/{total_assets} Active")
 
-                # --- C. Master Asset Queue Submenu ---
-                c_box = col0.box()
-                c_head = c_box.row(align=True)
-                c_icon = "TRIA_DOWN" if assetify_settings.step0_c_queue_expanded else "TRIA_RIGHT"
-                c_head.prop(assetify_settings, "step0_c_queue_expanded", text="", icon=c_icon, emboss=False)
-                c_head.label(text=f"C. Master Asset Queue ({total_assets} Items)", icon='OUTLINER_OB_MESH')
-                if assetify_settings.step0_c_queue_expanded:
-                    if assetify_settings.asset_mode == 'ASSET':
-                        header = c_box.row(align=True)
-                        split = header.split(factor=0.15)
-                        split.label(text="", icon='CHECKMARK')
-                        split = split.split(factor=0.4 / 0.85)
-                        split.label(text="Asset Name")
-                        remaining = split.split(factor=0.5)
-                        remaining.label(text="Bake", icon='NODE_TEXTURE')
-                        remaining.label(text="File", icon='FILE_TICK')
+                # Master Asset Queue Box
+                q_box = col0.box()
+                if assetify_settings.asset_mode == 'ASSET':
+                    header = q_box.row(align=True)
+                    split = header.split(factor=0.15)
+                    split.label(text="", icon='CHECKMARK')
+                    split = split.split(factor=0.4 / 0.85)
+                    split.label(text="Asset Name")
+                    remaining = split.split(factor=0.5)
+                    remaining.label(text="Bake", icon='NODE_TEXTURE')
+                    remaining.label(text="File", icon='FILE_TICK')
 
-                        num_rows = max(min(total_assets, 8), 4)
-                        c_box.template_list(
-                            "ASSETIFY_UL_baked_assets",
-                            "",
-                            assetify_settings,
-                            "baked_assets",
-                            assetify_settings,
-                            "active_baked_asset_index",
-                            rows=num_rows
-                        )
+                    num_rows = max(min(total_assets, 8), 4)
+                    q_box.template_list(
+                        "ASSETIFY_UL_baked_assets",
+                        "",
+                        assetify_settings,
+                        "baked_assets",
+                        assetify_settings,
+                        "active_baked_asset_index",
+                        rows=num_rows
+                    )
 
-                        act_row = c_box.row(align=True)
-                        act_row.operator("assetify.refresh_asset_collection_list", text="Refresh", icon='FILE_REFRESH')
-                        del_col = act_row.column()
-                        del_col.alert = True
-                        del_col.enabled = active_assets > 0
-                        del_col.operator("assetify.delete_selected_assets", text="Delete Selected", icon='TRASH')
-                    else:
-                        header = c_box.row(align=True)
-                        split = header.split(factor=0.15)
-                        split.label(text="", icon='CHECKMARK')
-                        split = split.split(factor=0.4 / 0.9)
-                        split.label(text="Collection Name")
-                        remaining = split.split(factor=0.33)
-                        remaining.label(text="Swap", icon='ARROW_LEFTRIGHT')
-                        remaining = remaining.split(factor=0.5)
-                        remaining.label(text="Bake", icon='NODE_TEXTURE')
-                        remaining.label(text="File", icon='FILE_TICK')
+                    act_row = q_box.row(align=True)
+                    act_row.operator("assetify.refresh_asset_collection_list", text="Refresh", icon='FILE_REFRESH')
+                    del_col = act_row.column()
+                    del_col.alert = True
+                    del_col.enabled = active_assets > 0
+                    del_col.operator("assetify.delete_selected_assets", text="Delete Selected", icon='TRASH')
+                else:
+                    header = q_box.row(align=True)
+                    split = header.split(factor=0.15)
+                    split.label(text="", icon='CHECKMARK')
+                    split = split.split(factor=0.4 / 0.9)
+                    split.label(text="Collection Name")
+                    remaining = split.split(factor=0.33)
+                    remaining.label(text="Swap", icon='ARROW_LEFTRIGHT')
+                    remaining = remaining.split(factor=0.5)
+                    remaining.label(text="Bake", icon='NODE_TEXTURE')
+                    remaining.label(text="File", icon='FILE_TICK')
 
-                        num_rows = max(min(total_assets, 8), 4)
-                        c_box.template_list(
-                            "ASSETIFY_UL_collection_list",
-                            "",
-                            assetify_settings,
-                            "baked_collections",
-                            assetify_settings,
-                            "active_baked_collection_index",
-                            rows=num_rows
-                        )
+                    num_rows = max(min(total_assets, 8), 4)
+                    q_box.template_list(
+                        "ASSETIFY_UL_collection_list",
+                        "",
+                        assetify_settings,
+                        "baked_collections",
+                        assetify_settings,
+                        "active_baked_collection_index",
+                        rows=num_rows
+                    )
 
-                        act_row = c_box.row(align=True)
-                        act_row.operator("assetify.refresh_asset_collection_list", text="Refresh", icon='FILE_REFRESH')
-                        del_col = act_row.column()
-                        del_col.alert = True
-                        del_col.enabled = active_assets > 0
-                        del_col.operator("assetify.delete_selected_collections", text="Delete Selected", icon='TRASH')
+                    act_row = q_box.row(align=True)
+                    act_row.operator("assetify.refresh_asset_collection_list", text="Refresh", icon='FILE_REFRESH')
+                    del_col = act_row.column()
+                    del_col.alert = True
+                    del_col.enabled = active_assets > 0
+                    del_col.operator("assetify.delete_selected_collections", text="Delete Selected", icon='TRASH')
 
                 # Full-Width Button to proceed to Step 2: Bake
                 nxt_row = col0.row(align=True)
