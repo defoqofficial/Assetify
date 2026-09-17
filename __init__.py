@@ -46,6 +46,7 @@ import addon_utils
 import glob
 from collections import deque
 from . import non_principled_baking
+from . import viewport_queue_drawer
 
 # Define a global dictionary to store the custom icon previews
 custom_icons = None
@@ -9296,7 +9297,8 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             selected = sum(1 for c in settings.baked_collections if c.include_in_send and get_collection_level(c.name) == 0)
         if total > 0:
             layout.label(text=f"({selected}/{total} Active)")
-        layout.popover(panel="ASSETIFY_PT_queue_popover", text="", icon='MENU_PANEL')
+        layout.operator("assetify.toggle_viewport_drawer", text="", icon='MENU_PANEL')
+        layout.popover(panel="ASSETIFY_PT_queue_popover", text="", icon='WINDOW')
 
     @classmethod
     def draw_full_queue(cls, self_or_none, layout, assetify_settings):
@@ -9432,7 +9434,8 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         else:
             label_text = f"{letter_prefix}. Target Assets to {action_label} ({badge})"
         t_head.label(text=label_text, icon=status_icon)
-        t_head.popover(panel="ASSETIFY_PT_queue_popover", text="", icon='MENU_PANEL')
+        t_head.operator("assetify.toggle_viewport_drawer", text="", icon='MENU_PANEL')
+        t_head.popover(panel="ASSETIFY_PT_queue_popover", text="", icon='WINDOW')
 
         if is_expanded:
             sub = t_box.column(align=False)
@@ -9568,11 +9571,16 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             total_q = count_top_level_collections(assetify_settings.baked_collections)
             selected_q = sum(1 for c in assetify_settings.baked_collections if c.include_in_send and get_collection_level(c.name) == 0)
 
-        q_txt = f"Queue ({selected_q}/{total_q})" if total_q > 0 else "Asset Queue"
-        vp_row.popover(
-            panel="ASSETIFY_PT_queue_popover",
+        q_txt = f"Queue ({selected_q}/{total_q})" if total_q > 0 else "Queue"
+        vp_row.operator(
+            "assetify.toggle_viewport_drawer",
             text=q_txt,
             icon='MENU_PANEL'
+        )
+        vp_row.popover(
+            panel="ASSETIFY_PT_queue_popover",
+            text="",
+            icon='DOWNARROW_HLT'
         )
         
         vp_row.separator()
@@ -10521,6 +10529,12 @@ def register():
         print("[INFO] pivot_tool registered successfully.")
     except Exception as e:
         print(f"[ERROR] Failed to register pivot_tool: {e}")
+
+    try:
+        viewport_queue_drawer.register()
+        print("[INFO] viewport_queue_drawer registered successfully.")
+    except Exception as e:
+        print(f"[ERROR] Failed to register viewport_queue_drawer: {e}")
     
     # Register Scene property for the toggle (Keep this in init.py)
     bpy.types.Scene.show_lod_manager = bpy.props.BoolProperty(default=False)
@@ -10611,6 +10625,11 @@ def unregister():
         pivot_tool.unregister()
     except Exception as e:
         print(f"[INFO] pivot_tool was not registered: {e}")
+
+    try:
+        viewport_queue_drawer.unregister()
+    except Exception as e:
+        print(f"[INFO] viewport_queue_drawer was not registered: {e}")
 
     # Unregister addon updater operations
     addon_updater_ops.unregister()
