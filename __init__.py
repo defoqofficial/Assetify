@@ -9278,7 +9278,8 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             selected = sum(1 for c in settings.baked_collections if c.include_in_send and get_collection_level(c.name) == 0)
         if total > 0:
             layout.label(text=f"({selected}/{total} Active)")
-        layout.prop(settings, "show_side_queue", text="", icon='SIDEBAR', emboss=False)
+        header_icon = 'PANEL_CLOSE' if settings.show_side_queue else 'MENU_PANEL'
+        layout.prop(settings, "show_side_queue", text="", icon=header_icon, emboss=False)
 
     def draw_full_queue(self, layout, assetify_settings):
         """Draws the full-height persistent Asset Queue drawer."""
@@ -9544,7 +9545,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         vp_row = vp_box.row(align=True)
         
         # Pinned Queue Drawer Toggle
-        side_q_icon = 'PANEL_CLOSE' if assetify_settings.show_side_queue else 'SIDEBAR'
+        side_q_icon = 'PANEL_CLOSE' if assetify_settings.show_side_queue else 'MENU_PANEL'
         side_q_text = "Close Queue" if assetify_settings.show_side_queue else "Asset Queue"
         vp_row.operator("assetify.toggle_side_queue", text=side_q_text, icon=side_q_icon, depress=assetify_settings.show_side_queue)
         
