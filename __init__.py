@@ -1605,10 +1605,26 @@ def ensure_file_saved(operator, context):
         def draw(self, context):
             self.layout.label(text="You have unsaved changes. Save before continuing?")
             row = self.layout.row(align=True)
+            # Serialize operator arguments to preserve them across the save popup
+            args_json = "{}"
+            if operator:
+                import json
+                args = {}
+                for k in operator.bl_rna.properties.keys():
+                    if k not in {'rna_type'}:
+                        try:
+                            val = getattr(operator, k, None)
+                            if isinstance(val, (str, int, float, bool)):
+                                args[k] = val
+                        except Exception:
+                            pass
+                args_json = json.dumps(args)
+
             # "Save Now" button
             save_op = row.operator("assetify.save_and_continue", text="Save & Proceed", icon='FILE_TICK')
             if operator:
                 save_op.operator_id = operator.__class__.bl_idname
+                save_op.operator_args = args_json
             else:
                 print("Warning: 'operator' is None when attempting to set 'operator_id'.")
 
@@ -1616,6 +1632,7 @@ def ensure_file_saved(operator, context):
             proceed_op = row.operator("assetify.proceed_without_saving", text="Don't Save & Proceed", icon='PLAY')
             if operator:
                 proceed_op.operator_id = operator.__class__.bl_idname
+                proceed_op.operator_args = args_json
             else:
                 print("Warning: 'operator' is None when attempting to set 'operator_id'.")
 
@@ -1644,6 +1661,7 @@ class ASSETIFY_OT_save_and_continue(bpy.types.Operator):
     bl_label = "Save and Continue"
 
     operator_id: bpy.props.StringProperty()  # Store the original operator's ID
+    operator_args: bpy.props.StringProperty(default="{}")  # Store the original operator's arguments
 
     def execute(self, context):
         # Save the file
@@ -1661,7 +1679,7 @@ class ASSETIFY_OT_save_and_continue(bpy.types.Operator):
             self.report({'ERROR'}, f"Invalid operator ID: {self.operator_id}")
             return {'CANCELLED'}
 
-        # Dynamically call the operator using the correct ID
+        # Dynamically call the operator using the correct ID and arguments
         try:
             # Safely access the operator without using eval
             operator_path = self.operator_id.split('.')
@@ -1669,8 +1687,16 @@ class ASSETIFY_OT_save_and_continue(bpy.types.Operator):
             for attr in operator_path:
                 op = getattr(op, attr)
 
-            # Call the operator with 'INVOKE_DEFAULT'
-            result = op('INVOKE_DEFAULT')
+            import json
+            kwargs = {}
+            if self.operator_args:
+                try:
+                    kwargs = json.loads(self.operator_args)
+                except Exception:
+                    kwargs = {}
+
+            # Call the operator with 'INVOKE_DEFAULT' and preserved arguments
+            result = op('INVOKE_DEFAULT', **kwargs)
 
             if 'CANCELLED' not in result:
                 # Operator is running or has finished successfully
@@ -1688,6 +1714,7 @@ class ASSETIFY_OT_proceed_without_saving(bpy.types.Operator):
     bl_label = "Don't Save & Proceed"
 
     operator_id: bpy.props.StringProperty()  # Store the original operator's ID
+    operator_args: bpy.props.StringProperty(default="{}")  # Store the original operator's arguments
 
     def execute(self, context):
         # Set a flag to indicate the user chose to proceed without saving
@@ -1698,7 +1725,7 @@ class ASSETIFY_OT_proceed_without_saving(bpy.types.Operator):
             self.report({'ERROR'}, f"Invalid operator ID: {self.operator_id}")
             return {'CANCELLED'}
 
-        # Dynamically call the operator using the correct ID
+        # Dynamically call the operator using the correct ID and arguments
         try:
             # Access the operator path
             operator_path = self.operator_id.split('.')
@@ -1706,8 +1733,16 @@ class ASSETIFY_OT_proceed_without_saving(bpy.types.Operator):
             for attr in operator_path:
                 op = getattr(op, attr)
 
-            # Call the operator without extra keyword arguments
-            result = op('INVOKE_DEFAULT')
+            import json
+            kwargs = {}
+            if self.operator_args:
+                try:
+                    kwargs = json.loads(self.operator_args)
+                except Exception:
+                    kwargs = {}
+
+            # Call the operator with 'INVOKE_DEFAULT' and preserved arguments
+            result = op('INVOKE_DEFAULT', **kwargs)
 
             if 'CANCELLED' not in result:
                 # Operator ran successfully
@@ -1784,7 +1819,7 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
             ('SELECTED', "From Selection", "Process collections from selected objects or Outliner"),
             ('LIST', "From List", "Process collections from the asset_collections list"),
         ],
-        default='DROPDOWN'
+        default='SELECTED'
     )
 
     # Variables for modal operation
