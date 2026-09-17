@@ -9302,9 +9302,10 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 else:
                     proc_txt = "Process Collection"
                     proc_icon = 'FORWARD'
-                op_add = r_pick.operator("object.convert_to_game_ready", text=proc_txt, icon=proc_icon)
+                sub_pick = r_pick.row(align=True)
+                sub_pick.enabled = (assetify_settings.source_collection is not None)
+                op_add = sub_pick.operator("object.convert_to_game_ready", text=proc_txt, icon=proc_icon)
                 op_add.source = 'DROPDOWN'
-                op_add.enabled = (assetify_settings.source_collection is not None)
 
                 # Row 2: Selection button
                 r_sel = in_box.row(align=True)
