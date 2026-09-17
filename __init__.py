@@ -46,7 +46,6 @@ import addon_utils
 import glob
 from collections import deque
 from . import non_principled_baking
-from . import viewport_queue_drawer
 
 # Define a global dictionary to store the custom icon previews
 custom_icons = None
@@ -3406,6 +3405,16 @@ def apply_global_animation_setting(assetify_settings):
             print(f"[DEBUG] Set animation processing for '{asset.name}' to {assetify_settings.process_animations_global}.")    
 
 class AssetifyBakeSettings(bpy.types.PropertyGroup):
+    
+    main_view_mode: bpy.props.EnumProperty(
+        name="Main View Mode",
+        description="Switch between dedicated full-width Asset Queue view and Pipeline Steps view",
+        items=[
+            ('STEPS', "Pipeline Steps", "Show the 4-step pipeline: Setup, Bake, Proxies, Export", 'TOOL_SETTINGS', 0),
+            ('QUEUE', "Asset Queue", "Show dedicated full-width asset queue and collection intake", 'OUTLINER_OB_MESH', 1),
+        ],
+        default='STEPS'
+    )
     
     uv_mode: bpy.props.EnumProperty(
         name="UV Mode",
@@ -9208,6 +9217,19 @@ class ASSETIFY_OT_toggle_side_queue(bpy.types.Operator):
         settings.show_side_queue = not settings.show_side_queue
         return {'FINISHED'}
 
+class ASSETIFY_OT_switch_main_view(bpy.types.Operator):
+    """Switch between dedicated full-width Asset Queue view and Pipeline Steps view"""
+    bl_idname = "assetify.switch_main_view"
+    bl_label = "Switch View"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: bpy.props.StringProperty(default='STEPS')
+
+    def execute(self, context):
+        settings = context.scene.assetify_bake_settings
+        settings.main_view_mode = self.mode
+        return {'FINISHED'}
+
 class ASSETIFY_OT_focus_step(bpy.types.Operator):
     """Focus or toggle a workflow pipeline step"""
     bl_idname = "assetify.focus_step"
@@ -9219,6 +9241,7 @@ class ASSETIFY_OT_focus_step(bpy.types.Operator):
     def execute(self, context):
         settings = context.scene.assetify_bake_settings
         settings.active_pipeline_step = self.step
+        settings.main_view_mode = 'STEPS'
         if self.step == '1':
             settings.show_bake_mode_menu = True
             settings.bake_menu_expanded = False
@@ -9296,9 +9319,12 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             total = count_top_level_collections(settings.baked_collections)
             selected = sum(1 for c in settings.baked_collections if c.include_in_send and get_collection_level(c.name) == 0)
         if total > 0:
-            layout.label(text=f"({selected}/{total} Active)")
-        layout.operator("assetify.toggle_viewport_drawer", text="", icon='MENU_PANEL')
-        layout.popover(panel="ASSETIFY_PT_queue_popover", text="", icon='WINDOW')
+            layout.label(text=f"({selected}/{total})")
+        main_mode = getattr(settings, "main_view_mode", "STEPS")
+        target_mode = 'STEPS' if main_mode == 'QUEUE' else 'QUEUE'
+        icon = 'TOOL_SETTINGS' if main_mode == 'QUEUE' else 'OUTLINER_OB_MESH'
+        op = layout.operator("assetify.switch_main_view", text="", icon=icon)
+        op.mode = target_mode
 
     @classmethod
     def draw_full_queue(cls, self_or_none, layout, assetify_settings):
@@ -9434,8 +9460,8 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         else:
             label_text = f"{letter_prefix}. Target Assets to {action_label} ({badge})"
         t_head.label(text=label_text, icon=status_icon)
-        t_head.operator("assetify.toggle_viewport_drawer", text="", icon='MENU_PANEL')
-        t_head.popover(panel="ASSETIFY_PT_queue_popover", text="", icon='WINDOW')
+        op_goto = t_head.operator("assetify.switch_main_view", text="", icon='FULLSCREEN_ENTER')
+        op_goto.mode = 'QUEUE'
 
         if is_expanded:
             sub = t_box.column(align=False)
@@ -9546,6 +9572,135 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             del_op = "assetify.delete_selected_assets" if assetify_settings.asset_mode == 'ASSET' else "assetify.delete_selected_collections"
             del_col.operator(del_op, text="Delete Selected", icon='TRASH')
 
+    def draw_dedicated_queue_view(self, layout, assetify_settings):
+        """Renders the dedicated full-width Asset Queue & Collection Intake workspace."""
+        if assetify_settings.asset_mode == 'ASSET':
+            total = len(assetify_settings.baked_assets)
+            active = sum(1 for a in assetify_settings.baked_assets if a.include_in_send)
+        else:
+            total = count_top_level_collections(assetify_settings.baked_collections)
+            active = sum(1 for c in assetify_settings.baked_collections if c.include_in_send and get_collection_level(c.name) == 0)
+
+        # Mode Switcher (Asset Mode vs Collection Mode)
+        sw_box = layout.box()
+        sw_head = sw_box.row(align=True)
+        badge = f"{active} of {total} Selected" if total > 0 else "Queue is Empty"
+        sw_head.label(text=f"Queue Mode ({badge})", icon='OUTLINER_OB_MESH')
+        sw_row = sw_box.row(align=True)
+        sw_row.scale_y = 1.15
+        sw_row.operator("assetify.switch_mode", text="Asset Mode", icon='OBJECT_DATA', depress=(assetify_settings.asset_mode == 'ASSET')).mode = 'ASSET'
+        sw_row.operator("assetify.switch_mode", text="Collection Mode", icon='OUTLINER_COLLECTION', depress=(assetify_settings.asset_mode == 'COLLECTION')).mode = 'COLLECTION'
+
+        # Intake Box (Process Collection or Selected)
+        in_box = layout.box()
+        in_head = in_box.row(align=True)
+        in_head.label(text="Intake: Process Collections or Objects to Queue", icon='COLLECTION_NEW')
+
+        # Row 1: Collection Dropdown + Process
+        r_pick = in_box.row(align=True)
+        r_pick.prop_search(assetify_settings, "source_collection", bpy.data, "collections", text="", icon='OUTLINER_COLLECTION')
+        if assetify_settings.bake_mode == 'ANIMATION':
+            proc_txt = "Process Anim"
+            proc_icon = 'FORWARD'
+        else:
+            proc_txt = "Process Collection"
+            proc_icon = 'FORWARD'
+        sub_pick = r_pick.row(align=True)
+        sub_pick.enabled = (assetify_settings.source_collection is not None)
+        op_add = sub_pick.operator("object.convert_to_game_ready", text=proc_txt, icon=proc_icon)
+        op_add.source = 'DROPDOWN'
+
+        # Row 2: Selected in 3D Viewport
+        r_sel = in_box.row(align=True)
+        r_sel.scale_y = 1.1
+        op_sel = r_sel.operator("object.convert_to_game_ready", text="Process Selected in Viewport / Outliner", icon='RESTRICT_SELECT_OFF')
+        op_sel.source = 'SELECTED'
+
+        layout.separator(factor=0.5)
+
+        # Queue Table Header & Controls
+        q_box = layout.box()
+        q_head = q_box.row(align=True)
+        q_head.label(text=f"Master Asset Queue ({total} Items)", icon='OUTLINER')
+
+        # Batch Selection Controls
+        sel_row = q_box.row(align=True)
+        op = sel_row.operator("assetify.toggle_select_assets", text="All")
+        op.action = 'SELECT'
+        op = sel_row.operator("assetify.toggle_select_assets", text="None")
+        op.action = 'DESELECT'
+        op = sel_row.operator("assetify.toggle_select_assets", text="Invert")
+        op.action = 'INVERT'
+        sel_row.label(text=f"{active}/{total} Active")
+
+        if total == 0:
+            hint_box = q_box.box()
+            hint_col = hint_box.column(align=True)
+            hint_col.label(text="No assets in queue yet.", icon='INFO')
+            hint_col.label(text="Select a collection or objects above and click 'Process'.")
+        else:
+            # Full width template list with generous rows (8-12)
+            if assetify_settings.asset_mode == 'ASSET':
+                header = q_box.row(align=True)
+                split = header.split(factor=0.12)
+                split.label(text="", icon='CHECKMARK')
+                split = split.split(factor=0.45 / 0.88)
+                split.label(text="Asset Name")
+                remaining = split.split(factor=0.5)
+                remaining.label(text="Bake", icon='NODE_TEXTURE')
+                remaining.label(text="File", icon='FILE_TICK')
+
+                num_rows = min(max(total, 6), 12)
+                q_box.template_list(
+                    "ASSETIFY_UL_baked_assets",
+                    "dedicated_queue_assets",
+                    assetify_settings,
+                    "baked_assets",
+                    assetify_settings,
+                    "active_baked_asset_index",
+                    rows=num_rows
+                )
+            else:
+                header = q_box.row(align=True)
+                split = header.split(factor=0.12)
+                split.label(text="", icon='CHECKMARK')
+                split = split.split(factor=0.45 / 0.88)
+                split.label(text="Collection Name")
+                remaining = split.split(factor=0.33)
+                remaining.label(text="Swap", icon='ARROW_LEFTRIGHT')
+                remaining = remaining.split(factor=0.5)
+                remaining.label(text="Bake", icon='NODE_TEXTURE')
+                remaining.label(text="File", icon='FILE_TICK')
+
+                num_rows = min(max(total, 6), 12)
+                q_box.template_list(
+                    "ASSETIFY_UL_collection_list",
+                    "dedicated_queue_colls",
+                    assetify_settings,
+                    "baked_collections",
+                    assetify_settings,
+                    "active_baked_collection_index",
+                    rows=num_rows
+                )
+
+            # Action Row (Refresh & Delete Selected)
+            act_row = q_box.row(align=True)
+            act_row.operator("assetify.refresh_asset_collection_list", text="Refresh", icon='FILE_REFRESH')
+            del_col = act_row.column()
+            del_col.alert = True
+            del_col.enabled = active > 0
+            del_op = "assetify.delete_selected_assets" if assetify_settings.asset_mode == 'ASSET' else "assetify.delete_selected_collections"
+            del_col.operator(del_op, text="Delete Selected", icon='TRASH')
+
+        layout.separator(factor=1.0)
+
+        # Bottom Proceed Navigation
+        foot_box = layout.box()
+        foot_col = foot_box.column(align=True)
+        foot_col.scale_y = 1.35
+        op_proceed = foot_col.operator("assetify.focus_step", text="Proceed to Step 2: Bake →", icon='FORWARD')
+        op_proceed.step = '2'
+
     def draw_target_summary_bar(self, layout, assetify_settings, action_label="Bake"):
         """Backward-compatible wrapper."""
         self.draw_target_selection_submenu(layout, assetify_settings, action_label=action_label, letter_prefix="A", expanded_prop_name="show_quick_target_select")
@@ -9558,12 +9713,8 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         addon_updater_ops.check_for_update_background()
 
         # =========================================================================
-        # HEADER TOOLBAR: VIEWPORT COMPARE & QUEUE POPOVER
+        # 1. VIEW MODE SWITCHER (PIPELINE STEPS vs ASSET QUEUE)
         # =========================================================================
-        vp_box = layout.box()
-        vp_row = vp_box.row(align=True)
-        
-        # Popover Queue Drawer
         if assetify_settings.asset_mode == 'ASSET':
             total_q = len(assetify_settings.baked_assets)
             selected_q = sum(1 for a in assetify_settings.baked_assets if a.include_in_send)
@@ -9571,31 +9722,37 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             total_q = count_top_level_collections(assetify_settings.baked_collections)
             selected_q = sum(1 for c in assetify_settings.baked_collections if c.include_in_send and get_collection_level(c.name) == 0)
 
-        q_txt = f"Queue ({selected_q}/{total_q})" if total_q > 0 else "Queue"
-        vp_row.operator(
-            "assetify.toggle_viewport_drawer",
-            text=q_txt,
-            icon='MENU_PANEL'
-        )
-        vp_row.popover(
-            panel="ASSETIFY_PT_queue_popover",
-            text="",
-            icon='DOWNARROW_HLT'
-        )
-        
-        vp_row.separator()
-        
-        vp_row.label(text="Compare:", icon='HIDE_OFF')
+        main_mode = getattr(assetify_settings, "main_view_mode", "STEPS")
+        q_label = f"Queue ({selected_q}/{total_q})" if total_q > 0 else "Asset Queue"
+
+        vm_box = layout.box()
+        vm_row = vm_box.row(align=True)
+        vm_row.scale_y = 1.3
+        op_steps = vm_row.operator("assetify.switch_main_view", text="Pipeline Steps", icon='TOOL_SETTINGS', depress=(main_mode == 'STEPS'))
+        op_steps.mode = 'STEPS'
+        op_q = vm_row.operator("assetify.switch_main_view", text=q_label, icon='OUTLINER_OB_MESH', depress=(main_mode == 'QUEUE'))
+        op_q.mode = 'QUEUE'
+
+        # Viewport Compare Bar
+        comp_row = vm_box.row(align=True)
+        comp_row.label(text="Compare:", icon='HIDE_OFF')
         current_vp_mode = getattr(scene, "assetify_viewport_mode", "BAKED")
         
-        op = vp_row.operator("assetify.viewport_compare", text="Original", depress=(current_vp_mode == 'ORIGINAL'))
+        op = comp_row.operator("assetify.viewport_compare", text="Original", depress=(current_vp_mode == 'ORIGINAL'))
         op.mode = 'ORIGINAL'
-        op = vp_row.operator("assetify.viewport_compare", text="Baked", depress=(current_vp_mode == 'BAKED'))
+        op = comp_row.operator("assetify.viewport_compare", text="Baked", depress=(current_vp_mode == 'BAKED'))
         op.mode = 'BAKED'
-        op = vp_row.operator("assetify.viewport_compare", text="Split", icon='ARROW_LEFTRIGHT', depress=(current_vp_mode == 'SIDE_BY_SIDE'))
+        op = comp_row.operator("assetify.viewport_compare", text="Split", icon='ARROW_LEFTRIGHT', depress=(current_vp_mode == 'SIDE_BY_SIDE'))
         op.mode = 'SIDE_BY_SIDE'
 
-        layout.separator(factor=1.5)
+        layout.separator(factor=1.0)
+
+        # =========================================================================
+        # VIEW 1: DEDICATED FULL-WIDTH ASSET QUEUE WORKSPACE
+        # =========================================================================
+        if main_mode == 'QUEUE':
+            self.draw_dedicated_queue_view(layout, assetify_settings)
+            return
 
         # =========================================================================
         # TOP PIPELINE STEPPER BAR (LANDSCAPE NAVIGATION)
@@ -10442,6 +10599,7 @@ classes = (
     OBJECT_OT_convert_to_game_ready,
     ASSETIFY_OT_toggle_select_assets,
     ASSETIFY_OT_toggle_side_queue,
+    ASSETIFY_OT_switch_main_view,
     ASSETIFY_OT_focus_step,
     ASSETIFY_PT_queue_popover,
     ASSETIFY_PT_tools_panel,
@@ -10529,12 +10687,6 @@ def register():
         print("[INFO] pivot_tool registered successfully.")
     except Exception as e:
         print(f"[ERROR] Failed to register pivot_tool: {e}")
-
-    try:
-        viewport_queue_drawer.register()
-        print("[INFO] viewport_queue_drawer registered successfully.")
-    except Exception as e:
-        print(f"[ERROR] Failed to register viewport_queue_drawer: {e}")
     
     # Register Scene property for the toggle (Keep this in init.py)
     bpy.types.Scene.show_lod_manager = bpy.props.BoolProperty(default=False)
@@ -10625,11 +10777,6 @@ def unregister():
         pivot_tool.unregister()
     except Exception as e:
         print(f"[INFO] pivot_tool was not registered: {e}")
-
-    try:
-        viewport_queue_drawer.unregister()
-    except Exception as e:
-        print(f"[INFO] viewport_queue_drawer was not registered: {e}")
 
     # Unregister addon updater operations
     addon_updater_ops.unregister()
