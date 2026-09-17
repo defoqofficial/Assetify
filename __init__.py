@@ -1610,14 +1610,23 @@ def ensure_file_saved(operator, context):
             if operator:
                 import json
                 args = {}
-                for k in operator.bl_rna.properties.keys():
-                    if k not in {'rna_type'}:
-                        try:
-                            val = getattr(operator, k, None)
-                            if isinstance(val, (str, int, float, bool)):
-                                args[k] = val
-                        except Exception:
-                            pass
+                try:
+                    raw_args = operator.as_keywords() if hasattr(operator, 'as_keywords') else {}
+                    for k, val in raw_args.items():
+                        if isinstance(val, (str, int, float, bool)):
+                            args[k] = val
+                except Exception as ex:
+                    print(f"Error reading operator arguments via as_keywords: {ex}")
+
+                # Exclude internal properties and any standard Operator RNA properties
+                excluded_keys = {
+                    'rna_type', 'name', 'properties', 'has_reports', 'bl_idname', 'bl_label',
+                    'bl_translation_context', 'bl_description', 'bl_undo_group', 'bl_options',
+                    'bl_cursor_pending', 'layout', 'options', 'macros', 'progress_value'
+                }
+                for ek in excluded_keys:
+                    args.pop(ek, None)
+
                 args_json = json.dumps(args)
 
             # "Save Now" button
@@ -1696,7 +1705,11 @@ class ASSETIFY_OT_save_and_continue(bpy.types.Operator):
                     kwargs = {}
 
             # Call the operator with 'INVOKE_DEFAULT' and preserved arguments
-            result = op('INVOKE_DEFAULT', **kwargs)
+            try:
+                result = op('INVOKE_DEFAULT', **kwargs)
+            except TypeError as te:
+                print(f"Warning: failed to call {self.operator_id} with kwargs {kwargs}: {te}. Calling without kwargs.")
+                result = op('INVOKE_DEFAULT')
 
             if 'CANCELLED' not in result:
                 # Operator is running or has finished successfully
@@ -1742,7 +1755,11 @@ class ASSETIFY_OT_proceed_without_saving(bpy.types.Operator):
                     kwargs = {}
 
             # Call the operator with 'INVOKE_DEFAULT' and preserved arguments
-            result = op('INVOKE_DEFAULT', **kwargs)
+            try:
+                result = op('INVOKE_DEFAULT', **kwargs)
+            except TypeError as te:
+                print(f"Warning: failed to call {self.operator_id} with kwargs {kwargs}: {te}. Calling without kwargs.")
+                result = op('INVOKE_DEFAULT')
 
             if 'CANCELLED' not in result:
                 # Operator ran successfully
