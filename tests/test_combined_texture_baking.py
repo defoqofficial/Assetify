@@ -198,6 +198,98 @@ def run_test():
         assert "TestGroup_BaseColor.png" not in files, "TestGroup_BaseColor.png should NOT exist in INDIVIDUAL mode!"
 
         print(">>> TEST 2 (INDIVIDUAL) PASSED SUCCESSFULLY! <<<")
+
+        # ----------------------------------------------------
+        # TEST 3: ATLAS UV SCALING MODES & PER-OBJECT WEIGHTS
+        # ----------------------------------------------------
+        print("\n--- TEST 3: ATLAS UV SCALING MODES & PER-OBJECT WEIGHTS ---")
+        import bmesh
+        import sys
+        assetify_mod = sys.modules.get("Assetify-master") or sys.modules.get("Assetify")
+        smart_uv_project_combined = assetify_mod.smart_uv_project_combined
+
+        def get_uv_area(obj):
+            bm = bmesh.new()
+            bm.from_mesh(obj.data)
+            uv_l = bm.loops.layers.uv.get("GameUV")
+            assert uv_l is not None, f"GameUV missing on {obj.name}"
+            total_uv_area = 0.0
+            for f in bm.faces:
+                uv_pts = [l[uv_l].uv for l in f.loops]
+                n = len(uv_pts)
+                total_uv_area += 0.5 * abs(sum(uv_pts[i].x * (uv_pts[(i+1)%n].y - uv_pts[(i-1)%n].y) for i in range(n)))
+            bm.free()
+            return total_uv_area
+
+        # Clean scene for geometry testing
+        for obj in list(bpy.data.objects):
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0))
+        c_small = bpy.context.active_object
+        c_small.name = "Cube_Small"
+
+        bpy.ops.mesh.primitive_cube_add(size=4.0, location=(10, 0, 0))
+        c_large = bpy.context.active_object
+        c_large.name = "Cube_Large"
+
+        test_mesh_objs = [c_small, c_large]
+
+        # Case 3A: SURFACE_AREA mode (Default: Large has 16x area of Small)
+        settings.combined_uv_scale_mode = 'SURFACE_AREA'
+        c_small.assetify_uv_weight = 1.0
+        c_large.assetify_uv_weight = 1.0
+        smart_uv_project_combined(test_mesh_objs)
+
+        area_s = get_uv_area(c_small)
+        area_l = get_uv_area(c_large)
+        ratio_surface = area_l / max(area_s, 1e-6)
+        print(f"SURFACE_AREA UV Areas -> Small: {area_s:.5f}, Large: {area_l:.5f} (Ratio: {ratio_surface:.2f})")
+        assert 12.0 < ratio_surface < 20.0, f"Expected ratio ~16.0, got {ratio_surface:.2f}"
+
+        # Case 3B: EQUAL mode (Equalized: Small and Large have equal area, ratio ~1.0)
+        settings.combined_uv_scale_mode = 'EQUAL'
+        c_small.assetify_uv_weight = 1.0
+        c_large.assetify_uv_weight = 1.0
+        smart_uv_project_combined(test_mesh_objs)
+
+        area_s = get_uv_area(c_small)
+        area_l = get_uv_area(c_large)
+        ratio_equal = area_l / max(area_s, 1e-6)
+        print(f"EQUAL UV Areas -> Small: {area_s:.5f}, Large: {area_l:.5f} (Ratio: {ratio_equal:.2f})")
+        assert 0.8 < ratio_equal < 1.25, f"Expected ratio ~1.0, got {ratio_equal:.2f}"
+
+        # Case 3C: BOUNDS mode (Ratio ~16.0 for cubes since bounds ratio is 4.0 -> area ratio 16.0)
+        settings.combined_uv_scale_mode = 'BOUNDS'
+        c_small.assetify_uv_weight = 1.0
+        c_large.assetify_uv_weight = 1.0
+        smart_uv_project_combined(test_mesh_objs)
+
+        area_s = get_uv_area(c_small)
+        area_l = get_uv_area(c_large)
+        ratio_bounds = area_l / max(area_s, 1e-6)
+        print(f"BOUNDS UV Areas -> Small: {area_s:.5f}, Large: {area_l:.5f} (Ratio: {ratio_bounds:.2f})")
+        assert 12.0 < ratio_bounds < 20.0, f"Expected ratio ~16.0, got {ratio_bounds:.2f}"
+
+        # Case 3D: Per-Object UV Weight multiplier
+        # In EQUAL mode, set Small cube weight to 2.0x (meaning 2x linear scale -> 4x UV area)
+        settings.combined_uv_scale_mode = 'EQUAL'
+        c_small.assetify_uv_weight = 2.0
+        c_large.assetify_uv_weight = 1.0
+        smart_uv_project_combined(test_mesh_objs)
+
+        area_s = get_uv_area(c_small)
+        area_l = get_uv_area(c_large)
+        ratio_weight = area_s / max(area_l, 1e-6)
+        print(f"WEIGHT (Small=2.0, Large=1.0) UV Areas -> Small: {area_s:.5f}, Large: {area_l:.5f} (Ratio S/L: {ratio_weight:.2f})")
+        assert 3.0 < ratio_weight < 5.0, f"Expected ratio ~4.0, got {ratio_weight:.2f}"
+
+        # Case 3E: Reset Operator
+        bpy.ops.assetify.reset_uv_weights()
+        assert c_small.assetify_uv_weight == 1.0, "Reset failed to restore c_small weight to 1.0"
+        print("Reset UV Weights operator verified successfully.")
+
+        print(">>> TEST 3 (ATLAS SCALING MODES & WEIGHTS) PASSED SUCCESSFULLY! <<<")
         print("\nALL UNIT TESTS PASSED!")
 
     finally:

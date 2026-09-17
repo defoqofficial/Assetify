@@ -641,6 +641,8 @@ def populate_baked_assets_from_scene(assetify_settings):
                     for col in assetify_settings.baked_collections
                     for asset in col.assets
                 )
+                if hasattr(obj, "assetify_uv_weight"):
+                    baked_asset.uv_weight = obj.assetify_uv_weight
 
                 print(f"[DEBUG] Added '{obj.name}' to baked assets list with baked status '{baked_asset.is_baked}'.")
 
@@ -803,6 +805,26 @@ def process_asset_in_collection(assetify_settings, obj, baked_collection):
 
     # Debug output for asset processing
     print(f"[DEBUG] Added '{obj.name}' to baked_assets in '{baked_collection.name}' collection.")
+
+class ASSETIFY_OT_reset_uv_weights(bpy.types.Operator):
+    """Reset all Atlas UV Weights to 1.0"""
+    bl_idname = "assetify.reset_uv_weights"
+    bl_label = "Reset UV Weights"
+    bl_description = "Reset all object and asset Atlas UV Weights back to 1.0"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = getattr(context.scene, "assetify_bake_settings", None)
+        if settings:
+            for asset in settings.baked_assets:
+                asset.uv_weight = 1.0
+            for coll in settings.baked_collections:
+                coll.uv_weight = 1.0
+        for obj in bpy.data.objects:
+            if hasattr(obj, "assetify_uv_weight"):
+                obj.assetify_uv_weight = 1.0
+        self.report({'INFO'}, "Reset all Atlas UV Weights to 1.0")
+        return {'FINISHED'}
 
 class ASSETIFY_OT_switch_mode(bpy.types.Operator):
     """Switch between Asset and Collection modes in the panel"""
@@ -1221,6 +1243,28 @@ class CustomAssetItem(bpy.types.PropertyGroup):
     is_baked: bpy.props.BoolProperty(default=False)
     include_in_send: bpy.props.BoolProperty(default=False)
 
+def update_asset_uv_weight(self, context):
+    try:
+        obj = bpy.data.objects.get(self.name)
+        if not obj:
+            obj = bpy.data.objects.get(self.name.replace("_gameasset", ""))
+        if obj and hasattr(obj, "assetify_uv_weight"):
+            if abs(obj.assetify_uv_weight - self.uv_weight) > 1e-4:
+                obj.assetify_uv_weight = self.uv_weight
+    except Exception:
+        pass
+
+def update_collection_uv_weight(self, context):
+    try:
+        col = bpy.data.collections.get(self.name)
+        if col:
+            for obj in col.all_objects:
+                if hasattr(obj, "assetify_uv_weight"):
+                    if abs(obj.assetify_uv_weight - self.uv_weight) > 1e-4:
+                        obj.assetify_uv_weight = self.uv_weight
+    except Exception:
+        pass
+
 class BakedAssetItem(bpy.types.PropertyGroup):
     """PropertyGroup for individual baked assets"""
     name: bpy.props.StringProperty(name="Asset Name")
@@ -1229,6 +1273,16 @@ class BakedAssetItem(bpy.types.PropertyGroup):
     is_fbx_exported: bpy.props.BoolProperty(name="Is FBX Exported", default=False)
     include_in_send: bpy.props.BoolProperty(name="Include in Send", default=False)
     collection_name: bpy.props.StringProperty(name="Collection Name")
+    uv_weight: bpy.props.FloatProperty(
+        name="Atlas UV Weight",
+        description="Relative resolution weight in combined texture atlas (1.0 = standard, 2.0 = 2x linear resolution)",
+        default=1.0,
+        min=0.1,
+        max=10.0,
+        step=10,
+        precision=2,
+        update=update_asset_uv_weight
+    )
 
 def update_include_in_send(self, context):
     """Update include_in_send status for collection and propagate to its hierarchy."""
@@ -1269,6 +1323,17 @@ class BakedCollectionItem(bpy.types.PropertyGroup):
         name="Is FBX Exported",
         description="Indicates if the collection has been exported as FBX",
         default=False
+    )
+    
+    uv_weight: bpy.props.FloatProperty(
+        name="Atlas UV Weight",
+        description="Relative resolution weight for this collection in combined texture atlas (1.0 = standard, 2.0 = 2x linear resolution)",
+        default=1.0,
+        min=0.1,
+        max=10.0,
+        step=10,
+        precision=2,
+        update=update_collection_uv_weight
     )
     
     include_in_send: bpy.props.BoolProperty(
@@ -3646,6 +3711,17 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
         default='INDIVIDUAL'
     )
     
+    combined_uv_scale_mode: bpy.props.EnumProperty(
+        name="Atlas UV Scaling",
+        description="Strategy for distributing UV space across objects in combined atlas mode",
+        items=[
+            ('SURFACE_AREA', "Physical Surface Area", "UV size proportional to 3D surface area (Uniform Texel Density)", 'SNAP_FACE', 0),
+            ('BOUNDS', "Object Dimensions (Bounds)", "UV size proportional to object 3D bounding box dimensions", 'CUBE', 1),
+            ('EQUAL', "Equal Share per Object", "Equalizes UV area across all objects regardless of physical size", 'ARROW_LEFTRIGHT', 2),
+        ],
+        default='SURFACE_AREA'
+    )
+    
     
     bake_format: bpy.props.EnumProperty(
         name="File Format",
@@ -5534,6 +5610,8 @@ def smart_uv_project_combined(objects):
         bpy.ops.mesh.remove_doubles(threshold=0.0001)
 
         import math as m
+        import bmesh
+
         # 1. Smart Project across all objects simultaneously
         bpy.ops.uv.smart_project(
             angle_limit=m.radians(66.0),
@@ -5543,8 +5621,75 @@ def smart_uv_project_combined(objects):
             scale_to_bounds=False
         )
 
-        # 2. Average scale across all objects
+        # 2. Average scale across all objects (sets baseline uniform texel density)
         bpy.ops.uv.average_islands_scale()
+
+        # Switch to Object mode to measure metrics and apply per-object scaling
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        def get_mesh_3d_area(obj):
+            bm = bmesh.new()
+            bm.from_mesh(obj.data)
+            area = sum(f.calc_area() for f in bm.faces)
+            bm.free()
+            return max(area, 1e-6)
+
+        def get_object_bound_size(obj):
+            dims = obj.dimensions
+            return max(max(dims.x, dims.y, dims.z), 1e-4)
+
+        def get_object_uv_weight(obj):
+            if hasattr(obj, "assetify_uv_weight") and obj.assetify_uv_weight > 0.0:
+                return obj.assetify_uv_weight
+            clean_name = obj.name.replace("_GameReady", "").replace("_gameasset", "")
+            for a in assetify_settings.baked_assets:
+                if a.name.replace("_gameasset", "") == clean_name or a.name == obj.name:
+                    return getattr(a, "uv_weight", 1.0)
+            for c in assetify_settings.baked_collections:
+                if c.name == clean_name or c.name == obj.name:
+                    return getattr(c, "uv_weight", 1.0)
+            return 1.0
+
+        scale_mode = getattr(assetify_settings, 'combined_uv_scale_mode', 'SURFACE_AREA')
+        base_factors = {}
+        if scale_mode == 'EQUAL':
+            areas = {o: get_mesh_3d_area(o) for o in valid_objs}
+            avg_sqrt = sum(m.sqrt(a) for a in areas.values()) / max(len(areas), 1)
+            for o in valid_objs:
+                base_factors[o] = avg_sqrt / m.sqrt(areas[o])
+        elif scale_mode == 'BOUNDS':
+            areas = {o: get_mesh_3d_area(o) for o in valid_objs}
+            bounds = {o: get_object_bound_size(o) for o in valid_objs}
+            raw_ratios = {o: bounds[o] / m.sqrt(areas[o]) for o in valid_objs}
+            avg_ratio = sum(raw_ratios.values()) / max(len(raw_ratios), 1)
+            for o in valid_objs:
+                base_factors[o] = raw_ratios[o] / max(avg_ratio, 1e-6)
+        else:  # SURFACE_AREA
+            for o in valid_objs:
+                base_factors[o] = 1.0
+
+        for o in valid_objs:
+            weight = get_object_uv_weight(o)
+            final_factor = base_factors[o] * weight
+            if abs(final_factor - 1.0) > 1e-4:
+                bm = bmesh.new()
+                bm.from_mesh(o.data)
+                uv_layer = bm.loops.layers.uv.get(uv_map_name)
+                if uv_layer:
+                    for face in bm.faces:
+                        for loop in face.loops:
+                            loop[uv_layer].uv *= final_factor
+                    bm.to_mesh(o.data)
+                    o.data.update()
+                bm.free()
+
+        # Switch back to multi-object Edit Mode to pack
+        bpy.ops.object.select_all(action='DESELECT')
+        for obj in valid_objs:
+            obj.select_set(True)
+        bpy.context.view_layer.objects.active = valid_objs[0]
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
 
         # 3. Pack islands into shared 0..1 UV space
         bpy.ops.uv.pack_islands(
@@ -5557,7 +5702,7 @@ def smart_uv_project_combined(objects):
         bpy.ops.object.mode_set(mode='OBJECT')
         for obj in valid_objs:
             obj["assetify_unwrapped"] = True
-        print(f"[Assetify] Successfully packed combined UVs for {len(valid_objs)} objects.")
+        print(f"[Assetify] Successfully packed combined UVs for {len(valid_objs)} objects (Mode: {scale_mode}).")
     except Exception as e:
         print(f"[Assetify] Error packing combined UVs: {e}")
         try:
@@ -10085,6 +10230,28 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                     rows=num_rows
                 )
 
+            if getattr(assetify_settings, 'texture_output_mode', 'INDIVIDUAL') == 'COMBINED':
+                w_box = sub.box()
+                w_row = w_box.row(align=True)
+                has_item = False
+                if assetify_settings.asset_mode == 'ASSET' and assetify_settings.baked_assets:
+                    idx = assetify_settings.active_baked_asset_index
+                    if 0 <= idx < len(assetify_settings.baked_assets):
+                        act_item = assetify_settings.baked_assets[idx]
+                        disp_name = act_item.name.replace("_gameasset", "")
+                        w_row.label(text=f"Atlas UV Weight ({disp_name}):", icon='GROUP_UVS')
+                        w_row.prop(act_item, "uv_weight", text="")
+                        has_item = True
+                elif assetify_settings.asset_mode == 'COLLECTION' and assetify_settings.baked_collections:
+                    idx = assetify_settings.active_baked_collection_index
+                    if 0 <= idx < len(assetify_settings.baked_collections):
+                        act_item = assetify_settings.baked_collections[idx]
+                        w_row.label(text=f"Atlas UV Weight ({act_item.name}):", icon='GROUP_UVS')
+                        w_row.prop(act_item, "uv_weight", text="")
+                        has_item = True
+                if has_item:
+                    w_row.operator("assetify.reset_uv_weights", text="", icon='LOOP_BACK')
+
             # Queue Action Buttons (Refresh & Delete Selected)
             act_row = sub.row(align=True)
             act_row.operator("assetify.refresh_asset_collection_list", text="Refresh", icon='FILE_REFRESH')
@@ -10204,6 +10371,28 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                     "active_baked_collection_index",
                     rows=num_rows
                 )
+
+            if getattr(assetify_settings, 'texture_output_mode', 'INDIVIDUAL') == 'COMBINED':
+                w_box = q_box.box()
+                w_row = w_box.row(align=True)
+                has_item = False
+                if assetify_settings.asset_mode == 'ASSET' and assetify_settings.baked_assets:
+                    idx = assetify_settings.active_baked_asset_index
+                    if 0 <= idx < len(assetify_settings.baked_assets):
+                        act_item = assetify_settings.baked_assets[idx]
+                        disp_name = act_item.name.replace("_gameasset", "")
+                        w_row.label(text=f"Atlas UV Weight ({disp_name}):", icon='GROUP_UVS')
+                        w_row.prop(act_item, "uv_weight", text="")
+                        has_item = True
+                elif assetify_settings.asset_mode == 'COLLECTION' and assetify_settings.baked_collections:
+                    idx = assetify_settings.active_baked_collection_index
+                    if 0 <= idx < len(assetify_settings.baked_collections):
+                        act_item = assetify_settings.baked_collections[idx]
+                        w_row.label(text=f"Atlas UV Weight ({act_item.name}):", icon='GROUP_UVS')
+                        w_row.prop(act_item, "uv_weight", text="")
+                        has_item = True
+                if has_item:
+                    w_row.operator("assetify.reset_uv_weights", text="", icon='LOOP_BACK')
 
             # Action Row (Refresh & Delete Selected)
             act_row = q_box.row(align=True)
@@ -10445,6 +10634,11 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 r_out.label(text="Texture Output:")
                 r_out.prop(assetify_settings, "texture_output_mode", text="")
 
+                if assetify_settings.texture_output_mode == 'COMBINED':
+                    r_scale = out_col.row(align=True)
+                    r_scale.label(text="Atlas UV Scaling:")
+                    r_scale.prop(assetify_settings, "combined_uv_scale_mode", text="")
+
                 out_col.prop(assetify_settings, "bake_folder", text="")
                 r_fmt = out_col.row(align=True)
                 r_fmt.label(text="Format / Res:")
@@ -10555,6 +10749,10 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 hw_col.separator(factor=0.5)
                 hw_col.prop(assetify_settings, "uv_mode", expand=True)
                 if assetify_settings.uv_mode == 'UNWRAP':
+                    if assetify_settings.texture_output_mode == 'COMBINED':
+                        r_scale = hw_col.row(align=True)
+                        r_scale.label(text="Atlas UV Scaling:")
+                        r_scale.prop(assetify_settings, "combined_uv_scale_mode", text="")
                     r_uvm = hw_col.row(align=True)
                     r_uvm.label(text="UV Margin:")
                     r_uvm.prop(assetify_settings, "uv_margin", text="")
@@ -11100,6 +11298,7 @@ classes = (
     ASSETIFY_OT_delete_selected_assets,
     ASSETIFY_OT_delete_selected_collections,
     ASSETIFY_OT_switch_mode,
+    ASSETIFY_OT_reset_uv_weights,
     ASSETIFY_OT_delete_bake_and_fbx_files,
     ASSETIFY_OT_import_selected_fbx,
     ASSETIFY_OT_show_unbaked_assets,
@@ -11254,6 +11453,17 @@ def register():
                 default='BAKED'
             )
             print("[INFO] assetify_viewport_mode added.")
+        if not hasattr(bpy.types.Object, "assetify_uv_weight"):
+            bpy.types.Object.assetify_uv_weight = bpy.props.FloatProperty(
+                name="Atlas UV Weight",
+                description="Relative resolution weight in combined texture atlas (1.0 = standard, 2.0 = 2x linear resolution)",
+                default=1.0,
+                min=0.1,
+                max=10.0,
+                step=10,
+                precision=2
+            )
+            print("[INFO] assetify_uv_weight added.")
     except Exception as e:
         print(f"[ERROR] Failed to add properties: {e}")
 
@@ -11334,6 +11544,8 @@ def unregister():
         del bpy.types.WindowManager.confirm_export
     if hasattr(bpy.types.Scene, "assetify_viewport_mode"):
         del bpy.types.Scene.assetify_viewport_mode
+    if hasattr(bpy.types.Object, "assetify_uv_weight"):
+        del bpy.types.Object.assetify_uv_weight
 
     # Remove handlers safely
     if load_post_handler in bpy.app.handlers.load_post:
