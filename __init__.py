@@ -3539,6 +3539,12 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
         description="Toggle the quick asset selection dropdown in pipeline steps",
         default=False
     )
+
+    show_side_queue: bpy.props.BoolProperty(
+        name="Show Side Queue",
+        description="Dock the Asset Queue side-by-side on the left in full height",
+        default=False
+    )
     
     show_advanced_setup: bpy.props.BoolProperty(
         name="Show Advanced Setup",
@@ -9190,6 +9196,17 @@ class ASSETIFY_OT_toggle_select_assets(bpy.types.Operator):
                 item.include_in_send = not item.include_in_send
         return {'FINISHED'}
 
+class ASSETIFY_OT_toggle_side_queue(bpy.types.Operator):
+    """Toggle the side-by-side Asset Queue drawer"""
+    bl_idname = "assetify.toggle_side_queue"
+    bl_label = "Toggle Side Queue"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.assetify_bake_settings
+        settings.show_side_queue = not settings.show_side_queue
+        return {'FINISHED'}
+
 class ASSETIFY_OT_focus_step(bpy.types.Operator):
     """Focus or toggle a workflow pipeline step"""
     bl_idname = "assetify.focus_step"
@@ -9261,6 +9278,121 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             selected = sum(1 for c in settings.baked_collections if c.include_in_send and get_collection_level(c.name) == 0)
         if total > 0:
             layout.label(text=f"({selected}/{total} Active)")
+        layout.prop(settings, "show_side_queue", text="", icon='SIDEBAR', emboss=False)
+
+    def draw_full_queue(self, layout, assetify_settings):
+        """Draws the full-height persistent Asset Queue drawer."""
+        if assetify_settings.asset_mode == 'ASSET':
+            total = len(assetify_settings.baked_assets)
+            active = sum(1 for a in assetify_settings.baked_assets if a.include_in_send)
+        else:
+            total = count_top_level_collections(assetify_settings.baked_collections)
+            active = sum(1 for c in assetify_settings.baked_collections if c.include_in_send and get_collection_level(c.name) == 0)
+
+        q_box = layout.box()
+
+        # Header with Title and Collapse Button
+        h_row = q_box.row(align=True)
+        h_row.label(text=f"Asset Queue ({active}/{total})", icon='OUTLINER_OB_MESH')
+        h_row.operator("assetify.toggle_side_queue", text="", icon='PANEL_CLOSE', emboss=False)
+
+        # Intake Box
+        in_box = q_box.box()
+        in_box.label(text="Intake: Process to Queue", icon='COLLECTION_NEW')
+
+        r_pick = in_box.row(align=True)
+        r_pick.prop_search(assetify_settings, "source_collection", bpy.data, "collections", text="", icon='OUTLINER_COLLECTION')
+        if assetify_settings.bake_mode == 'ANIMATION':
+            proc_txt = "Process Anim"
+            proc_icon = 'FORWARD'
+        else:
+            proc_txt = "Process Collection"
+            proc_icon = 'FORWARD'
+        sub_pick = r_pick.row(align=True)
+        sub_pick.enabled = (assetify_settings.source_collection is not None)
+        op_add = sub_pick.operator("object.convert_to_game_ready", text=proc_txt, icon=proc_icon)
+        op_add.source = 'DROPDOWN'
+
+        r_sel = in_box.row(align=True)
+        op_sel = r_sel.operator("object.convert_to_game_ready", text="Process Selected in Viewport / Outliner", icon='RESTRICT_SELECT_OFF')
+        op_sel.source = 'SELECTED'
+
+        q_box.separator(factor=0.5)
+
+        if total == 0:
+            hint_box = q_box.box()
+            hint_col = hint_box.column(align=True)
+            hint_col.label(text="No assets in queue yet.", icon='INFO')
+            hint_col.label(text="Select a collection above and click 'Process Collection'.")
+            return
+
+        # Mode Switcher (Asset Mode vs Collection Mode)
+        sw_row = q_box.row(align=True)
+        sw_row.operator("assetify.switch_mode", text="Asset Mode", icon='OBJECT_DATA', depress=(assetify_settings.asset_mode == 'ASSET')).mode = 'ASSET'
+        sw_row.operator("assetify.switch_mode", text="Collection Mode", icon='OUTLINER_COLLECTION', depress=(assetify_settings.asset_mode == 'COLLECTION')).mode = 'COLLECTION'
+
+        # Selection Controls
+        sel_row = q_box.row(align=True)
+        op = sel_row.operator("assetify.toggle_select_assets", text="All")
+        op.action = 'SELECT'
+        op = sel_row.operator("assetify.toggle_select_assets", text="None")
+        op.action = 'DESELECT'
+        op = sel_row.operator("assetify.toggle_select_assets", text="Invert")
+        op.action = 'INVERT'
+        sel_row.label(text=f"{active}/{total} Active")
+
+        # Table Header & Template List
+        if assetify_settings.asset_mode == 'ASSET':
+            header = q_box.row(align=True)
+            split = header.split(factor=0.15)
+            split.label(text="", icon='CHECKMARK')
+            split = split.split(factor=0.4 / 0.85)
+            split.label(text="Asset Name")
+            remaining = split.split(factor=0.5)
+            remaining.label(text="Bake", icon='NODE_TEXTURE')
+            remaining.label(text="File", icon='FILE_TICK')
+
+            num_rows = min(max(total, 6), 12)
+            q_box.template_list(
+                "ASSETIFY_UL_baked_assets",
+                "side_drawer_assets",
+                assetify_settings,
+                "baked_assets",
+                assetify_settings,
+                "active_baked_asset_index",
+                rows=num_rows
+            )
+        else:
+            header = q_box.row(align=True)
+            split = header.split(factor=0.15)
+            split.label(text="", icon='CHECKMARK')
+            split = split.split(factor=0.4 / 0.9)
+            split.label(text="Collection Name")
+            remaining = split.split(factor=0.33)
+            remaining.label(text="Swap", icon='ARROW_LEFTRIGHT')
+            remaining = remaining.split(factor=0.5)
+            remaining.label(text="Bake", icon='NODE_TEXTURE')
+            remaining.label(text="File", icon='FILE_TICK')
+
+            num_rows = min(max(total, 6), 12)
+            q_box.template_list(
+                "ASSETIFY_UL_collection_list",
+                "side_drawer_colls",
+                assetify_settings,
+                "baked_collections",
+                assetify_settings,
+                "active_baked_collection_index",
+                rows=num_rows
+            )
+
+        # Queue Action Buttons (Refresh & Delete Selected)
+        act_row = q_box.row(align=True)
+        act_row.operator("assetify.refresh_asset_collection_list", text="Refresh", icon='FILE_REFRESH')
+        del_col = act_row.column()
+        del_col.alert = True
+        del_col.enabled = active > 0
+        del_op = "assetify.delete_selected_assets" if assetify_settings.asset_mode == 'ASSET' else "assetify.delete_selected_collections"
+        del_col.operator(del_op, text="Delete Selected", icon='TRASH')
 
     def draw_target_selection_submenu(self, layout, assetify_settings, action_label="Bake", letter_prefix="A", expanded_prop_name="show_quick_target_select", show_intake=False):
         """Draws the complete target asset selection as an A-Z lettered submenu collapsed by default."""
@@ -9406,10 +9538,18 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         addon_updater_ops.check_for_update_background()
 
         # =========================================================================
-        # HEADER TOOLBAR: VIEWPORT COMPARE
+        # HEADER TOOLBAR: VIEWPORT COMPARE & QUEUE DRAWER TOGGLE
         # =========================================================================
         vp_box = layout.box()
         vp_row = vp_box.row(align=True)
+        
+        # Pinned Queue Drawer Toggle
+        side_q_icon = 'PANEL_CLOSE' if assetify_settings.show_side_queue else 'SIDEBAR'
+        side_q_text = "Close Queue" if assetify_settings.show_side_queue else "Asset Queue"
+        vp_row.operator("assetify.toggle_side_queue", text=side_q_text, icon=side_q_icon, depress=assetify_settings.show_side_queue)
+        
+        vp_row.separator()
+        
         vp_row.label(text="Compare:", icon='HIDE_OFF')
         current_vp_mode = getattr(scene, "assetify_viewport_mode", "BAKED")
         
@@ -9452,6 +9592,18 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         layout.separator(factor=1.5)
 
         # =========================================================================
+        # MAIN CONTENT LAYOUT (SPLIT INTO DUAL COLUMNS IF SIDE QUEUE PINNED)
+        # =========================================================================
+        if assetify_settings.show_side_queue:
+            split = layout.split(factor=0.46, align=False)
+            left_col = split.column(align=False)
+            right_col = split.column(align=False)
+            self.draw_full_queue(left_col, assetify_settings)
+            content_layout = right_col
+        else:
+            content_layout = layout
+
+        # =========================================================================
         # STEP 1: SETUP & ASSETS
         # =========================================================================
         if cur_step in {'1', 'ALL'}:
@@ -9462,7 +9614,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
 
             badge_step1 = f"({total_assets} Ready)" if total_assets > 0 else "(Empty Queue)"
             
-            step1_box = layout.box()
+            step1_box = content_layout.box()
             s1_head = step1_box.row(align=True)
             s1_head.label(text=f"Step 1: Setup & Assets  {badge_step1}", icon="GEOMETRY_SET")
 
@@ -9482,23 +9634,25 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 ab.mode = 'ANIMATION'
 
             # --- B. Asset Queue Submenu (Intake Bar + Full Queue) ---
-            self.draw_target_selection_submenu(
-                col1,
-                assetify_settings,
-                action_label="Queue",
-                letter_prefix="B",
-                expanded_prop_name="step1_b_queue_expanded",
-                show_intake=True
-            )
+            if not assetify_settings.show_side_queue:
+                self.draw_target_selection_submenu(
+                    col1,
+                    assetify_settings,
+                    action_label="Queue",
+                    letter_prefix="B",
+                    expanded_prop_name="step1_b_queue_expanded",
+                    show_intake=True
+                )
 
-            # --- C. Advanced Setup (Mossify & Custom Attributes) ---
+            # --- Advanced Setup (Mossify & Custom Attributes) ---
             c_box = col1.box()
             c_head = c_box.row(align=True)
             c_icon = "TRIA_DOWN" if assetify_settings.step1_c_advanced_expanded else "TRIA_RIGHT"
             c_head.prop(assetify_settings, "step1_c_advanced_expanded", text="", icon=c_icon, emboss=False)
             adv_active = assetify_settings.use_mossify or assetify_settings.enable_custom_attributes
             adv_badge = "Active" if adv_active else "Off"
-            c_head.label(text=f"C. Advanced Setup ({adv_badge})", icon='PREFERENCES')
+            c_letter = "B" if assetify_settings.show_side_queue else "C"
+            c_head.label(text=f"{c_letter}. Advanced Setup ({adv_badge})", icon='PREFERENCES')
             if assetify_settings.step1_c_advanced_expanded:
                 opt_box = c_box.column(align=False)
                 r_moss = opt_box.row(align=True)
@@ -9541,7 +9695,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 nxt_row.enabled = False
                 nxt_row.operator("assetify.focus_step", text="Process a Collection Above to Begin →", icon='INFO')
 
-            layout.separator(factor=1.5)
+            content_layout.separator(factor=1.5)
 
         # =========================================================================
         # STEP 2: BAKE & CHANNEL PACK
@@ -9551,7 +9705,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             res_badge = assetify_settings.bake_resolution
             badge_step2 = f"({res_badge} • {preset_badge})"
             
-            step2_box = layout.box()
+            step2_box = content_layout.box()
             s2_head = step2_box.row(align=True)
             s2_head.label(text=f"Step 2: Bake & Channel Pack  {badge_step2}", icon="NODE_TEXTURE")
 
@@ -9694,7 +9848,8 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                         r_udim.prop(assetify_settings, "udim_tiles", text="Tiles")
 
             # --- E. Target Assets to Bake Submenu ---
-            self.draw_target_selection_submenu(col2, assetify_settings, action_label="Bake", letter_prefix="E", expanded_prop_name="step2_e_targets_expanded")
+            if not assetify_settings.show_side_queue:
+                self.draw_target_selection_submenu(col2, assetify_settings, action_label="Bake", letter_prefix="E", expanded_prop_name="step2_e_targets_expanded")
 
             # --- Full-Width Execution Button: Bake Textures ---
             bake_row = col2.row(align=True)
@@ -9713,7 +9868,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             op_p = nxt_row.operator("assetify.focus_step", text="Proceed to Step 3: Proxies →", icon='MOD_DECIM')
             op_p.step = '3'
 
-            layout.separator(factor=1.5)
+            content_layout.separator(factor=1.5)
 
         # =========================================================================
         # STEP 3: MESH PROXIES (COLLIDERS & LODS)
@@ -9722,16 +9877,17 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             nanite_active = getattr(assetify_settings, 'nanite_mode', False)
             badge_step3 = "(Nanite Active)" if nanite_active else "(Compound • LODs)"
             
-            step3_box = layout.box()
+            step3_box = content_layout.box()
             s3_head = step3_box.row(align=True)
             s3_head.label(text=f"Step 3: Mesh Proxies  {badge_step3}", icon="MOD_DECIM")
 
             col3 = step3_box.column(align=False)
             
-            # --- A. Target Assets Submenu ---
-            self.draw_target_selection_submenu(col3, assetify_settings, action_label="Colliders & LODs", letter_prefix="A", expanded_prop_name="step3_a_targets_expanded")
+            # --- Target Assets Submenu ---
+            if not assetify_settings.show_side_queue:
+                self.draw_target_selection_submenu(col3, assetify_settings, action_label="Colliders & LODs", letter_prefix="A", expanded_prop_name="step3_a_targets_expanded")
             
-            # --- B. Compound Collision (UCX) Submenu ---
+            # --- Compound Collision (UCX) Submenu ---
             b_box = col3.box()
             b_head = b_box.row(align=True)
             b_icon = "TRIA_DOWN" if assetify_settings.step3_b_collision_expanded else "TRIA_RIGHT"
@@ -9739,7 +9895,8 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             collision_settings = getattr(context.scene, "assetify_collision_settings", None)
             c_strat = collision_settings.collision_mode.title() if collision_settings else "Auto"
             hulls_badge = f"{getattr(collision_settings, 'max_hulls', 8)} Hulls" if collision_settings else ""
-            b_head.label(text=f"B. Compound Collision UCX ({c_strat} • {hulls_badge})", icon='PHYSICS')
+            b_letter = "A" if assetify_settings.show_side_queue else "B"
+            b_head.label(text=f"{b_letter}. Compound Collision UCX ({c_strat} • {hulls_badge})", icon='PHYSICS')
             if assetify_settings.step3_b_collision_expanded:
                 if collision_settings:
                     b_box.prop(collision_settings, "collision_mode", text="Strategy")
@@ -9749,14 +9906,15 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 else:
                     b_box.label(text="Collision settings unavailable", icon='ERROR')
 
-            # --- C. LOD Decimation & Nanite Submenu ---
+            # --- LOD Decimation & Nanite Submenu ---
             c_box = col3.box()
             c_head = c_box.row(align=True)
             c_icon = "TRIA_DOWN" if assetify_settings.step3_c_lods_expanded else "TRIA_RIGHT"
             c_head.prop(assetify_settings, "step3_c_lods_expanded", text="", icon=c_icon, emboss=False)
             nanite_active = getattr(assetify_settings, 'nanite_mode', False)
             lod_badge = "Nanite Ready" if nanite_active else "Decimation LODs"
-            c_head.label(text=f"C. LOD Decimation & Nanite ({lod_badge})", icon='MOD_DECIM')
+            c_letter = "B" if assetify_settings.show_side_queue else "C"
+            c_head.label(text=f"{c_letter}. LOD Decimation & Nanite ({lod_badge})", icon='MOD_DECIM')
             if assetify_settings.step3_c_lods_expanded:
                 c_box.prop(assetify_settings, "nanite_mode", text="Nanite-Ready Mode (UE5)", icon='LIGHT')
                 if nanite_active:
@@ -9796,7 +9954,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             op_e = nxt_row.operator("assetify.focus_step", text="Proceed to Step 4: Export →", icon='EXPORT')
             op_e.step = '4'
 
-            layout.separator(factor=1.5)
+            content_layout.separator(factor=1.5)
 
         # =========================================================================
         # STEP 4: EXPORT & ENGINE BRIDGE
@@ -9805,21 +9963,23 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             exp_fmt = assetify_settings.export_format.upper() if assetify_settings.export_mode == 'STILL' else assetify_settings.animation_export_format.upper()
             badge_step4 = f"({exp_fmt})"
             
-            step4_box = layout.box()
+            step4_box = content_layout.box()
             s4_head = step4_box.row(align=True)
             s4_head.label(text=f"Step 4: Export & Engine Bridge  {badge_step4}", icon="EXPORT")
 
             col4 = step4_box.column(align=False)
             
-            # --- A. Target Assets to Export Submenu ---
-            self.draw_target_selection_submenu(col4, assetify_settings, action_label="Export", letter_prefix="A", expanded_prop_name="step4_a_targets_expanded")
+            # --- Target Assets to Export Submenu ---
+            if not assetify_settings.show_side_queue:
+                self.draw_target_selection_submenu(col4, assetify_settings, action_label="Export", letter_prefix="A", expanded_prop_name="step4_a_targets_expanded")
 
-            # --- B. Destination & Format Submenu ---
+            # --- Destination & Format Submenu ---
             b_box = col4.box()
             b_head = b_box.row(align=True)
             b_icon = "TRIA_DOWN" if assetify_settings.step4_b_destination_expanded else "TRIA_RIGHT"
             b_head.prop(assetify_settings, "step4_b_destination_expanded", text="", icon=b_icon, emboss=False)
-            b_head.label(text=f"B. Destination & Format ({exp_fmt} • {assetify_settings.export_mode.title()})", icon='FILE_FOLDER')
+            b_letter = "A" if assetify_settings.show_side_queue else "B"
+            b_head.label(text=f"{b_letter}. Destination & Format ({exp_fmt} • {assetify_settings.export_mode.title()})", icon='FILE_FOLDER')
             if assetify_settings.step4_b_destination_expanded:
                 e_row = b_box.row(align=True)
                 e_still = e_row.operator("assetify.switch_export_mode", text="Still", depress=(assetify_settings.export_mode == 'STILL'))
@@ -9836,14 +9996,15 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                     r_ep.label(text="Anim Format:")
                     r_ep.prop(assetify_settings, "animation_export_format", text="")
 
-            # --- C. Unreal Engine Live Bridge Submenu ---
+            # --- Unreal Engine Live Bridge Submenu ---
             c_box = col4.box()
             c_head = c_box.row(align=True)
             c_icon = "TRIA_DOWN" if assetify_settings.step4_c_unreal_expanded else "TRIA_RIGHT"
             c_head.prop(assetify_settings, "step4_c_unreal_expanded", text="", icon=c_icon, emboss=False)
             ue_active = bool(assetify_settings.unreal_project_path)
             ue_badge = "Configured" if ue_active else "Setup"
-            c_head.label(text=f"C. Unreal Engine Live Bridge ({ue_badge})", icon='IMPORT')
+            c_letter = "B" if assetify_settings.show_side_queue else "C"
+            c_head.label(text=f"{c_letter}. Unreal Engine Live Bridge ({ue_badge})", icon='IMPORT')
             if assetify_settings.step4_c_unreal_expanded:
                 c_box.prop(assetify_settings, "unreal_project_path", text="Project (.uproject)")
                 c_box.prop(assetify_settings, "unreal_editor_path", text="Editor (UnrealEditor.exe)")
@@ -9867,13 +10028,14 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             ue_row.operator("assetify.send_to_unreal", text="Send Direct to Unreal Engine", icon='IMPORT')
             ue_row.operator("assetify.unreal_help", text="", icon='QUESTION')
 
-            # --- D. Verified Game Asset Import Submenu ---
+            # --- Verified Game Asset Import Submenu ---
             d_box = col4.box()
             d_head = d_box.row(align=True)
             d_icon = "TRIA_DOWN" if assetify_settings.step4_d_import_expanded else "TRIA_RIGHT"
             d_head.prop(assetify_settings, "step4_d_import_expanded", text="", icon=d_icon, emboss=False)
             imp_fmt = assetify_settings.import_format.upper() if assetify_settings.export_mode == 'STILL' else assetify_settings.animation_import_format.upper()
-            d_head.label(text=f"D. Verified Game Asset Import ({imp_fmt})", icon='IMPORT')
+            d_letter = "C" if assetify_settings.show_side_queue else "D"
+            d_head.label(text=f"{d_letter}. Verified Game Asset Import ({imp_fmt})", icon='IMPORT')
             if assetify_settings.step4_d_import_expanded:
                 imp_r = d_box.row(align=True)
                 if assetify_settings.export_mode == 'STILL':
@@ -9893,13 +10055,13 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                     lbl_imp = f"Import Selected Anim ({assetify_settings.animation_import_format.upper()})"
                 imp_col.operator("assetify.import_selected_fbx", text=lbl_imp)
 
-            layout.separator(factor=1.5)
+            content_layout.separator(factor=1.5)
 
         # =========================================================================
         # UTILITIES & TOOLS
         # =========================================================================
         if cur_step in {'UTILS', 'ALL'}:
-            mu_box = layout.box()
+            mu_box = content_layout.box()
             mu_head = mu_box.row(align=True)
             mu_head.label(text="Mesh & Pivot Utilities", icon="TOOL_SETTINGS")
 
@@ -9950,12 +10112,12 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 c_btn.operator("assetify.show_swap_info", text="", icon='INFO', emboss=False)
                 c_btn.operator("assetify.swap_collections", text="Swap Original & Game Assets")
 
-            layout.separator(factor=1.5)
+            content_layout.separator(factor=1.5)
 
         # =========================================================================
         # COMMUNITY & SUPPORT (ALWAYS VISIBLE FOOTER)
         # =========================================================================
-        soc_box = layout.box()
+        soc_box = content_layout.box()
         s_head = soc_box.row(align=True)
         s_head.label(text="Community & Support", icon='HELP')
         self.draw_social_links(soc_box)
@@ -10261,6 +10423,7 @@ classes = (
     OBJECT_OT_bake_textures_modal,
     OBJECT_OT_convert_to_game_ready,
     ASSETIFY_OT_toggle_select_assets,
+    ASSETIFY_OT_toggle_side_queue,
     ASSETIFY_OT_focus_step,
     ASSETIFY_PT_tools_panel,
     ASSETIFY_UL_custom_attributes,
