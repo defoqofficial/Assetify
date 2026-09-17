@@ -1728,6 +1728,48 @@ class ASSETIFY_OT_cancel_operation(bpy.types.Operator):
         self.report({'INFO'}, "Operation cancelled.")
         return {'CANCELLED'}
 
+
+def get_outliner_selected_collections(context):
+    """
+    Returns collection data-blocks explicitly selected in any Outliner area.
+    """
+    colls = []
+    # If the operator is invoked directly within an OUTLINER area:
+    if getattr(context, 'area', None) and context.area.type == 'OUTLINER':
+        if hasattr(context, "selected_ids"):
+            for id_block in context.selected_ids:
+                if isinstance(id_block, bpy.types.Collection):
+                    if id_block != context.scene.collection and not id_block.name.endswith("_GameReady"):
+                        if id_block not in colls:
+                            colls.append(id_block)
+        return colls
+
+    # Otherwise scan all windows / screens for OUTLINER areas using temp_override:
+    wm = getattr(context, 'window_manager', None)
+    windows = wm.windows if wm and hasattr(wm, 'windows') else [getattr(context, 'window', None)]
+    for win in windows:
+        if not win:
+            continue
+        screen = getattr(win, 'screen', None)
+        if not screen:
+            continue
+        for area in screen.areas:
+            if area.type == 'OUTLINER':
+                for region in area.regions:
+                    if region.type == 'WINDOW':
+                        try:
+                            with context.temp_override(window=win, screen=screen, area=area, region=region):
+                                if hasattr(bpy.context, "selected_ids"):
+                                    for id_block in bpy.context.selected_ids:
+                                        if isinstance(id_block, bpy.types.Collection):
+                                            if id_block != context.scene.collection and not id_block.name.endswith("_GameReady"):
+                                                if id_block not in colls:
+                                                    colls.append(id_block)
+                        except Exception:
+                            pass
+    return colls
+
+
 class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
     """Convert the user-selected collection to Game-Ready format with unique objects"""
     bl_idname = "object.convert_to_game_ready"
@@ -1748,6 +1790,7 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
     # Variables for modal operation
     _timer = None
     _collections_to_process = []
+    _explicit_objects = None
     _current_index = 0
     total_collections = 0
     progress_value: bpy.props.FloatProperty(name="Progress", default=0.0, min=0.0, max=1.0)
@@ -1775,8 +1818,9 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
         # Ensure viewport shading is set to solid
         set_viewport_shading_to_solid(context)
 
-        # Collect target collections based on source mode
+        self._explicit_objects = None
         colls_to_process = []
+
         if self.source == 'DROPDOWN':
             if assetify_settings.source_collection:
                 colls_to_process = [assetify_settings.source_collection]
@@ -1784,24 +1828,63 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
                 self.report({'WARNING'}, "Please select a collection from the dropdown to process.")
                 return {'CANCELLED'}
         elif self.source == 'SELECTED':
-            found = set()
-            # 1. Selected IDs in Outliner
-            if hasattr(context, "selected_ids"):
-                for id_block in context.selected_ids:
-                    if isinstance(id_block, bpy.types.Collection) and id_block != context.scene.collection and not id_block.name.endswith("_GameReady"):
-                        found.add(id_block)
-            # 2. Collections of selected objects in 3D Viewport
-            for obj in context.selected_objects:
-                for coll in obj.users_collection:
-                    if coll != context.scene.collection and not coll.name.endswith("_GameReady"):
-                        found.add(coll)
-            # 3. Active collection fallback
-            if not found and context.collection and context.collection != context.scene.collection and not context.collection.name.endswith("_GameReady"):
-                found.add(context.collection)
+            collision_prefixes = ("UCX_", "UBX_", "USP_", "UCP_")
+            import re as _re
+            lod_pattern = _re.compile(r'_LOD\d+$')
 
-            colls_to_process = list(found)
-            if not colls_to_process:
-                self.report({'WARNING'}, "No scene collections or objects in collections selected.")
+            # 1. Check if user explicitly selected collection(s) in the Outliner
+            outliner_colls = get_outliner_selected_collections(context)
+
+            # 2. Get eligible selected objects in viewport / outliner
+            selected_objs = [
+                obj for obj in context.selected_objects
+                if obj.type in {'MESH', 'CURVE', 'FONT'}
+                and not obj.name.startswith(collision_prefixes)
+                and not lod_pattern.search(obj.name)
+                and not obj.name.endswith("_gameasset")
+            ]
+
+            # 3. Determine whether user's intent is collection-level or object-level:
+            if outliner_colls:
+                # User explicitly selected collection(s) in the Outliner
+                colls_to_process = outliner_colls
+                self._explicit_objects = None
+            elif selected_objs:
+                # Check if active collection in Outliner was switched to a collection that does NOT contain the selected objects
+                active_coll = context.view_layer.active_layer_collection.collection if context.view_layer.active_layer_collection else None
+                if (
+                    active_coll
+                    and active_coll != context.scene.collection
+                    and not active_coll.name.endswith("_GameReady")
+                    and not any(active_coll in obj.users_collection for obj in selected_objs)
+                ):
+                    colls_to_process = [active_coll]
+                    self._explicit_objects = None
+                else:
+                    # Process ONLY the selected objects!
+                    self._explicit_objects = selected_objs
+                    found_colls = []
+                    for obj in selected_objs:
+                        user_colls = [c for c in obj.users_collection if c != context.scene.collection and not c.name.endswith("_GameReady")]
+                        orig_c = user_colls[0] if user_colls else context.scene.collection
+                        if orig_c not in found_colls:
+                            found_colls.append(orig_c)
+                    colls_to_process = found_colls
+            else:
+                # No objects selected and no Outliner collection multi-selected.
+                # Fallback to active collection in view layer:
+                active_coll = context.view_layer.active_layer_collection.collection if context.view_layer.active_layer_collection else None
+                if not active_coll or active_coll == context.scene.collection:
+                    active_coll = context.collection
+                if active_coll and active_coll != context.scene.collection and not active_coll.name.endswith("_GameReady"):
+                    colls_to_process = [active_coll]
+                    self._explicit_objects = None
+                else:
+                    self.report({'WARNING'}, "No scene collections or objects selected to process.")
+                    return {'CANCELLED'}
+
+            if not colls_to_process and not self._explicit_objects:
+                self.report({'WARNING'}, "No scene collections or objects selected to process.")
                 return {'CANCELLED'}
         else:  # 'LIST'
             colls_to_process = [item.collection for item in assetify_settings.asset_collections if item.collection]
@@ -1811,8 +1894,10 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
 
         self._collections_to_process = colls_to_process
 
-        # Continue with the regular game-ready conversion
-        self.report({'INFO'}, f"Processing {len(colls_to_process)} collection(s) to Game-Ready...")
+        if self._explicit_objects is not None:
+            self.report({'INFO'}, f"Processing {len(self._explicit_objects)} selected object(s) to Game-Ready...")
+        else:
+            self.report({'INFO'}, f"Processing {len(colls_to_process)} collection(s) to Game-Ready...")
         return self.run_still_process(context)
 
     def run_still_process(self, context):
@@ -1833,17 +1918,33 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
 
         # Collect assets and create game-ready collections
         assetify_settings = context.scene.assetify_bake_settings
-        for collection in self._collections_to_process:
-            if collection:
-                self.main_collections.add(collection)
-                # Create game-ready collection for main collection
-                self.create_game_ready_collection(collection, context, assetify_settings)
-                # Collect assets and build game-ready subcollections
-                self.collect_assets(
-                    collection,
-                    context,
-                    parent_game_ready_collection=self.game_ready_collections[collection]
-                )
+
+        if getattr(self, '_explicit_objects', None) is not None:
+            # Process ONLY the explicit objects
+            for obj in self._explicit_objects:
+                user_colls = [c for c in obj.users_collection if c != context.scene.collection and not c.name.endswith("_GameReady")]
+                orig_coll = user_colls[0] if user_colls else context.scene.collection
+
+                if orig_coll not in self.game_ready_collections:
+                    self.main_collections.add(orig_coll)
+                    self.create_game_ready_collection(orig_coll, context, assetify_settings)
+
+                self._assets_to_process.append({'object': obj, 'original_collection': orig_coll})
+                if orig_coll not in self.collection_asset_counts:
+                    self.collection_asset_counts[orig_coll] = 0
+                self.collection_asset_counts[orig_coll] += 1
+        else:
+            for collection in self._collections_to_process:
+                if collection:
+                    self.main_collections.add(collection)
+                    # Create game-ready collection for main collection
+                    self.create_game_ready_collection(collection, context, assetify_settings)
+                    # Collect assets and build game-ready subcollections
+                    self.collect_assets(
+                        collection,
+                        context,
+                        parent_game_ready_collection=self.game_ready_collections[collection]
+                    )
 
         self.total_assets = len(self._assets_to_process)
 
@@ -1852,13 +1953,17 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
             return {'CANCELLED'}
 
         # --- VISUAL FEEDBACK: Hide Originals Immediately ---
-        # We hide the original collections NOW so the user sees the new assets "pop in"
+        # We hide the original collections/objects NOW so the user sees the new assets "pop in"
         if assetify_settings.disable_original_collections:
-            for view_layer in bpy.context.scene.view_layers:
-                for original_collection in self.main_collections:
-                    layer_coll = find_layer_collection(view_layer.layer_collection, original_collection)
-                    if layer_coll:
-                        layer_coll.exclude = True
+            if getattr(self, '_explicit_objects', None) is not None:
+                for item in self._assets_to_process:
+                    item['object'].hide_set(True)
+            else:
+                for view_layer in bpy.context.scene.view_layers:
+                    for original_collection in self.main_collections:
+                        layer_coll = find_layer_collection(view_layer.layer_collection, original_collection)
+                        if layer_coll:
+                            layer_coll.exclude = True
 
         # Start progress bar
         start_progress_bar(self, initial_message="Processing Selected Assets")
@@ -1884,7 +1989,10 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
                 # Update progress
                 self._current_asset_index += 1
                 self.progress_value = self._current_asset_index / self.total_assets
-                bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+                try:
+                    bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+                except Exception:
+                    pass
             else:
                 # Processing complete
                 self.current_operation = "Processing Complete."
@@ -2172,11 +2280,16 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
         # Restore visibility if user cancelled
         assetify_settings = context.scene.assetify_bake_settings
         if assetify_settings.disable_original_collections:
-            for view_layer in bpy.context.scene.view_layers:
-                for original_collection in self.main_collections:
-                    layer_coll = find_layer_collection(view_layer.layer_collection, original_collection)
-                    if layer_coll:
-                        layer_coll.exclude = False
+            if getattr(self, '_explicit_objects', None) is not None:
+                for item in self._assets_to_process:
+                    if item.get('object'):
+                        item['object'].hide_set(False)
+            else:
+                for view_layer in bpy.context.scene.view_layers:
+                    for original_collection in self.main_collections:
+                        layer_coll = find_layer_collection(view_layer.layer_collection, original_collection)
+                        if layer_coll:
+                            layer_coll.exclude = False
                         
         self.report({'INFO'}, "Set Game Assets operation canceled.")
 
@@ -2229,7 +2342,21 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
             self.collect_assets(subcol, context, parent_game_ready_collection=game_ready_collection)
             
     def create_game_ready_collection(self, collection, context, assetify_settings):
-        game_ready_collection_name = self.generate_unique_collection_name(f"{collection.name}_GameReady")
+        if collection == context.scene.collection:
+            base_name = "Selected"
+        else:
+            base_name = collection.name
+
+        target_name = f"{base_name}_GameReady"
+        # If in selected-objects mode and target_name already exists in scene, reuse it
+        if getattr(self, '_explicit_objects', None) is not None and target_name in bpy.data.collections:
+            existing_col = bpy.data.collections[target_name]
+            if existing_col.name in context.scene.collection.children:
+                self.game_ready_collections[collection] = existing_col
+                print(f"Reusing existing game-ready collection: {existing_col.name}")
+                return
+
+        game_ready_collection_name = self.generate_unique_collection_name(target_name)
         game_ready_collection = bpy.data.collections.new(game_ready_collection_name)
         context.scene.collection.children.link(game_ready_collection)
         self.game_ready_collections[collection] = game_ready_collection
