@@ -2128,7 +2128,7 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
                 
                 assetify_settings.skip_save_check = False
                 assetify_settings.active_pipeline_step = '1'
-                assetify_settings.step1_b_queue_expanded = True
+                assetify_settings.step1_c_queue_expanded = True
                 
                 return {'FINISHED'}
 
@@ -4279,10 +4279,10 @@ class AssetifyBakeSettings(bpy.types.PropertyGroup):
     # --- Submenu Expansion States (A-Z Sequential Submenus, Collapsed by Default) ---
     # Step 1: Setup
     step1_a_mode_expanded: bpy.props.BoolProperty(name="A. Pipeline Mode", default=False)
-    step1_b_uv_expanded: bpy.props.BoolProperty(name="B. UV Settings", default=False)
-    step1_c_intake_expanded: bpy.props.BoolProperty(name="C. Intake", default=True)
-    step1_d_queue_expanded: bpy.props.BoolProperty(name="D. Asset Queue", default=True)
-    step1_e_advanced_expanded: bpy.props.BoolProperty(name="E. Advanced Setup", default=False)
+    step1_b_intake_expanded: bpy.props.BoolProperty(name="B. Intake", default=True)
+    step1_c_queue_expanded: bpy.props.BoolProperty(name="C. Asset Queue", default=True)
+    step1_d_advanced_expanded: bpy.props.BoolProperty(name="D. Advanced Setup", default=False)
+    show_collection_mesh_weights: bpy.props.BoolProperty(name="Configure Mesh Weights", default=False)
 
     # Step 2: Bake
     step2_a_output_expanded: bpy.props.BoolProperty(name="A. Output & Resolution", default=False)
@@ -10205,28 +10205,6 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                     rows=num_rows
                 )
 
-            if show_weight and getattr(assetify_settings, 'texture_output_mode', 'INDIVIDUAL') == 'COMBINED':
-                w_box = sub.box()
-                w_row = w_box.row(align=True)
-                has_item = False
-                if assetify_settings.asset_mode == 'ASSET' and assetify_settings.baked_assets:
-                    idx = assetify_settings.active_baked_asset_index
-                    if 0 <= idx < len(assetify_settings.baked_assets):
-                        act_item = assetify_settings.baked_assets[idx]
-                        disp_name = act_item.name.replace("_gameasset", "")
-                        w_row.label(text=f"Atlas UV Weight ({disp_name}):", icon='GROUP_UVS')
-                        w_row.prop(act_item, "uv_weight", text="")
-                        has_item = True
-                elif assetify_settings.asset_mode == 'COLLECTION' and assetify_settings.baked_collections:
-                    idx = assetify_settings.active_baked_collection_index
-                    if 0 <= idx < len(assetify_settings.baked_collections):
-                        act_item = assetify_settings.baked_collections[idx]
-                        w_row.label(text=f"Atlas UV Weight ({act_item.name}):", icon='GROUP_UVS')
-                        w_row.prop(act_item, "uv_weight", text="")
-                        has_item = True
-                if has_item:
-                    w_row.operator("assetify.reset_uv_weights", text="", icon='LOOP_BACK')
-
             # Queue Action Buttons (Refresh & Delete Selected)
             act_row = sub.row(align=True)
             act_row.operator("assetify.refresh_asset_collection_list", text="Refresh", icon='FILE_REFRESH')
@@ -10346,28 +10324,6 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                     "active_baked_collection_index",
                     rows=num_rows
                 )
-
-            if getattr(assetify_settings, 'texture_output_mode', 'INDIVIDUAL') == 'COMBINED':
-                w_box = q_box.box()
-                w_row = w_box.row(align=True)
-                has_item = False
-                if assetify_settings.asset_mode == 'ASSET' and assetify_settings.baked_assets:
-                    idx = assetify_settings.active_baked_asset_index
-                    if 0 <= idx < len(assetify_settings.baked_assets):
-                        act_item = assetify_settings.baked_assets[idx]
-                        disp_name = act_item.name.replace("_gameasset", "")
-                        w_row.label(text=f"Atlas UV Weight ({disp_name}):", icon='GROUP_UVS')
-                        w_row.prop(act_item, "uv_weight", text="")
-                        has_item = True
-                elif assetify_settings.asset_mode == 'COLLECTION' and assetify_settings.baked_collections:
-                    idx = assetify_settings.active_baked_collection_index
-                    if 0 <= idx < len(assetify_settings.baked_collections):
-                        act_item = assetify_settings.baked_collections[idx]
-                        w_row.label(text=f"Atlas UV Weight ({act_item.name}):", icon='GROUP_UVS')
-                        w_row.prop(act_item, "uv_weight", text="")
-                        has_item = True
-                if has_item:
-                    w_row.operator("assetify.reset_uv_weights", text="", icon='LOOP_BACK')
 
             # Action Row (Refresh & Delete Selected)
             act_row = q_box.row(align=True)
@@ -10510,71 +10466,15 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 ab = mode_row.operator("assetify.switch_bake_mode", text="Animation", depress=(assetify_settings.bake_mode == 'ANIMATION'))
                 ab.mode = 'ANIMATION'
 
-            # --- B. UV Settings Submenu ---
+            # --- B. Intake Submenu ---
             b_box = col1.box()
             b_head = b_box.row(align=True)
-            b_icon = "TRIA_DOWN" if assetify_settings.step1_b_uv_expanded else "TRIA_RIGHT"
-            b_head.prop(assetify_settings, "step1_b_uv_expanded", text="", icon=b_icon, emboss=False)
-            if assetify_settings.uv_mode == 'UNWRAP':
-                out_lbl = "Combined" if assetify_settings.texture_output_mode == 'COMBINED' else "Individual"
-                uv_badge = f"Unwrap • {out_lbl}"
-            else:
-                uv_badge = "Skip UV"
-            b_head.label(text=f"B. UV Settings ({uv_badge})", icon='UV')
-            if assetify_settings.step1_b_uv_expanded:
-                uv_col = b_box.column(align=True)
-                uv_col.prop(assetify_settings, "uv_mode", expand=True)
-                if assetify_settings.uv_mode == 'UNWRAP':
-                    r_out = uv_col.row(align=True)
-                    r_out.label(text="Texture Output:")
-                    r_out.prop(assetify_settings, "texture_output_mode", text="")
-                    
-                    r_uvm = uv_col.row(align=True)
-                    r_uvm.label(text="UV Margin:")
-                    r_uvm.prop(assetify_settings, "uv_margin", text="")
-                    
-                    r_udim = uv_col.row(align=True)
-                    r_udim.prop(assetify_settings, "use_udim", text="Use UDIMs")
-                    if assetify_settings.use_udim:
-                        r_udim.prop(assetify_settings, "udim_tiles", text="Tiles")
-
-                    if assetify_settings.texture_output_mode == 'COMBINED':
-                        r_scale = uv_col.row(align=True)
-                        r_scale.label(text="Atlas UV Scaling:")
-                        r_scale.prop(assetify_settings, "combined_uv_scale_mode", text="")
-
-                        # Active asset UV weight slider
-                        w_box = uv_col.box()
-                        w_row = w_box.row(align=True)
-                        has_item = False
-                        if assetify_settings.asset_mode == 'ASSET' and assetify_settings.baked_assets:
-                            idx = assetify_settings.active_baked_asset_index
-                            if 0 <= idx < len(assetify_settings.baked_assets):
-                                act_item = assetify_settings.baked_assets[idx]
-                                disp_name = act_item.name.replace("_gameasset", "")
-                                w_row.label(text=f"Weight ({disp_name}):", icon='GROUP_UVS')
-                                w_row.prop(act_item, "uv_weight", text="")
-                                has_item = True
-                        elif assetify_settings.asset_mode == 'COLLECTION' and assetify_settings.baked_collections:
-                            idx = assetify_settings.active_baked_collection_index
-                            if 0 <= idx < len(assetify_settings.baked_collections):
-                                act_item = assetify_settings.baked_collections[idx]
-                                w_row.label(text=f"Weight ({act_item.name}):", icon='GROUP_UVS')
-                                w_row.prop(act_item, "uv_weight", text="")
-                                has_item = True
-                        if not has_item:
-                            w_row.label(text="Select asset in Queue to adjust UV weight", icon='INFO')
-                        w_row.operator("assetify.reset_uv_weights", text="", icon='LOOP_BACK')
-
-            # --- C. Intake Submenu ---
-            c_box = col1.box()
-            c_head = c_box.row(align=True)
-            c_icon = "TRIA_DOWN" if assetify_settings.step1_c_intake_expanded else "TRIA_RIGHT"
-            c_head.prop(assetify_settings, "step1_c_intake_expanded", text="", icon=c_icon, emboss=False)
+            b_icon = "TRIA_DOWN" if assetify_settings.step1_b_intake_expanded else "TRIA_RIGHT"
+            b_head.prop(assetify_settings, "step1_b_intake_expanded", text="", icon=b_icon, emboss=False)
             src_name = assetify_settings.source_collection.name if assetify_settings.source_collection else "Select Collection"
-            c_head.label(text=f"C. Intake ({src_name})", icon='COLLECTION_NEW')
-            if assetify_settings.step1_c_intake_expanded:
-                in_col = c_box.column(align=False)
+            b_head.label(text=f"B. Intake ({src_name})", icon='COLLECTION_NEW')
+            if assetify_settings.step1_b_intake_expanded:
+                in_col = b_box.column(align=False)
                 # Row 1: Dropdown + Process button
                 r_pick = in_col.row(align=True)
                 r_pick.prop_search(assetify_settings, "source_collection", bpy.data, "collections", text="", icon='OUTLINER_COLLECTION')
@@ -10589,26 +10489,26 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 op_sel = r_sel.operator("object.convert_to_game_ready", text="Process Selected in Viewport / Outliner", icon='RESTRICT_SELECT_OFF')
                 op_sel.source = 'SELECTED'
 
-            # --- D. Asset Queue Submenu ---
+            # --- C. Asset Queue Submenu ---
             self.draw_target_selection_submenu(
                 col1,
                 assetify_settings,
                 action_label="Queue",
-                letter_prefix="D",
-                expanded_prop_name="step1_d_queue_expanded",
+                letter_prefix="C",
+                expanded_prop_name="step1_c_queue_expanded",
                 show_weight=False
             )
 
-            # --- E. Advanced Setup (Mossify & Custom Attributes) ---
-            e_box = col1.box()
-            e_head = e_box.row(align=True)
-            e_icon = "TRIA_DOWN" if assetify_settings.step1_e_advanced_expanded else "TRIA_RIGHT"
-            e_head.prop(assetify_settings, "step1_e_advanced_expanded", text="", icon=e_icon, emboss=False)
+            # --- D. Advanced Setup (Mossify & Custom Attributes) ---
+            d_box = col1.box()
+            d_head = d_box.row(align=True)
+            d_icon = "TRIA_DOWN" if assetify_settings.step1_d_advanced_expanded else "TRIA_RIGHT"
+            d_head.prop(assetify_settings, "step1_d_advanced_expanded", text="", icon=d_icon, emboss=False)
             adv_active = assetify_settings.use_mossify or assetify_settings.enable_custom_attributes
             adv_badge = "Active" if adv_active else "Off"
-            e_head.label(text=f"E. Advanced Setup ({adv_badge})", icon='PREFERENCES')
-            if assetify_settings.step1_e_advanced_expanded:
-                opt_box = e_box.column(align=False)
+            d_head.label(text=f"D. Advanced Setup ({adv_badge})", icon='PREFERENCES')
+            if assetify_settings.step1_d_advanced_expanded:
+                opt_box = d_box.column(align=False)
                 r_moss = opt_box.row(align=True)
                 r_moss.operator("assetify.show_mossify_mode_info", text="", icon='INFO', emboss=False)
                 r_moss.prop(assetify_settings, "use_mossify", text="Mossify Mode")
@@ -10692,6 +10592,78 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                     r_scale = out_col.row(align=True)
                     r_scale.label(text="Atlas UV Scaling:")
                     r_scale.prop(assetify_settings, "combined_uv_scale_mode", text="")
+
+                    # --- Configure Mesh Weights Drawer ---
+                    col_mesh_groups = []
+                    if assetify_settings.asset_mode == 'COLLECTION':
+                        active_colls = [c for c in assetify_settings.baked_collections if c.include_in_send]
+                        if not active_colls and assetify_settings.baked_collections:
+                            idx = assetify_settings.active_baked_collection_index
+                            if 0 <= idx < len(assetify_settings.baked_collections):
+                                active_colls = [assetify_settings.baked_collections[idx]]
+
+                        for c_item in active_colls:
+                            c_ref = bpy.data.collections.get(c_item.name)
+                            if not c_ref and not c_item.name.endswith("_GameReady"):
+                                c_ref = bpy.data.collections.get(c_item.name + "_GameReady")
+                            meshes = []
+                            if c_ref:
+                                meshes = [o for o in c_ref.all_objects if o.type == 'MESH']
+                            elif hasattr(c_item, "assets") and c_item.assets:
+                                for a in c_item.assets:
+                                    o = bpy.data.objects.get(a.name)
+                                    if o and o.type == 'MESH':
+                                        meshes.append(o)
+                            
+                            seen = set()
+                            dedup_meshes = []
+                            for m_obj in meshes:
+                                if m_obj.name not in seen:
+                                    seen.add(m_obj.name)
+                                    dedup_meshes.append(m_obj)
+                            if dedup_meshes:
+                                clean_name = c_item.name.replace("_GameReady", "")
+                                col_mesh_groups.append((clean_name, dedup_meshes))
+                    else:
+                        active_assets = [a for a in assetify_settings.baked_assets if a.include_in_send]
+                        if not active_assets and assetify_settings.baked_assets:
+                            idx = assetify_settings.active_baked_asset_index
+                            if 0 <= idx < len(assetify_settings.baked_assets):
+                                active_assets = [assetify_settings.baked_assets[idx]]
+                        meshes = []
+                        for a in active_assets:
+                            o = bpy.data.objects.get(a.name)
+                            if o and o.type == 'MESH':
+                                meshes.append(o)
+                        if meshes:
+                            col_mesh_groups.append(("Assets", meshes))
+
+                    total_meshes = sum(len(grp[1]) for grp in col_mesh_groups)
+                    if total_meshes > 0:
+                        w_head = out_col.row(align=True)
+                        w_icon = "TRIA_DOWN" if assetify_settings.show_collection_mesh_weights else "TRIA_RIGHT"
+                        w_head.prop(assetify_settings, "show_collection_mesh_weights", text="", icon=w_icon, emboss=False)
+                        if len(col_mesh_groups) == 1:
+                            target_lbl = f"Configure Mesh Weights ({col_mesh_groups[0][0]}: {total_meshes} meshes)"
+                        else:
+                            target_lbl = f"Configure Mesh Weights ({len(col_mesh_groups)} collections: {total_meshes} meshes)"
+                        w_head.label(text=target_lbl, icon='GROUP_UVS')
+
+                        if assetify_settings.show_collection_mesh_weights:
+                            w_box = out_col.box()
+                            for grp_name, meshes in col_mesh_groups:
+                                if len(col_mesh_groups) > 1:
+                                    w_box.label(text=f"Collection: {grp_name}", icon='OUTLINER_COLLECTION')
+                                for o in meshes:
+                                    r_obj = w_box.row(align=True)
+                                    split = r_obj.split(factor=0.6)
+                                    disp_name = o.name.replace("_gameasset", "").replace("_GameReady", "")
+                                    split.label(text=disp_name, icon='MESH_DATA')
+                                    split.prop(o, "assetify_uv_weight", text="", slider=True)
+                            r_rst = w_box.row(align=True)
+                            r_rst.operator("assetify.reset_uv_weights", text="Reset All to 1.0", icon='LOOP_BACK')
+                    else:
+                        out_col.label(text="Process a collection to configure mesh UV weights", icon='INFO')
 
                 out_col.prop(assetify_settings, "bake_folder", text="")
                 r_fmt = out_col.row(align=True)
@@ -10803,10 +10775,6 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                 hw_col.separator(factor=0.5)
                 hw_col.prop(assetify_settings, "uv_mode", expand=True)
                 if assetify_settings.uv_mode == 'UNWRAP':
-                    if assetify_settings.texture_output_mode == 'COMBINED':
-                        r_scale = hw_col.row(align=True)
-                        r_scale.label(text="Atlas UV Scaling:")
-                        r_scale.prop(assetify_settings, "combined_uv_scale_mode", text="")
                     r_uvm = hw_col.row(align=True)
                     r_uvm.label(text="UV Margin:")
                     r_uvm.prop(assetify_settings, "uv_margin", text="")
@@ -10816,7 +10784,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
                         r_udim.prop(assetify_settings, "udim_tiles", text="Tiles")
 
             # --- E. Target Assets to Bake Submenu ---
-            self.draw_target_selection_submenu(col2, assetify_settings, action_label="Bake", letter_prefix="E", expanded_prop_name="step2_e_targets_expanded", show_weight=True)
+            self.draw_target_selection_submenu(col2, assetify_settings, action_label="Bake", letter_prefix="E", expanded_prop_name="step2_e_targets_expanded", show_weight=False)
 
             # --- Full-Width Execution Button: Bake Textures ---
             bake_row = col2.row(align=True)
