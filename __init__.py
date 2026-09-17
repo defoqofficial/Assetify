@@ -9713,6 +9713,12 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
         addon_updater_ops.check_for_update_background()
 
         # =========================================================================
+        # SOCIAL / COMMUNITY LINKS (SINGLE ROW AT VERY TOP)
+        # =========================================================================
+        self.draw_social_links(layout)
+        layout.separator(factor=0.5)
+
+        # =========================================================================
         # 1. VIEW MODE SWITCHER (PIPELINE STEPS vs ASSET QUEUE)
         # =========================================================================
         if assetify_settings.asset_mode == 'ASSET':
@@ -10289,13 +10295,7 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
 
             content_layout.separator(factor=1.5)
 
-        # =========================================================================
-        # COMMUNITY & SUPPORT (ALWAYS VISIBLE FOOTER)
-        # =========================================================================
-        soc_box = content_layout.box()
-        s_head = soc_box.row(align=True)
-        s_head.label(text="Community & Support", icon='HELP')
-        self.draw_social_links(soc_box)
+
     
     def check_import_button_enabled(self, assetify_settings):
         """Returns True if the Import button should be enabled based on include_in_send and file existence."""
@@ -10406,8 +10406,9 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             ("https://www.tiktok.com/@defo.q", "tiktok_icon")
         ]
 
-        # Create a grid flow layout that adjusts based on the available width
-        flow = layout.grid_flow(row_major=True, columns=len(socials), even_columns=True, even_rows=True, align=True)
+        # Render as a single aligned row of icons at the very top
+        row = layout.row(align=True)
+        row.scale_y = 1.05
 
         # Iterate over the list of socials and add each icon
         for url, icon_key in socials:
@@ -10415,10 +10416,10 @@ class ASSETIFY_PT_tools_panel(bpy.types.Panel):
             if icon_key in custom_icons:
                 icon_id = custom_icons[icon_key].icon_id
                 # Add an operator for each social link
-                flow.operator("wm.url_open", text="", icon_value=icon_id).url = url
+                row.operator("wm.url_open", text="", icon_value=icon_id).url = url
             else:
                 # Fallback if icon file is missing (avoids silent failure)
-                flow.operator("wm.url_open", text="Link", icon='URL').url = url
+                row.operator("wm.url_open", text="", icon='URL').url = url
 
 class ASSETIFY_OT_show_ungroup_info(bpy.types.Operator):
     """Show detailed info about ungrouping node groups"""  
