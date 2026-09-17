@@ -2096,7 +2096,7 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
         for obj in collection.objects:
             if obj.type in {'MESH', 'CURVE', 'FONT'}:
                 # Skip collision meshes and LOD variants
-                if obj.name.startswith(collision_prefixes) or lod_pattern.search(obj.name):
+                if obj.name.startswith(collision_prefixes) or lod_pattern.search(obj.name) or "_gameasset" in obj.name or obj.get("is_game_asset"):
                     continue
                 if obj.particle_systems:
                     print(f"Applying particle systems on {obj.name}")
@@ -2187,6 +2187,14 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
         new_obj.name = f"{obj.name}_gameasset"
         game_ready_collection.objects.link(new_obj)
         print(f"[DEBUG] Linked object: {new_obj.name} to {game_ready_collection.name}")
+
+        # Clean up any duplicate linking of game assets from the original collection
+        if original_collection and original_collection != game_ready_collection:
+            for existing in list(original_collection.objects):
+                if ("_gameasset" in existing.name or existing.get("is_game_asset")) and existing != new_obj:
+                    if existing in game_ready_collection.objects.values():
+                        original_collection.objects.unlink(existing)
+                        print(f"[DEBUG] Removed duplicate game asset link '{existing.name}' from original collection '{original_collection.name}'")
         
         assetify_settings = context.scene.assetify_bake_settings
 
@@ -2258,6 +2266,11 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
             context.scene.custom_name,
             context.scene.custom_value_name
         )
+
+        # Ensure the game asset is exclusively in the game-ready collection
+        for col in list(new_obj.users_collection):
+            if col != game_ready_collection:
+                col.objects.unlink(new_obj)
 
         # Add the asset to the baked assets list
         baked_asset = assetify_settings.baked_assets.add()
@@ -2381,6 +2394,9 @@ class OBJECT_OT_convert_to_game_ready(bpy.types.Operator):
                     continue
                 # Skip LOD variants (already handled in Step 3)
                 if lod_pattern.search(obj.name):
+                    continue
+                # Skip already created game assets
+                if "_gameasset" in obj.name or obj.get("is_game_asset"):
                     continue
                 self._assets_to_process.append({'object': obj, 'original_collection': collection})
 
@@ -5664,6 +5680,8 @@ def duplicate_objects_in_collection(original_collection, game_ready_collection, 
     assetify_settings = bpy.context.scene.assetify_bake_settings
     
     for obj in original_collection.objects:
+        if "_gameasset" in obj.name or obj.get("is_game_asset"):
+            continue
         if obj.type in {'MESH', 'CURVE', 'FONT'}:
             new_obj = obj.copy()
             new_obj.data = obj.data.copy()
@@ -5672,6 +5690,11 @@ def duplicate_objects_in_collection(original_collection, game_ready_collection, 
             duplicated_objects.append(new_obj)
     
             process_object(new_obj, custom_object, custom_name, custom_value_name)
+
+            # Ensure the game asset is exclusively in the game-ready collection
+            for col in list(new_obj.users_collection):
+                if col != game_ready_collection:
+                    col.objects.unlink(new_obj)
     
             # Mark object as a game asset
             new_obj['is_game_asset'] = True
@@ -5727,6 +5750,8 @@ def process_collection(collection, game_ready_collection, assetify_settings, mai
 
     # Process all objects in the current collection
     for obj in collection.objects:
+        if "_gameasset" in obj.name or obj.get("is_game_asset"):
+            continue
         if obj.type in {'MESH', 'CURVE', 'FONT'}:
             print(f"[DEBUG] Found object: {obj.name} of type {obj.type}")
 
@@ -5765,6 +5790,11 @@ def process_collection(collection, game_ready_collection, assetify_settings, mai
                     scene.custom_name,         # Retrieve custom_name from scene
                     scene.custom_value_name    # Retrieve custom_value_name from scene
                 )
+
+                # Ensure the game asset is exclusively in the game-ready collection
+                for col in list(new_obj.users_collection):
+                    if col != game_ready_collection:
+                        col.objects.unlink(new_obj)
 
                 # Add the asset to the baked collection's asset list
                 collection_asset = baked_collection.assets.add()
